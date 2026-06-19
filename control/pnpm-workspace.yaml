@@ -1,0 +1,7 @@
+# Isolate this package as its own pnpm workspace root, so `pnpm install` here does NOT
+# walk up and attach to a parent workspace (e.g. ~/Code). Installs land in
+# control/node_modules. Mirrors the parent's build allow-list (no native postinstalls).
+allowBuilds:
+  esbuild: false
+  sharp: false
+  workerd: false

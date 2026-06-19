@@ -1,0 +1,76 @@
+{
+  "model": "gpt-oss-120b",
+  "fit": {
+    "n_stages": 4,
+    "target_k": 8,
+    "context_len": 4096,
+    "stage_layers": [
+      9,
+      9,
+      9,
+      9
+    ]
+  },
+  "gates": [
+    {
+      "name": "v1.0 reliability",
+      "completed": 20,
+      "submitted": 20,
+      "pass": true,
+      "detail": "20/20 clean completions"
+    },
+    {
+      "name": "v1.0 correctness (split == single reference)",
+      "n_stages": 4,
+      "tokens": 16,
+      "pass": true,
+      "detail": "split N=4 token-for-token == single-node reference"
+    },
+    {
+      "name": "v1.0 induced interruption (kill mid-decode \u2192 reassign \u2192 resume)",
+      "pass": true,
+      "policy": "reassign",
+      "stage_killed": 2,
+      "recovery": {
+        "t_warning": 28.0,
+        "load_s": 20.0,
+        "reprefill_s": 0.28,
+        "t_resume": 51.28,
+        "replay_tokens": 28,
+        "affected_streams": 4
+      },
+      "detail": "stage 2/4 reassign; output uncorrupted; resumed at t=51.3"
+    },
+    {
+      "name": "v1.1 utilisation (per-stage occupancy under K streams)",
+      "n_stages": 4,
+      "floor": 0.8,
+      "occupancy_vs_k": {
+        "1": 0.255,
+        "2": 0.503,
+        "4": 0.982,
+        "8": 0.991
+      },
+      "occupancy_at_k=N": 0.982,
+      "pass": true,
+      "detail": "single-stream=0.255 (\u22481/N), K=N occupancy=0.982 (floor 0.8)"
+    },
+    {
+      "name": "v1.1 cross-stream correctness (HARD gate \u2014 the silent bug)",
+      "streams": 6,
+      "pass": true,
+      "detail": "all 6 concurrent streams token-for-token == their solo runs"
+    },
+    {
+      "name": "v1.1 cost/token (ILLUSTRATIVE \u2014 real $/hr + throughput from \u00a712)",
+      "illustrative": true,
+      "pass": null,
+      "cairn_$per_Mtok": 430.9896,
+      "baseline_$per_Mtok": 1149.3056,
+      "ratio_baseline_over_cairn": 2.67,
+      "detail": "occupancy-driven; numbers illustrative, not a $ claim (spec \u00a76 'pitch it narrow')"
+    }
+  ],
+  "all_hard_gates_pass": true,
+  "note": "Rung-1 SIMULATION gates (no GPU). Real-fleet gates need the Shard fork + a g6 pool."
+}

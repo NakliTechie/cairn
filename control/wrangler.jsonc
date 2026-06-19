@@ -1,0 +1,22 @@
+{
+  // Cairn control plane — Workers gateway + Durable Objects fleet state (spec §7).
+  // Deploy is owner-gated: `wrangler deploy` needs Cloudflare auth + the API-key/PSK
+  // secrets set out-of-band (spec §8 — never in the repo).
+  "name": "cairn-control",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "FLEET", "class_name": "FleetDO" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["FleetDO"] }
+  ],
+  "vars": {
+    "SERVICE_VERSION": "0.1.0"
+  }
+  // Secrets (set via `wrangler secret put`, never here):
+  //   CAIRN_API_KEYS   — comma-separated valid API keys
+  //   SHARD_PSK        — wire seal for the in-VPC data plane
+  //   HF_TOKEN, AWS_*  — data-plane provisioning (used by infra/, not the Worker)
+}

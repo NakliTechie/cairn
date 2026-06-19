@@ -1,0 +1,54 @@
+# Cairn model-as-config — Qwen3.5-397B-A17B (commercial headline target). SKELETON.
+#
+# Spec §3: the headline model. ~397 GB (FP8) / ~200 GB (INT4); pool = g6e.xlarge
+# (1× L40S, 48 GB); N ≈ 9–10 (FP8) / ≈ 5 (INT4) weights-only (real N larger after KV).
+#
+# Architecture values below are PLACEHOLDERS — fill from the real config.json when the
+# weights/spec are pinned. Footprint + pool are from spec §3 and are load-bearing now.
+# The point of this file existing: prove the fit handles a second model with ZERO new
+# code (invariant #3) — only the g6.xlarge→g6e.xlarge / footprint swap.
+
+name: qwen3.5-397b-a17b
+source:
+  hf_repo: Qwen/Qwen3.5-397B-A17B    # TODO confirm exact repo id when published
+license: Apache-2.0                   # confirmed in spec §3
+
+arch:
+  num_layers: 64            # TODO from config.json
+  hidden_size: 8192         # TODO
+  num_attention_heads: 64   # TODO
+  num_key_value_heads: 8    # TODO (GQA)
+  head_dim: 128             # TODO
+  vocab_size: 151936        # TODO
+  num_local_experts: 128    # TODO (A17B ⇒ ~17B active)
+  num_experts_per_tok: 8    # TODO
+  intermediate_size: 0      # TODO
+  max_context: 131072       # TODO
+  sliding_window: null
+  rope_theta: 1000000       # TODO
+  tie_word_embeddings: false
+
+quant:
+  method: fp8               # headline = FP8 (~397 GB); int4 variant ~200 GB is a separate config
+
+precision:
+  kv_dtype: float16
+  embedding_dtype: bfloat16
+  kv_model: full
+
+footprint:
+  total_weight_bytes: 426300473344   # ~397 GiB FP8 (spec §3)
+
+overheads:
+  framework_overhead_bytes: 4294967296   # ~4 GiB placeholder (L40S). TODO measure.
+  activation_buffer_bytes: 1073741824    # ~1 GiB placeholder. TODO measure.
+
+fit_defaults:
+  target_k: 8
+  max_context: 8192
+
+pool:
+  instance_type: g6e.xlarge
+  gpu: L40S
+  gpu_vram_bytes: 51539607552  # 48 GiB
+  gpu_count_per_node: 1
