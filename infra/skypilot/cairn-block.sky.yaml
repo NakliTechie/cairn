@@ -1,0 +1,45 @@
+# One Cairn block node — a single-GPU g6.xlarge spot instance serving one contiguous
+# block of layers. The fleet = N of these + 1 warm spare, all in one VPC/placement group.
+# Launched/torn-down entirely via the SkyPilot API (infra/skypilot/launch.py, down.py) —
+# never the AWS console.
+#
+# v1.0 proof model = gpt-oss-120b on g6.xlarge (1x L4, 24 GB); N ≈ 4 (see configs/).
+# SkyPilot's job: provision + per-instance spot recovery (the minutes-timescale backfill,
+# handoff §4). Cairn's controller owns block assignment, topology, and the seconds-
+# timescale warm-spare reassign (spec §5) — NOT SkyPilot.
+
+name: cairn-block
+
+resources:
+  cloud: aws
+  region: us-east-1                  # single region for v1.0 (multi-AZ hedge = v1.2)
+  instance_type: g6.xlarge          # 1x L4, 24 GB (spec §3)
+  use_spot: true                    # v1.0: spot-only, 0 on-demand floor (spec §5.2)
+  disk_size: 256                    # EBS: stage block weights here for fast re-stage (handoff §4)
+  # Low intra-pipeline latency: keep the pool in one cluster placement group. SkyPilot
+  # passes this through; confirm the exact field on the pinned SkyPilot version (handoff §3).
+  # (placement group wiring lives in launch.py via the AWS-specific config.)
+
+# Pinned, no surprise downloads (handoff §6). The box image: CUDA torch + SGLang + the fork.
+setup: |
+  set -euo pipefail
+  pip install --no-input -r ~/sky_workdir/infra/requirements-gpu.txt
+  # Pre-stage this block's weights to EBS so a reassign is VRAM-load only, never a
+  # download (spec §5.1). Uses HF_TOKEN; the controller tells the node which block.
+  python -m cairn_node.stage --hf-token-env HF_TOKEN || true
+
+# Boot the block runtime and register with the CF control plane. The controller assigns
+# the layer range + pipeline position; the decode loop runs wholly in-VPC (invariant #4).
+run: |
+  set -euo pipefail
+  python -m cairn_node.serve \
+    --control-url "$CAIRN_CONTROL_URL" \
+    --psk-env SHARD_PSK \
+    --bind 0.0.0.0:7777
+
+# Secrets are injected at launch from the environment / secret store, never stored here
+# (spec §8). launch.py fills these from ~/.cairn/secrets or env.
+envs:
+  SHARD_PSK: ""
+  HF_TOKEN: ""
+  CAIRN_CONTROL_URL: ""

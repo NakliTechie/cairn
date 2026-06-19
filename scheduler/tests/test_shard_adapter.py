@@ -35,6 +35,28 @@ def test_forward_and_load_are_gpu_gated():
         rt.forward("s", 123, 0)  # SGLang forward → CUDA (rung 2)
 
 
+def test_sglang_runtime_structural_and_gpu_gated():
+    from shard.node import LayerRange
+    from shard.sglang_node import SglangNodeRuntime
+
+    rt = SglangNodeRuntime("gpt-oss-120b", LayerRange(0, 9), device="cuda:0")
+    hb = rt.heartbeat()                      # heartbeat works without CUDA (reports not-alive)
+    assert hb["alive"] is False and hb["layers"] == [0, 9]
+    assert rt.kv_tokens("s") == 0
+    rt.free_seq("s")                          # no-op, must not raise
+    with pytest.raises(Exception):            # load_shard needs a GPU/sglang (SglangNotAvailable/NotImplemented)
+        rt.load_shard()
+
+
+def test_adapter_accepts_sglang_runtime_cls():
+    from shard.sglang_node import SglangNodeRuntime
+
+    rt = ShardBlockRuntime(0, 0, 8, "gpt-oss-120b", runtime_cls=SglangNodeRuntime)
+    assert isinstance(rt, BlockRuntime)       # still conforms to the seam with the real backend
+    with pytest.raises(Exception):
+        rt.load()                              # GPU-gated
+
+
 def test_build_shard_pipeline_mirrors_fit(gpt_oss_cfg):
     r = fit(gpt_oss_cfg, target_k=8, context_len=4096)
     pipe = build_shard_pipeline(r, gpt_oss_cfg.hf_repo or "gpt-oss-120b")

@@ -13,21 +13,25 @@ KV bookkeeping are real now and verified against the protocol on CPU.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Type
 
 from shard.node import LayerRange, NodeRuntime
 
 
 class ShardBlockRuntime:
-    """One real pipeline stage: a contiguous block of layers served by SGLang."""
+    """One real pipeline stage: a contiguous block of layers served by SGLang.
+
+    `runtime_cls` selects the backing NodeRuntime: the base contract (default — its
+    stubs raise NotImplementedError, so this is a CPU-safe no-op) or, on a GPU,
+    `shard.sglang_node.SglangNodeRuntime`."""
 
     def __init__(self, stage: int, layer_start: int, layer_end: int, model: str,
-                 device: str = "cuda:0") -> None:
+                 device: str = "cuda:0", runtime_cls: Type[NodeRuntime] = NodeRuntime) -> None:
         self.stage = stage
         self.layer_start = layer_start            # inclusive (Cairn convention)
         self.layer_end = layer_end                # inclusive
         # NodeRuntime.LayerRange.end is EXCLUSIVE — convert.
-        self._node = NodeRuntime(model, LayerRange(layer_start, layer_end + 1), device)
+        self._node = runtime_cls(model, LayerRange(layer_start, layer_end + 1), device)
         self._kv_len: Dict[str, int] = {}
 
     def load(self) -> None:
@@ -49,10 +53,12 @@ class ShardBlockRuntime:
         # needs a free_seq() (upstream has none); add it with the real forward impl.
 
 
-def build_shard_pipeline(fit_result, model: str, device: str = "cuda:0") -> List[ShardBlockRuntime]:
+def build_shard_pipeline(fit_result, model: str, device: str = "cuda:0",
+                         runtime_cls: Type[NodeRuntime] = NodeRuntime) -> List[ShardBlockRuntime]:
     """Materialise real ShardBlockRuntimes from a FitResult — the GPU counterpart of
-    `cairn_scheduler.runtime.build_mock_pipeline`. The same FitResult drives both."""
+    `cairn_scheduler.runtime.build_mock_pipeline`. The same FitResult drives both. On a
+    GPU pass `runtime_cls=SglangNodeRuntime` (from shard.sglang_node)."""
     return [
-        ShardBlockRuntime(a.stage, a.layer_start, a.layer_end, model, device)
+        ShardBlockRuntime(a.stage, a.layer_start, a.layer_end, model, device, runtime_cls)
         for a in fit_result.assignments
     ]

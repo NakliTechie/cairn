@@ -1,0 +1,43 @@
+{
+  "_comment": "Minimal-ish IAM policy for SkyPilot to provision the Cairn spot fleet on AWS. Apply it to a dedicated 'cairn-skypilot' IAM user via infra/aws/bootstrap.sh (AWS CLI — never the console). Confirm against SkyPilot's documented policy for the pinned version: https://docs.skypilot.co/en/latest/cloud-setup/cloud-permissions/aws.html",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Ec2SpotFleetLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:TerminateInstances",
+        "ec2:StopInstances",
+        "ec2:StartInstances",
+        "ec2:Describe*",
+        "ec2:CreateTags",
+        "ec2:CreatePlacementGroup",
+        "ec2:DeletePlacementGroup",
+        "ec2:CreateSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:CreateKeyPair",
+        "ec2:DeleteKeyPair",
+        "ec2:RequestSpotInstances",
+        "ec2:CancelSpotInstanceRequests"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InstanceProfileForSkyPilot",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:CreateRole",
+        "iam:CreateInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:PassRole",
+        "iam:GetInstanceProfile",
+        "iam:ListInstanceProfiles",
+        "iam:AttachRolePolicy",
+        "iam:PutRolePolicy"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
