@@ -72,3 +72,22 @@ def test_eviction_warning_sets_draining():
     f = _three_node_pipeline()
     f.note_eviction_warning("n1")
     assert f.nodes["n1"].state == NodeState.DRAINING
+
+
+def test_register_rejects_invalid_and_overlapping_ranges():
+    f = FleetState()
+    with pytest.raises(FleetError):
+        f.register_node("bad", 0, 10, 4, "v1")  # layer_end < layer_start - 1
+    f.register_node("n0", 0, 0, 11, "v1")
+    with pytest.raises(FleetError):
+        f.register_node("n1", 1, 6, 17, "v1")   # overlaps n0
+    f.register_node("tail", 2, 24, 23, "v1")     # 0-layer lm_head tail — allowed
+
+
+def test_set_state_seeds_heartbeat_on_active():
+    f = FleetState()
+    f.register_node("n0", 0, 0, 11, "v1")        # last_heartbeat defaults to 0.0
+    for s in (NodeState.STAGING, NodeState.WARM, NodeState.LOADING):
+        f.set_state("n0", s)
+    f.set_state("n0", NodeState.ACTIVE, t=500.0)
+    assert f.stale_nodes(now=600.0, timeout=1000.0) == []  # 600-500 < 1000 (would be 600-0 without L4)

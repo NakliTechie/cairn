@@ -31,7 +31,7 @@ export interface ChatRequest {
 // Length-independent constant-time-ish string compare (M8): always scans the full span,
 // no early-exit on the first differing byte. (Keys are high-entropy, so the length-XOR
 // leak is negligible; this removes the per-byte timing channel of `Set.has`/`===`.)
-function constantTimeEqual(a: string, b: string): boolean {
+export function constantTimeEqual(a: string, b: string): boolean {
   const enc = new TextEncoder();
   const ab = enc.encode(a);
   const bb = enc.encode(b);

@@ -16,7 +16,8 @@
     "SERVICE_VERSION": "0.1.0"
   }
   // Secrets (set via `wrangler secret put`, never here):
-  //   CAIRN_API_KEYS   — comma-separated valid API keys
-  //   SHARD_PSK        — wire seal for the in-VPC data plane
-  //   HF_TOKEN, AWS_*  — data-plane provisioning (used by infra/, not the Worker)
+  //   CAIRN_API_KEYS        — comma-separated valid API keys (public ingress)
+  //   CAIRN_INTERNAL_TOKEN  — shared secret for the data-plane → /internal/* control surface (S4)
+  //   SHARD_PSK             — wire seal for the in-VPC data plane
+  //   HF_TOKEN, AWS_*       — data-plane provisioning (used by infra/, not the Worker)
 }

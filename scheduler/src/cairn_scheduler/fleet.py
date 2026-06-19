@@ -41,15 +41,29 @@ class FleetState:
     def register_node(self, node_id, stage, layer_start, layer_end, version, t=0.0) -> NodeInfo:
         if node_id in self.nodes:
             raise FleetError(f"node {node_id} already registered")
+        # L5: validate the layer range + reject overlaps (a 0-layer lm_head tail has
+        # layer_end == layer_start - 1 and occupies no layers).
+        if layer_end < layer_start - 1:
+            raise FleetError(f"node {node_id}: invalid layer range [{layer_start}, {layer_end}]")
+        if layer_end >= layer_start:
+            for n in self.nodes.values():
+                if n.layer_end >= n.layer_start and layer_start <= n.layer_end and layer_end >= n.layer_start:
+                    raise FleetError(
+                        f"node {node_id} layers [{layer_start},{layer_end}] overlap "
+                        f"{n.node_id} [{n.layer_start},{n.layer_end}]"
+                    )
         info = NodeInfo(node_id, stage, layer_start, layer_end, version, NodeState.PROVISIONING, t)
         self.nodes[node_id] = info
         return info
 
-    def set_state(self, node_id: str, state: NodeState) -> None:
+    def set_state(self, node_id: str, state: NodeState, t: float = 0.0) -> None:
         info = self._node(node_id)
         if not can_transition(info.state, state):
             raise FleetError(f"illegal transition {info.state.value} → {state.value} for {node_id}")
         info.state = state
+        # L4: seed the heartbeat clock on first ACTIVE so the node isn't read as instantly stale.
+        if state == NodeState.ACTIVE and info.last_heartbeat == 0.0:
+            info.last_heartbeat = t
 
     def _node(self, node_id: str) -> NodeInfo:
         if node_id not in self.nodes:

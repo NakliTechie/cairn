@@ -2,20 +2,28 @@
 // auth → validate → admit → route → stream. NEVER in the per-token hot path
 // (invariant #4): on a valid request it forwards to the in-VPC entry node, which runs
 // the decode loop; the Worker only shapes the request and relays the stream back.
+//
+// It also exposes an authed /internal/* control surface (S4) backed by the FleetDO: the
+// data plane registers nodes / heartbeats / mirrors token-history; the recovery loop reads
+// health + policy. Internal calls are authenticated by CAIRN_INTERNAL_TOKEN, never the
+// public API keys.
 
-import { authenticate, GatewayError, parseRequest } from "./gateway";
+import { authenticate, constantTimeEqual, GatewayError, parseRequest } from "./gateway";
 import { FleetDO } from "./fleet-do";
 
 export interface Env {
   SERVICE_VERSION?: string;
   CAIRN_API_KEYS?: string; // comma-separated, set via `wrangler secret put` (spec §8)
+  CAIRN_INTERNAL_TOKEN?: string; // shared secret for the data-plane → control-plane /internal/* calls
   DATA_PLANE_URL?: string; // the in-VPC entry node ingress (set per deployment)
-  FLEET: DurableObjectNamespace;
+  FLEET: DurableObjectNamespace<FleetDO>;
 }
 
 const MODELS = new Set(["gpt-oss-120b", "qwen3.5-397b-a17b"]);
 const MAX_BODY_BYTES = 1_048_576; // 1 MiB request-body ceiling (H2)
 const UPSTREAM_TIMEOUT_MS = 120_000; // abort a hung data-plane forward (H4)
+const RATE_LIMIT_PER_MIN = 120; // per-key request ceiling (M7)
+const RATE_WINDOW_MS = 60_000;
 // Only these upstream response headers reach the client — never Set-Cookie or internal
 // banners (H3). text/event-stream (streaming) rides on content-type.
 const ALLOWED_RESPONSE_HEADERS = ["content-type", "cache-control", "x-request-id"];
@@ -34,10 +42,73 @@ function json(obj: unknown, status = 200): Response {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 }
 
+// The single fleet-state Durable Object for the cluster.
+function fleet(env: Env): DurableObjectStub<FleetDO> {
+  return env.FLEET.get(env.FLEET.idFromName("fleet"));
+}
+
+function internalAuthOk(request: Request, env: Env): boolean {
+  const tok = request.headers.get("x-cairn-internal");
+  // Fail closed: no configured token ⇒ the internal surface is unreachable.
+  return !!env.CAIRN_INTERNAL_TOKEN && !!tok && constantTimeEqual(tok, env.CAIRN_INTERNAL_TOKEN);
+}
+
+// Authed data-plane / recovery-loop control surface, backed by the FleetDO (S4).
+async function handleInternal(request: Request, url: URL, env: Env): Promise<Response> {
+  if (!internalAuthOk(request, env)) {
+    return json({ error: { message: "internal auth failed", type: "authentication_error", code: "authentication_error" } }, 401);
+  }
+  const f = fleet(env);
+  const p = url.pathname;
+  try {
+    if (request.method === "POST") {
+      const b = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+      switch (p) {
+        case "/internal/register":
+          await f.registerNode(b.nodeId as string, b.stage as number, b.layerStart as number, b.layerEnd as number, b.version as string, (b.t as number) ?? 0);
+          return json({ ok: true });
+        case "/internal/state":
+          await f.setState(b.nodeId as string, b.state as NodeStateLike, b.t as number);
+          return json({ ok: true });
+        case "/internal/topology":
+          await f.setTopology((b.order as string[]) ?? []);
+          return json({ ok: true });
+        case "/internal/heartbeat":
+          await f.heartbeat(b.nodeId as string, (b.t as number) ?? Date.now());
+          return json({ ok: true });
+        case "/internal/tokens":
+          await f.recordTokens(b.streamId as string, (b.tokenIds as number[]) ?? []);
+          return json({ ok: true });
+        case "/internal/stream/complete":
+          await f.dropStream(b.streamId as string);
+          return json({ ok: true });
+      }
+    } else if (request.method === "GET") {
+      const q = url.searchParams;
+      if (p === "/internal/recovery") {
+        return json(await f.selectRecovery(q.get("nodeId") ?? "", Number(q.get("warmSpares") ?? 0), q.get("spareVersion") ?? ""));
+      }
+      if (p === "/internal/stale") {
+        return json({ stale: await f.staleNodes(Number(q.get("now") ?? 0), Number(q.get("timeout") ?? 0)) });
+      }
+    }
+    return json({ error: { message: "not found", type: "not_found", code: "not_found" } }, 404);
+  } catch (e) {
+    // FleetError (illegal transition, overlap, over-cap, …) → 400 with the message.
+    return json({ error: { message: String((e as Error)?.message ?? e), type: "invalid_request_error", code: "invalid_request_error" } }, 400);
+  }
+}
+
+// The DO's RPC type for setState's enum arg (kept loose to avoid importing the enum here).
+type NodeStateLike = Parameters<FleetDO["setState"]>[1];
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (url.pathname.startsWith("/internal/")) {
+      return handleInternal(request, url, env);
+    }
     if (request.method === "GET" && url.pathname === "/version") {
       return json({ service: "cairn", version: env.SERVICE_VERSION ?? "dev" });
     }
@@ -46,9 +117,14 @@ export default {
     }
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
       try {
-        authenticate(request.headers.get("authorization"), apiKeys(env));
-        // TODO(M7): per-key rate limit goes here — mechanism undecided (CF Rate Limiting
-        // binding vs a counter in FleetDO, which couples to the S4 wire-the-DO decision). /decide-nt.
+        const key = authenticate(request.headers.get("authorization"), apiKeys(env));
+        // M7: per-key rate limit via the FleetDO counter (skipped if no DO binding, e.g. in unit tests).
+        if (env.FLEET) {
+          const rl = await fleet(env).checkRate(key, RATE_LIMIT_PER_MIN, RATE_WINDOW_MS);
+          if (!rl.allowed) {
+            return json({ error: { message: "rate limit exceeded", type: "rate_limit_error", code: "rate_limit_exceeded" } }, 429);
+          }
+        }
         const declaredLen = Number(request.headers.get("content-length") ?? 0);
         if (declaredLen > MAX_BODY_BYTES) {
           throw new GatewayError(413, "request body too large", "payload_too_large");

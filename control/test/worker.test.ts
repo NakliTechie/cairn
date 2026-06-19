@@ -80,6 +80,14 @@ describe("worker routes", () => {
     expect(r.status).toBe(504);
   });
 
+  it("rejects /internal/* without the internal token (S4)", async () => {
+    const r = await worker.fetch(
+      new Request("https://cairn.example/internal/register", { method: "POST", body: "{}" }),
+      env, // no CAIRN_INTERNAL_TOKEN → fail closed
+    );
+    expect(r.status).toBe(401);
+  });
+
   it("404s an unknown route", async () => {
     const r = await worker.fetch(new Request("https://cairn.example/nope"), env);
     expect(r.status).toBe(404);
