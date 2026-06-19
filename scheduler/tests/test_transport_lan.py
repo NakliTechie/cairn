@@ -51,3 +51,21 @@ def test_tampered_frame_is_a_dead_edge():
     with pytest.raises(EDGE_ERRORS):
         rx.recv()
     assert rx.health()["alive"] is False and rx.resets == 1  # supervision marks it dead
+
+
+def test_oversized_frame_is_rejected():
+    """M11: a hostile !Q length beyond the cap is rejected before _recvall buffers it."""
+    wire.use_key("test-psk")
+    a, b = socket.socketpair()
+    rx = LanEdge.from_socket(b, name="rx")
+    a.sendall(struct.pack("!Q", 65 * 1024 * 1024))  # declare 65 MiB (> the 64 MiB cap)
+    with pytest.raises(EDGE_ERRORS):
+        rx.recv()
+    assert rx.health()["alive"] is False
+
+
+def test_from_socket_sets_last_ok():
+    """L3: an accepted edge has a defined health age immediately (parity with connect())."""
+    _, b = socket.socketpair()
+    rx = LanEdge.from_socket(b, name="rx")
+    assert rx.health()["age_s"] is not None

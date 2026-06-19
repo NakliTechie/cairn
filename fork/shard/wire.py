@@ -39,6 +39,11 @@ from cryptography.exceptions import InvalidTag
 
 _KEY = None                                  # 32-byte AEAD key, set once per process
 _NONCE = 12                                  # ChaCha20-Poly1305 nonce length
+# Cap the pre-auth frame length (Cairn hardening, forward-pass M11): recv_msg reads the !Q
+# length prefix in the clear before it can authenticate, so an unbounded value lets any
+# in-VPC host exhaust a node's memory in _recvall. Activations are KB-scale (spec §6); 64 MiB
+# is a generous ceiling well under any DoS.
+_MAX_FRAME = 64 * 1024 * 1024
 # torch dtype <-> stable JSON-clean name, so the header serializes without pickle
 _DTYPES = {str(d): d for d in (torch.float32, torch.float16, torch.bfloat16,
                                torch.int64, torch.int32, torch.uint8, torch.bool)}
@@ -147,6 +152,8 @@ def send_msg(sock, obj):
 
 def recv_msg(sock):
     (n,) = struct.unpack("!Q", _recvall(sock, 8))
+    if n > _MAX_FRAME:  # reject before _recvall buffers it — a hostile length is a dead edge (M11)
+        raise ConnectionError(f"frame length {n} exceeds {_MAX_FRAME} cap")
     frame = _recvall(sock, n)
     # any frame we can't authenticate AND parse into a message is a dead edge: re-raise as
     # ConnectionError so the existing `except EDGE_ERRORS` supervision resets the connection

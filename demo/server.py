@@ -15,6 +15,7 @@ data-plane logic* running together; only the SGLang block forward is mocked (run
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,7 +30,7 @@ from cairn_scheduler.runtime import build_mock_pipeline  # noqa: E402
 from cairn_scheduler.scheduler import Scheduler, Stream  # noqa: E402
 from cairn_scheduler.sim import Sim  # noqa: E402
 
-API_KEY = "sk-cairn-demo"
+API_KEY = os.environ.get("CAIRN_DEMO_API_KEY", "sk-cairn-demo")  # dev default; override via env (L7)
 CFG = ROOT / "configs" / "gpt-oss-120b.yaml"
 MAX_BODY_BYTES = 1_048_576  # 1 MiB request-body ceiling (H2)
 
@@ -109,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/demo/scenario"):
             self._send(eng.scenario())
         else:
-            self._send({"error": {"message": "not found", "type": "not_found"}}, 404)
+            self._send({"error": {"message": "not found", "type": "not_found", "code": "not_found"}}, 404)
 
     def _read_capped(self, length: int):
         """Read the body buffering at most MAX_BODY_BYTES, but DRAIN the rest so the client
@@ -131,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         eng = _engine()
         if self.path != "/v1/chat/completions":
-            self._send({"error": {"message": "not found", "type": "not_found"}}, 404)
+            self._send({"error": {"message": "not found", "type": "not_found", "code": "not_found"}}, 404)
             return
         try:
             eng.gateway.authenticate(self.headers.get("authorization"))
@@ -152,7 +153,7 @@ class Handler(BaseHTTPRequestHandler):
         except GatewayError as e:
             self._send(e.to_error(), e.status)
         except Exception:  # never leak a traceback to the client (M10)
-            self._send({"error": {"message": "internal error", "type": "internal_error"}}, 500)
+            self._send({"error": {"message": "internal error", "type": "internal_error", "code": "internal_error"}}, 500)
 
 
 def make_server(port: int = 8400) -> ThreadingHTTPServer:
@@ -162,5 +163,6 @@ def make_server(port: int = 8400) -> ThreadingHTTPServer:
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8400
-    print(f"Cairn demo on http://127.0.0.1:{port}  (API key: {API_KEY})")
+    src = "env CAIRN_DEMO_API_KEY" if os.environ.get("CAIRN_DEMO_API_KEY") else "dev default"
+    print(f"Cairn demo on http://127.0.0.1:{port}  (API key from {src} — not printed)")
     make_server(port).serve_forever()

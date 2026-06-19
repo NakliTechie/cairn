@@ -85,6 +85,10 @@ class ModelConfig:
             raise ConfigError(f"{self.name}: num_layers must be > 0")
         if self.num_key_value_heads <= 0 or self.head_dim <= 0:
             raise ConfigError(f"{self.name}: GQA dims (num_key_value_heads, head_dim) must be > 0")
+        # L6: a 0 here silently understates the footprint (e.g. embedding_bytes==0) and skews the fit.
+        for fld in ("hidden_size", "vocab_size", "num_attention_heads", "max_context"):
+            if getattr(self, fld) <= 0:
+                raise ConfigError(f"{self.name}: {fld} must be > 0")
         if self.total_weight_bytes <= 0:
             raise ConfigError(f"{self.name}: footprint.total_weight_bytes must be > 0")
         if self.gpu_vram_bytes <= 0:

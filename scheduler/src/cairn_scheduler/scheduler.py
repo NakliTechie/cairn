@@ -135,7 +135,6 @@ class Scheduler:
         *,
         vocab_size: int,
         k_max: int,
-        k_min: Optional[int] = None,
         service_time: float = 1.0,
         high_watermark: int = 8,
     ) -> None:
@@ -148,7 +147,6 @@ class Scheduler:
         self.sim = sim
         self.vocab = vocab_size
         self.k_max = k_max
-        self.k_min = k_min if k_min is not None else len(runtimes)  # K_min = N (spec §4.3)
         self.stages: List[_Stage] = [
             _Stage(sim, rt, i, service_time, high_watermark, self) for i, rt in enumerate(runtimes)
         ]

@@ -20,8 +20,14 @@ const UPSTREAM_TIMEOUT_MS = 120_000; // abort a hung data-plane forward (H4)
 // banners (H3). text/event-stream (streaming) rides on content-type.
 const ALLOWED_RESPONSE_HEADERS = ["content-type", "cache-control", "x-request-id"];
 
+const _keyCache = new WeakMap<Env, Set<string>>(); // memoize per env — avoid re-parsing each request (S9)
 function apiKeys(env: Env): Set<string> {
-  return new Set((env.CAIRN_API_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+  let keys = _keyCache.get(env);
+  if (!keys) {
+    keys = new Set((env.CAIRN_API_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+    _keyCache.set(env, keys);
+  }
+  return keys;
 }
 
 function json(obj: unknown, status = 200): Response {

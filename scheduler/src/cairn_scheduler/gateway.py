@@ -11,8 +11,8 @@ scheduler's.
 from __future__ import annotations
 
 import hmac
-from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Set
+from dataclasses import dataclass
+from typing import Iterator, List, Optional, Set
 
 from .runtime import _mix
 from .scheduler import Stream

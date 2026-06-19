@@ -79,6 +79,7 @@ class LanEdge:
         cls._nodelay(sock)
         edge._sock = sock
         edge.alive = True
+        edge.last_ok = time.monotonic()  # parity with connect() — health()'s age_s starts defined (L3)
         return edge
 
     def connect(self) -> None:

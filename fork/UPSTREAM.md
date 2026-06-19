@@ -14,7 +14,7 @@ volunteer-node privacy, decentralised payments) — see `docs/cairn-vision-roadm
 
 | Cairn path | Upstream | Why |
 |---|---|---|
-| `shard/wire.py` | `phase0/wire.py` | The wire — pickle-free JSON header + raw tensor bytes, ChaCha20-Poly1305 under `SHARD_PSK`, crypto self-test at boot. **Verbatim** (handoff §3/§6, spec §8). |
+| `shard/wire.py` | `phase0/wire.py` | The wire — pickle-free JSON header + raw tensor bytes, ChaCha20-Poly1305 under `SHARD_PSK`, crypto self-test at boot (handoff §3/§6, spec §8). Verbatim **except one Cairn patch**: a `_MAX_FRAME` cap in `recv_msg` (forward-pass M11) — the pre-auth `!Q` length is now bounded so a hostile frame can't exhaust memory. |
 | `shard/node.py` | `shard/node.py` | `NodeRuntime` — the `forward(hidden_states, kv_meta) → hidden` block-runtime contract (SGLang wrap). The seam the scheduler drives. |
 | `shard/topology.py` | `shard/topology.py` | Pure min-latency loop solver (Held-Karp + 2-opt). **Not load-bearing in v1.0** (one placement group → trivial order); kept for v1.2 AZ-spread. |
 | `LICENSE` | `LICENSE` | Apache-2.0, required. |

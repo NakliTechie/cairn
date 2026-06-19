@@ -46,6 +46,19 @@ def test_sglang_runtime_structural_and_gpu_gated():
     rt.free_seq("s")                          # no-op, must not raise
     with pytest.raises(Exception):            # load_shard needs a GPU/sglang (SglangNotAvailable/NotImplemented)
         rt.load_shard()
+    # L1: a malformed-but-colon-bearing device string must not crash the constructor.
+    for dev in ("cuda:", "cuda:abc", "cuda", "cpu"):
+        assert SglangNodeRuntime("m", LayerRange(0, 1), device=dev).device_index == 0
+
+
+def test_adapter_free_stream_releases_node_kv():
+    """S11: ShardBlockRuntime.free_stream delegates to the backing runtime's free_seq."""
+    from shard.sglang_node import SglangNodeRuntime
+
+    rt = ShardBlockRuntime(0, 0, 8, "gpt-oss-120b", runtime_cls=SglangNodeRuntime)
+    rt._node._kv_seqs["s"] = 3            # simulate KV cached on the node for stream "s"
+    rt.free_stream("s")
+    assert rt._node.kv_tokens("s") == 0  # released via free_seq, not just the adapter's counter
 
 
 def test_adapter_accepts_sglang_runtime_cls():

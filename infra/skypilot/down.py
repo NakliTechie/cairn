@@ -36,9 +36,10 @@ def main() -> int:
         return 0
 
     for j in jobs:
-        sky.jobs.cancel(name=j["job_name"])
-        print(f"[down] cancelled {j['job_name']}")
-    print(f"[down] fleet scaled to zero — no idle GPU spend.")
+        name = j.get("job_name")  # consistent .get access (S10)
+        sky.jobs.cancel(name=name)
+        print(f"[down] cancelled {name}")
+    print("[down] fleet scaled to zero — no idle GPU spend.")
     return 0
 
 

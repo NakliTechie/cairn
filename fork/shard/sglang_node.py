@@ -52,7 +52,8 @@ class SglangNodeRuntime(NodeRuntime):
                  quant: str = "mxfp4") -> None:
         super().__init__(model, layer_range, device)
         self.quant = quant
-        self.device_index = int(device.split(":")[1]) if ":" in device else 0
+        parts = device.split(":")  # tolerate "cpu" / "cuda" / "cuda:N" without crashing (L1)
+        self.device_index = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
         self._engine = None                      # the loaded SGLang block engine
         self._kv_seqs: Dict[str, int] = {}       # seq_id -> tokens cached on THIS block
 
@@ -103,10 +104,14 @@ class SglangNodeRuntime(NodeRuntime):
             "kv_seqs": len(self._kv_seqs),
         }
         if _HAS_TORCH and torch.cuda.is_available():
-            free, total = torch.cuda.mem_get_info(self.device_index)
-            info["vram_used_gb"] = round((total - free) / 2**30, 2)
-            info["vram_total_gb"] = round(total / 2**30, 2)
-            info["alive"] = True
+            try:
+                free, total = torch.cuda.mem_get_info(self.device_index)
+                info["vram_used_gb"] = round((total - free) / 2**30, 2)
+                info["vram_total_gb"] = round(total / 2**30, 2)
+                info["alive"] = True
+            except Exception as e:  # bad ordinal / driver error → unhealthy, never throw (L2)
+                info["alive"] = False
+                info["note"] = f"VRAM probe failed: {e}"
         else:
             info["alive"] = False
             info["note"] = "no CUDA — this runtime is GPU-only (rung 2/3)"

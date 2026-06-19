@@ -49,8 +49,11 @@ class ShardBlockRuntime:
 
     def free_stream(self, stream_id: str) -> None:
         self._kv_len.pop(stream_id, None)
-        # TODO(rung-2): also free this seq's KV pages in the SGLang engine — NodeRuntime
-        # needs a free_seq() (upstream has none); add it with the real forward impl.
+        # Release the seq's KV on the backing runtime if it supports it (SglangNodeRuntime
+        # has free_seq; the base NodeRuntime contract does not) — S11.
+        free_seq = getattr(self._node, "free_seq", None)
+        if callable(free_seq):
+            free_seq(stream_id)
 
 
 def build_shard_pipeline(fit_result, model: str, device: str = "cuda:0",
