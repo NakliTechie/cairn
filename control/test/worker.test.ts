@@ -36,6 +36,15 @@ describe("worker routes", () => {
     expect(r.status).toBe(400);
   });
 
+  it("rejects an oversized body (H2)", async () => {
+    // 413 when Content-Length is present (real HTTP); 400 via the gateway char-cap when it
+    // isn't (the in-process Request doesn't always set it). Either way the body is rejected,
+    // never buffered into the fleet — that's the security property.
+    const big = { model: "gpt-oss-120b", messages: [{ role: "user", content: "a".repeat(1_100_000) }] };
+    const r = await worker.fetch(post(big, "Bearer sk-good"), env);
+    expect([400, 413]).toContain(r.status);
+  });
+
   it("returns 503 when the data plane is not attached (valid request)", async () => {
     const r = await worker.fetch(
       post({ model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] }, "Bearer sk-good"),

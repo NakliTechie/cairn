@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scheduler" / "src"))
@@ -31,6 +31,7 @@ from cairn_scheduler.sim import Sim  # noqa: E402
 
 API_KEY = "sk-cairn-demo"
 CFG = ROOT / "configs" / "gpt-oss-120b.yaml"
+MAX_BODY_BYTES = 1_048_576  # 1 MiB request-body ceiling (H2)
 
 
 class Engine:
@@ -110,6 +111,23 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send({"error": {"message": "not found", "type": "not_found"}}, 404)
 
+    def _read_capped(self, length: int):
+        """Read the body buffering at most MAX_BODY_BYTES, but DRAIN the rest so the client
+        still receives our response cleanly (rejecting on Content-Length alone and closing
+        mid-upload resets the connection). Returns (kept_bytes, total_bytes_seen)."""
+        kept = bytearray()
+        total = 0
+        remaining = max(0, length)
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            total += len(chunk)
+            if len(kept) < MAX_BODY_BYTES:
+                kept.extend(chunk[: MAX_BODY_BYTES - len(kept)])
+        return bytes(kept), total
+
     def do_POST(self):
         eng = _engine()
         if self.path != "/v1/chat/completions":
@@ -117,8 +135,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             eng.gateway.authenticate(self.headers.get("authorization"))
-            length = int(self.headers.get("content-length", 0))
-            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                length = int(self.headers.get("content-length", 0))
+            except ValueError:
+                raise GatewayError(400, "invalid Content-Length")
+            raw, total = self._read_capped(length)
+            if total > MAX_BODY_BYTES:
+                raise GatewayError(413, "request body too large")
+            raw = raw or b"{}"
             try:
                 body = json.loads(raw)
             except json.JSONDecodeError:
@@ -127,10 +151,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(eng.complete(req))
         except GatewayError as e:
             self._send(e.to_error(), e.status)
+        except Exception:  # never leak a traceback to the client (M10)
+            self._send({"error": {"message": "internal error", "type": "internal_error"}}, 500)
 
 
-def make_server(port: int = 8400) -> HTTPServer:
-    return HTTPServer(("127.0.0.1", port), Handler)
+def make_server(port: int = 8400) -> ThreadingHTTPServer:
+    _engine()  # build eagerly (single-threaded) so the lazy init can't race under threads (L8)
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
 if __name__ == "__main__":

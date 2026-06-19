@@ -14,6 +14,7 @@ export interface Env {
 }
 
 const MODELS = new Set(["gpt-oss-120b", "qwen3.5-397b-a17b"]);
+const MAX_BODY_BYTES = 1_048_576; // 1 MiB request-body ceiling (H2)
 
 function apiKeys(env: Env): Set<string> {
   return new Set((env.CAIRN_API_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
@@ -36,6 +37,10 @@ export default {
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
       try {
         authenticate(request.headers.get("authorization"), apiKeys(env));
+        const declaredLen = Number(request.headers.get("content-length") ?? 0);
+        if (declaredLen > MAX_BODY_BYTES) {
+          throw new GatewayError(413, "request body too large", "payload_too_large");
+        }
         const body = await request.json().catch(() => {
           throw new GatewayError(400, "invalid JSON body");
         });

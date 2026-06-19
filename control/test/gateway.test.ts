@@ -38,6 +38,9 @@ describe("parseRequest", () => {
     [body({ messages: [] }), 400], // empty messages
     [body({ messages: [{ role: "user" }] }), 400], // malformed message
     [body({ max_tokens: 0 }), 400], // bad max_tokens
+    [body({ max_tokens: 10_000_000 }), 400], // H1: over the ceiling
+    [body({ messages: Array(300).fill({ role: "user", content: "x" }) }), 400], // H2: too many messages
+    [body({ messages: [{ role: "user", content: "x".repeat(200_000) }] }), 400], // H2: prompt too large
   ])("rejects %o with status %i", (b, status) => {
     try {
       parseRequest(b, MODELS);

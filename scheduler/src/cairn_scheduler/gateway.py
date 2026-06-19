@@ -52,11 +52,23 @@ def _prompt_to_hiddens(messages: List[dict]) -> List[int]:
     return hiddens or [_mix(0xA11CE, 1) & 0xFFFF]  # never-empty prompt
 
 
+# Ingress limits — bound every request so one caller can't fan an unbounded decode or a
+# giant prompt into the fleet (forward-pass H1/H2). Keep in sync with control/src/gateway.ts.
+MAX_OUTPUT_TOKENS = 4096
+MAX_MESSAGES = 256
+MAX_PROMPT_CHARS = 128_000
+
+
 class Gateway:
-    def __init__(self, *, api_keys: Set[str], model_names: Set[str], default_version: str = "v1") -> None:
+    def __init__(self, *, api_keys: Set[str], model_names: Set[str], default_version: str = "v1",
+                 max_output_tokens: int = MAX_OUTPUT_TOKENS, max_messages: int = MAX_MESSAGES,
+                 max_prompt_chars: int = MAX_PROMPT_CHARS) -> None:
         self.api_keys = set(api_keys)
         self.model_names = set(model_names)
         self.version = default_version  # surfaced at /version (handoff §14)
+        self.max_output_tokens = max_output_tokens
+        self.max_messages = max_messages
+        self.max_prompt_chars = max_prompt_chars
         self._counter = 0
 
     # --- auth (one door, invariant #7) ---
@@ -80,12 +92,21 @@ class Gateway:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise GatewayError(400, "messages must be a non-empty array")
+        if len(messages) > self.max_messages:
+            raise GatewayError(400, f"too many messages (max {self.max_messages})")
+        total_chars = 0
         for m in messages:
             if not isinstance(m, dict) or "role" not in m or "content" not in m:
                 raise GatewayError(400, "each message needs 'role' and 'content'")
+            total_chars += len(str(m.get("content", "")))
+        if total_chars > self.max_prompt_chars:
+            raise GatewayError(400, f"prompt too large (max {self.max_prompt_chars} chars)")
         max_tokens = body.get("max_tokens", 64)
-        if not isinstance(max_tokens, int) or max_tokens < 1:
+        # `type(...) is int` rejects bool (isinstance(True, int) is True) — M14.
+        if type(max_tokens) is not int or max_tokens < 1:
             raise GatewayError(400, "max_tokens must be a positive integer")
+        if max_tokens > self.max_output_tokens:
+            raise GatewayError(400, f"max_tokens exceeds ceiling ({self.max_output_tokens})")
         return ChatRequest(
             model=model, messages=messages, max_tokens=max_tokens,
             stream=bool(body.get("stream", False)), temperature=float(body.get("temperature", 0.0)),

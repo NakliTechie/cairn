@@ -34,6 +34,10 @@ def test_parse_valid_request():
     (_body(messages=[]), 400),                                       # empty messages
     (_body(messages=[{"role": "user"}]), 400),                       # malformed message
     (_body(max_tokens=0), 400),                                      # bad max_tokens
+    (_body(max_tokens=10_000_000), 400),                            # H1: over the ceiling
+    (_body(max_tokens=True), 400),                                  # M14: bool rejected
+    (_body(messages=[{"role": "user", "content": "x"}] * 300), 400),  # H2: too many messages
+    (_body(messages=[{"role": "user", "content": "x" * 200_000}]), 400),  # H2: prompt too large
 ])
 def test_parse_errors(body, status):
     with pytest.raises(GatewayError) as e:

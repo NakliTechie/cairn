@@ -40,6 +40,12 @@ export function authenticate(authorization: string | null, apiKeys: Set<string>)
   return key;
 }
 
+// Ingress limits — bound every request (forward-pass H1/H2). Keep in sync with the Python
+// gateway (scheduler/src/cairn_scheduler/gateway.py).
+export const MAX_OUTPUT_TOKENS = 4096;
+export const MAX_MESSAGES = 256;
+export const MAX_PROMPT_CHARS = 128_000;
+
 export function parseRequest(body: unknown, modelNames: Set<string>): ChatRequest {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new GatewayError(400, "request body must be a JSON object");
@@ -56,15 +62,26 @@ export function parseRequest(body: unknown, modelNames: Set<string>): ChatReques
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new GatewayError(400, "messages must be a non-empty array");
   }
+  if (messages.length > MAX_MESSAGES) {
+    throw new GatewayError(400, `too many messages (max ${MAX_MESSAGES})`);
+  }
+  let totalChars = 0;
   for (const m of messages) {
     if (typeof m !== "object" || m === null || !("role" in m) || !("content" in m)) {
       throw new GatewayError(400, "each message needs 'role' and 'content'");
     }
+    totalChars += String((m as Record<string, unknown>).content ?? "").length;
+  }
+  if (totalChars > MAX_PROMPT_CHARS) {
+    throw new GatewayError(400, `prompt too large (max ${MAX_PROMPT_CHARS} chars)`);
   }
   let maxTokens = 64;
   if (b.max_tokens !== undefined) {
     if (typeof b.max_tokens !== "number" || !Number.isInteger(b.max_tokens) || b.max_tokens < 1) {
       throw new GatewayError(400, "max_tokens must be a positive integer");
+    }
+    if (b.max_tokens > MAX_OUTPUT_TOKENS) {
+      throw new GatewayError(400, `max_tokens exceeds ceiling (${MAX_OUTPUT_TOKENS})`);
     }
     maxTokens = b.max_tokens;
   }

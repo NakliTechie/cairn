@@ -82,6 +82,18 @@ def test_unknown_model_404(base_url):
     assert status == 404
 
 
+def test_rejects_oversized_body(base_url):
+    big = {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "a" * 1_100_000}]}
+    status, _ = _post(base_url + "/v1/chat/completions", big, auth=f"Bearer {API_KEY}")
+    assert status == 413  # body-size cap fires before parse (H2/M10)
+
+
+def test_rejects_excessive_max_tokens(base_url):
+    body = {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10_000_000}
+    status, _ = _post(base_url + "/v1/chat/completions", body, auth=f"Bearer {API_KEY}")
+    assert status == 400  # H1 ceiling
+
+
 def test_scenario_runs_with_recovery(base_url):
     status, body = _get(base_url + "/demo/scenario")
     assert status == 200
