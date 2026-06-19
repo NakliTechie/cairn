@@ -16,9 +16,14 @@ resources:
   instance_type: g6.xlarge          # 1x L4, 24 GB (spec §3)
   use_spot: true                    # v1.0: spot-only, 0 on-demand floor (spec §5.2)
   disk_size: 256                    # EBS: stage block weights here for fast re-stage (handoff §4)
+  labels:
+    cairn: "true"                   # tag instances so the IAM destructive-action gate applies (infra/aws/iam-policy.json, M13/H5)
   # Low intra-pipeline latency: keep the pool in one cluster placement group. SkyPilot
   # passes this through; confirm the exact field on the pinned SkyPilot version (handoff §3).
   # (placement group wiring lives in launch.py via the AWS-specific config.)
+  # SECURITY (M13): the SG ingress for port 7777 (below) MUST be restricted to the fleet's
+  # own SG/CIDR — never 0.0.0.0/0. SkyPilot manages the SG; pin this when the SG wiring lands
+  # in launch.py. The block runtime binds the VPC-internal interface (run:), not all interfaces.
 
 # Pinned, no surprise downloads (handoff §6). The box image: CUDA torch + SGLang + the fork.
 setup: |
@@ -32,10 +37,11 @@ setup: |
 # the layer range + pipeline position; the decode loop runs wholly in-VPC (invariant #4).
 run: |
   set -euo pipefail
+  PRIVATE_IP="$(hostname -I | awk '{print $1}')"   # VPC-internal address (M13: not 0.0.0.0/all interfaces)
   python -m cairn_node.serve \
     --control-url "$CAIRN_CONTROL_URL" \
     --psk-env SHARD_PSK \
-    --bind 0.0.0.0:7777
+    --bind "${PRIVATE_IP}:7777"
 
 # Secrets are injected at launch from the environment / secret store, never stored here
 # (spec §8). launch.py fills these from ~/.cairn/secrets or env.

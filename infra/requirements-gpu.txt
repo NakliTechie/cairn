@@ -1,19 +1,23 @@
-# Cairn GPU box image — pinned, no surprise downloads (handoff §6: probe + pin every dep).
-# The exact CUDA build of torch is box/driver-specific (shard's pyproject note) — pin it to
-# the g6/L4 driver on first bring-up, then freeze here. Versions below are PLACEHOLDERS to
-# confirm on the box (rung 2).
+# Cairn GPU box image — EXACT pins, no wildcards (forward-pass M12: a floating `2.*`/`0.4.*`
+# pulls an unreviewed patch on the next bring-up — supply-chain + repro risk on a box that
+# decrypts activations). Versions below are the intended pins; confirm them against the L4
+# driver on first bring-up, then HASH-LOCK:
+#   pip-compile --generate-hashes -o requirements.lock requirements-gpu.txt   # on the GPU box
+#   pip install --require-hashes -r requirements.lock
+# The torch CUDA wheel is driver-specific — install with the matching index, e.g.:
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 
 # per-node serving engine — we wrap it at block granularity, don't rebuild it
-sglang==0.4.*            # TODO pin exact (the block-forward path is SGLang-version-specific)
-torch==2.*               # TODO pin the exact CUDA wheel for the L4 driver
+sglang==0.4.6.post5       # TODO confirm exact patch on the box (the block-forward path is SGLang-version-specific)
+torch==2.5.1              # + CUDA wheel via --index-url (L4 driver-specific)
 
 # the wire (fork/shard/wire.py) — required to load any node
-cryptography>=42
-numpy>=1.26
+cryptography==43.0.1
+numpy==1.26.4
 
 # model/weight pull
-huggingface-hub>=0.24
-transformers>=4.44       # rung-2 reference-block stepping stone (sglang_node.py path C)
+huggingface-hub==0.25.2
+transformers==4.45.2      # rung-2 reference-block stepping stone (sglang_node.py path C)
 
 # the Cairn scheduler/runtime (installed from the repo, editable on the box)
-pyyaml>=6.0
+pyyaml==6.0.2
