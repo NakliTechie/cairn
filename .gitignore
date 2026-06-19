@@ -1,0 +1,45 @@
+# Local working notes — not tracked (plan-folder convention)
+plan/
+
+# OS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Env / secrets — never committed (spec §8: secrets live in a secret store)
+.env
+.env.*
+*.pem
+*.key
+
+# Python (scheduler, infra, bench)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / Cloudflare control plane
+node_modules/
+.wrangler/
+dist/
+*.log
+
+# Model weights / large artifacts — never in the repo (handoff §6)
+*.safetensors
+*.bin
+*.gguf
+weights/
