@@ -36,6 +36,37 @@ def test_replay_rebuild_block_resumes_identically(gpt_oss_cfg):
     assert [rt for j, rt in enumerate(test) if j != i] == others_before  # only block i rebuilt
 
 
+def _tail_pipeline():
+    """18 layers across 2 stages + a 0-layer lm_head tail (stage 2) — the C1 trigger:
+    evicting stage 1 makes the old code pick the tail as 'survivor' (kv_len always 0)."""
+    return [MockBlockRuntime(0, 0, 8), MockBlockRuntime(1, 9, 17), MockBlockRuntime(2, 18, 17)]
+
+
+def test_c1_recovery_with_lmhead_tail_uncorrupted(gpt_oss_cfg):
+    """C1: a node whose downstream neighbour is a 0-layer lm_head tail must still rebuild
+    its KV to the committed length (not 0) — output identical to a no-crash run."""
+    vocab = gpt_oss_cfg.vocab_size
+    specs = [(f"s{i}", [i + 1, i + 2, i + 3], 12) for i in range(3)]
+
+    sim = Sim()
+    sched = Scheduler(sim, _tail_pipeline(), vocab_size=vocab, k_max=3)
+    sched.submit_all([Stream(id=i, prompt=list(p), max_new_tokens=m) for i, p, m in specs])
+    sim.run()
+    ref = {s.id: s.generated for s in sched.finished}
+
+    sim2 = Sim()
+    sched2 = Scheduler(sim2, _tail_pipeline(), vocab_size=vocab, k_max=3)
+    rm = RecoveryManager(sim2, sched2, warm_spares=1)
+    rm.arm(1, after_stream="s0", after_count=5)  # evict the pre-tail layer-bearing stage
+    sched2.submit_all([Stream(id=i, prompt=list(p), max_new_tokens=m) for i, p, m in specs])
+    sim2.run()
+    got = {s.id: s.generated for s in sched2.finished}
+
+    assert rm.timeline[0].stage == 1
+    assert rm.timeline[0].replay_tokens > 0   # actually replayed history (not the 0-len bug)
+    assert got == ref                          # uncorrupted despite the 0-layer tail neighbour
+
+
 def _run(cfg, specs, *, k_max, evict_stage=None, after="s0", count=0,
          warm_spares=1, version_skew=False):
     sim = Sim()

@@ -141,6 +141,10 @@ class Scheduler:
     ) -> None:
         if not runtimes:
             raise ValueError("need at least one stage")
+        if k_max < 1:
+            raise ValueError("k_max must be >= 1")
+        if vocab_size < 1:
+            raise ValueError("vocab_size must be >= 1")
         self.sim = sim
         self.vocab = vocab_size
         self.k_max = k_max
@@ -163,7 +167,7 @@ class Scheduler:
         # an eviction warning; fire a one-shot callback when the pipeline goes idle; observe
         # each committed token.
         self.paused = False
-        self._idle_cb: Optional[Callable[[], None]] = None
+        self._idle_cbs: List[Callable[[], None]] = []
         self.on_commit: Optional[Callable[[Stream, int], None]] = None
 
     @property
@@ -171,13 +175,24 @@ class Scheduler:
         return len(self.stages)
 
     # --- submission + admission ---
+    @staticmethod
+    def _validate(stream: Stream) -> None:
+        # Reject bad streams BEFORE they enter pending/active — a raise mid-admission used
+        # to strand the stream in `active` and permanently skew admission accounting (M5).
+        if not stream.prompt:
+            raise ValueError(f"stream {stream.id}: prompt must be non-empty")
+        if stream.max_new_tokens < 1:
+            raise ValueError(f"stream {stream.id}: max_new_tokens must be >= 1")
+
     def submit(self, stream: Stream) -> None:
+        self._validate(stream)
         self.pending.append(stream)
         self._admit()
 
     def submit_all(self, streams: List[Stream]) -> None:
         for s in streams:
-            self.pending.append(s)
+            self._validate(s)
+        self.pending.extend(streams)
         self._admit()
 
     def _admit(self) -> None:
@@ -189,8 +204,6 @@ class Scheduler:
             self._start_prefill(s)
 
     def _start_prefill(self, s: Stream) -> None:
-        if not s.prompt:
-            raise ValueError(f"stream {s.id}: prompt must be non-empty")
         s.phase = "prefill"
         s.prefill_remaining = len(s.prompt)
         s.entry_history = list(s.prompt)
@@ -246,15 +259,17 @@ class Scheduler:
         )
 
     def call_when_idle(self, cb: Callable[[], None]) -> None:
-        """Fire `cb` once, as soon as the pipeline is idle (now, or after it drains)."""
-        self._idle_cb = cb
+        """Fire `cb` once, as soon as the pipeline is idle (now, or after it drains). Queued,
+        so a second eviction in the same drain window doesn't drop the first's callback (M3)."""
+        self._idle_cbs.append(cb)
         self._check_idle()
 
     def _check_idle(self) -> None:
-        if self._idle_cb is not None and self.pipeline_idle():
-            cb = self._idle_cb
-            self._idle_cb = None
-            cb()
+        if self._idle_cbs and self.pipeline_idle():
+            cbs = self._idle_cbs
+            self._idle_cbs = []
+            for cb in cbs:
+                cb()
 
     def resume_feeding(self) -> None:
         self.paused = False

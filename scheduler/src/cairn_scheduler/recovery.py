@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from .domain import NodeState
+from .domain import NodeState, can_transition
 from .runtime import BlockRuntime, MockBlockRuntime
 from .scheduler import Scheduler
 from .sim import Sim
@@ -84,6 +84,25 @@ class RecoveryManager:
         }
         self._armed: Optional[dict] = None
 
+    def _set_state(self, pos: int, state: NodeState) -> None:
+        """Transition the node currently occupying pipeline position `pos`, validated
+        against the §5.4 state machine (M4 — recovery used to drive an illegal
+        DRAINING→LOADING without checking)."""
+        cur = self.node_state[pos]
+        if not can_transition(cur, state):
+            raise ValueError(f"illegal node transition {cur.value} → {state.value} at position {pos}")
+        self.node_state[pos] = state
+
+    def _committed_len(self, sid: str) -> int:
+        """The committed KV length for a stream, read from the DURABLE token-history:
+        entry-history minus the traversals still buffered at the entry (not yet processed
+        by any stage). Independent of any peer stage's cache — the old code read
+        `stages[i+1].kv_len`, which is always 0 for a 0-layer lm_head tail → it rebuilt the
+        reassigned stage with EMPTY KV (C1)."""
+        history = self.sched.active[sid].entry_history
+        buffered = sum(1 for it in self.sched._entry_buffer if it.stream_id == sid)
+        return max(0, len(history) - buffered)
+
     def arm(self, stage_index: int, *, after_stream: str, after_count: int,
             version_skew: bool = False) -> None:
         """Trigger an eviction of `stage_index` once `after_stream` commits `after_count`
@@ -103,7 +122,7 @@ class RecoveryManager:
     def evict(self, stage_index: int, *, version_skew: bool = False) -> None:
         """Eviction warning → DRAINING; stop feeding new tokens; recover once drained."""
         t_warn = self.sim.now
-        self.node_state[stage_index] = NodeState.DRAINING
+        self._set_state(stage_index, NodeState.DRAINING)  # ACTIVE → DRAINING (legal)
         self.sched.paused = True
         self.sched.call_when_idle(lambda: self._recover(stage_index, t_warn, version_skew))
 
@@ -114,15 +133,19 @@ class RecoveryManager:
         # activations are garbage → must rebuild) — spec §5.1.
         policy = "reassign" if (has_spare and not version_skew) else "rebuild"
 
-        self.node_state[i] = NodeState.LOADING  # spare: VRAM-load + graph capture
+        # The drained node dies; a DISTINCT pre-staged warm spare takes pipeline position i
+        # and loads the block (WARM → LOADING). Modelling them as the same key was what made
+        # the old DRAINING → LOADING transition illegal (M4).
+        self._set_state(i, NodeState.DEAD)        # DRAINING → DEAD (the old node)
+        self.node_state[i] = NodeState.WARM       # the spare (a different node) now occupies position i
+        self._set_state(i, NodeState.LOADING)     # WARM → LOADING (VRAM-load + graph capture)
         old_stage = self.sched.stages[i]
         new_rt = _fresh_like(old_stage.runtime)
         upstream = [st.runtime for st in self.sched.stages[:i]]
-        survivor = self.sched.stages[i + 1] if i + 1 < self.sched.n else self.sched.stages[i - 1]
 
         replay_tokens = 0
         for sid in affected:
-            target_len = survivor.runtime.kv_len(sid)  # rebuild to match surviving stages
+            target_len = self._committed_len(sid)  # rebuild to the committed count (durable history) — C1
             replay_rebuild_kv(upstream, new_rt, sid, self.sched.active[sid].entry_history, target_len)
             replay_tokens += target_len
 
@@ -136,7 +159,7 @@ class RecoveryManager:
         reprefill_s = replay_tokens * self.reprefill_per_token
 
         def _resume() -> None:
-            self.node_state[i] = NodeState.ACTIVE
+            self._set_state(i, NodeState.ACTIVE)  # LOADING → ACTIVE (legal)
             self.sched.resume_feeding()
 
         self.sim.schedule(load_s + reprefill_s, _resume)  # model the recovery gap

@@ -1,3 +1,5 @@
+import pytest
+
 from cairn_scheduler import fit
 from cairn_scheduler.runtime import MockBlockRuntime, build_mock_pipeline
 from cairn_scheduler.scheduler import Scheduler, Stream
@@ -62,6 +64,42 @@ def test_backpressure_bounds_queues(gpt_oss_cfg):
     specs = [(f"s{i}", [1, 2, 3], 10) for i in range(6)]
     sched, _ = _run(lambda: build_mock_pipeline(r), specs, gpt_oss_cfg.vocab_size, k_max=6, high_watermark=4)
     assert sched.max_queue_len() <= 4  # no stage queue ever exceeds the high-watermark
+
+
+def test_rejects_bad_streams(gpt_oss_cfg):
+    """M1/M5: empty prompt or max_new_tokens<1 is rejected at submit, before the stream
+    can enter `active` (no admission-accounting pollution)."""
+    r = fit(gpt_oss_cfg, target_k=8, context_len=4096)
+    sim = Sim()
+    sched = Scheduler(sim, build_mock_pipeline(r), vocab_size=gpt_oss_cfg.vocab_size, k_max=4)
+    with pytest.raises(ValueError):
+        sched.submit(Stream(id="empty", prompt=[], max_new_tokens=4))
+    with pytest.raises(ValueError):
+        sched.submit(Stream(id="zero", prompt=[1, 2], max_new_tokens=0))
+    assert len(sched.active) == 0 and sched.max_active == 0  # nothing polluted admission
+
+
+def test_rejects_bad_config(gpt_oss_cfg):
+    """M2: k_max<1 / vocab_size<1 fail loudly instead of silently admitting nothing."""
+    r = fit(gpt_oss_cfg, target_k=8, context_len=4096)
+    with pytest.raises(ValueError):
+        Scheduler(Sim(), build_mock_pipeline(r), vocab_size=gpt_oss_cfg.vocab_size, k_max=0)
+    with pytest.raises(ValueError):
+        Scheduler(Sim(), build_mock_pipeline(r), vocab_size=0, k_max=4)
+
+
+def test_call_when_idle_queues_multiple(gpt_oss_cfg):
+    """M3: two idle callbacks registered while work is in flight both fire — the second
+    no longer clobbers the first (a second eviction in a drain window must not be dropped)."""
+    r = fit(gpt_oss_cfg, target_k=8, context_len=4096)
+    sim = Sim()
+    sched = Scheduler(sim, build_mock_pipeline(r), vocab_size=gpt_oss_cfg.vocab_size, k_max=2)
+    fired = []
+    sched.submit(Stream(id="s", prompt=[1, 2], max_new_tokens=5))
+    sched.call_when_idle(lambda: fired.append("a"))
+    sched.call_when_idle(lambda: fired.append("b"))
+    sim.run()
+    assert fired == ["a", "b"]
 
 
 def test_multistream_improves_occupancy(gpt_oss_cfg):
