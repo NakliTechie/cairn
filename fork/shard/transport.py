@@ -64,11 +64,19 @@ class LanEdge:
         self.resets: int = 0
         self.alive: bool = False
 
+    @staticmethod
+    def _nodelay(sock: socket.socket) -> None:
+        # TCP_NODELAY is a TCP-only latency hint; never fatal (non-TCP sockets reject it).
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
     @classmethod
     def from_socket(cls, sock: socket.socket, **kw: Any) -> "LanEdge":
         """Wrap an already-accepted socket (the receiving side of an edge)."""
         edge = cls("", 0, **kw)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        cls._nodelay(sock)
         edge._sock = sock
         edge.alive = True
         return edge
@@ -76,7 +84,7 @@ class LanEdge:
     def connect(self) -> None:
         """Direct LAN dial (no hole-punch). Raises on failure → supervision retries."""
         sock = socket.create_connection((self.peer_host, self.peer_port), timeout=self.connect_timeout)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._nodelay(sock)
         self._sock = sock
         self.alive = True
         self.last_ok = time.monotonic()
