@@ -15,6 +15,10 @@ export interface Env {
 
 const MODELS = new Set(["gpt-oss-120b", "qwen3.5-397b-a17b"]);
 const MAX_BODY_BYTES = 1_048_576; // 1 MiB request-body ceiling (H2)
+const UPSTREAM_TIMEOUT_MS = 120_000; // abort a hung data-plane forward (H4)
+// Only these upstream response headers reach the client — never Set-Cookie or internal
+// banners (H3). text/event-stream (streaming) rides on content-type.
+const ALLOWED_RESPONSE_HEADERS = ["content-type", "cache-control", "x-request-id"];
 
 function apiKeys(env: Env): Set<string> {
   return new Set((env.CAIRN_API_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
@@ -37,6 +41,8 @@ export default {
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
       try {
         authenticate(request.headers.get("authorization"), apiKeys(env));
+        // TODO(M7): per-key rate limit goes here — mechanism undecided (CF Rate Limiting
+        // binding vs a counter in FleetDO, which couples to the S4 wire-the-DO decision). /decide-nt.
         const declaredLen = Number(request.headers.get("content-length") ?? 0);
         if (declaredLen > MAX_BODY_BYTES) {
           throw new GatewayError(413, "request body too large", "payload_too_large");
@@ -52,12 +58,24 @@ export default {
           );
         }
         // Forward to the in-VPC entry node — the decode loop runs there, not on CF.
-        const upstream = await fetch(env.DATA_PLANE_URL, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(req),
-        });
-        return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+        let upstream: Response;
+        try {
+          upstream = await fetch(env.DATA_PLANE_URL, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(req),
+            signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), // H4: never hang on a dead node
+          });
+        } catch {
+          return json({ error: { message: "upstream timeout or unreachable", type: "upstream_unavailable", code: "upstream_unavailable" } }, 504);
+        }
+        // H3: forward only an allowlist of response headers — never Set-Cookie / internal banners.
+        const safe = new Headers();
+        for (const h of ALLOWED_RESPONSE_HEADERS) {
+          const v = upstream.headers.get(h);
+          if (v) safe.set(h, v);
+        }
+        return new Response(upstream.body, { status: upstream.status, headers: safe });
       } catch (e) {
         if (e instanceof GatewayError) return json(e.toError(), e.status);
         return json({ error: { message: "internal error", type: "internal_error", code: "internal_error" } }, 500);

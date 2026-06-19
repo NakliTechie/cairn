@@ -1,7 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import worker, { type Env } from "../src/index";
 
 const env = { SERVICE_VERSION: "0.1.0", CAIRN_API_KEYS: "sk-good" } as unknown as Env;
+const envUpstream = { ...env, DATA_PLANE_URL: "https://data.internal/infer" } as unknown as Env;
+
+afterEach(() => vi.unstubAllGlobals());
+
+const chat = { model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] };
 
 function post(bodyObj: unknown, auth?: string): Request {
   const headers: Record<string, string> = { "content-type": "application/json" };
@@ -51,6 +56,28 @@ describe("worker routes", () => {
       env,
     );
     expect(r.status).toBe(503);
+  });
+
+  it("forwards only allow-listed response headers (H3)", async () => {
+    vi.stubGlobal("fetch", async () =>
+      new Response('{"ok":true}', {
+        status: 200,
+        headers: { "content-type": "application/json", "set-cookie": "sid=secret", "server": "internal-vllm" },
+      }),
+    );
+    const r = await worker.fetch(post(chat, "Bearer sk-good"), envUpstream);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toBe("application/json");
+    expect(r.headers.get("set-cookie")).toBeNull(); // leak blocked
+    expect(r.headers.get("server")).toBeNull();
+  });
+
+  it("returns 504 when the upstream forward fails/times out (H4)", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("upstream down");
+    });
+    const r = await worker.fetch(post(chat, "Bearer sk-good"), envUpstream);
+    expect(r.status).toBe(504);
   });
 
   it("404s an unknown route", async () => {

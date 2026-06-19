@@ -28,13 +28,31 @@ export interface ChatRequest {
   temperature: number;
 }
 
+// Length-independent constant-time-ish string compare (M8): always scans the full span,
+// no early-exit on the first differing byte. (Keys are high-entropy, so the length-XOR
+// leak is negligible; this removes the per-byte timing channel of `Set.has`/`===`.)
+function constantTimeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  let diff = ab.length ^ bb.length;
+  const n = Math.max(ab.length, bb.length);
+  for (let i = 0; i < n; i++) diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0);
+  return diff === 0;
+}
+
 // One door (invariant #7). Bearer-token auth against the configured key set.
 export function authenticate(authorization: string | null, apiKeys: Set<string>): string {
   if (!authorization || !authorization.startsWith("Bearer ")) {
     throw new GatewayError(401, "missing or malformed Authorization header", "authentication_error");
   }
   const key = authorization.slice("Bearer ".length).trim();
-  if (!apiKeys.has(key)) {
+  let ok = false;
+  for (const k of apiKeys) {
+    const match = constantTimeEqual(key, k); // computed first → no short-circuit timing leak
+    ok = ok || match;
+  }
+  if (!ok) {
     throw new GatewayError(401, "invalid API key", "authentication_error");
   }
   return key;

@@ -10,6 +10,7 @@ scheduler's.
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Set
 
@@ -76,7 +77,9 @@ class Gateway:
         if not authorization or not authorization.startswith("Bearer "):
             raise GatewayError(401, "missing or malformed Authorization header", "authentication_error")
         key = authorization[len("Bearer "):].strip()
-        if key not in self.api_keys:
+        # Constant-time compare (M8). `any` only short-circuits on a match (a valid key the
+        # attacker already holds); every invalid key is checked against all entries.
+        if not any(hmac.compare_digest(key, k) for k in self.api_keys):
             raise GatewayError(401, "invalid API key", "authentication_error")
         return key
 
