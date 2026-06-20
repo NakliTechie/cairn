@@ -19,6 +19,7 @@ Desktop.ini
 # Env / secrets — never committed (spec §8: secrets live in a secret store)
 .env
 .env.*
+secrets.env
 *.pem
 *.key
 

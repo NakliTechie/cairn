@@ -11,14 +11,25 @@ the first real GPU serving. **The GPU *is* the AWS spot box**, region is **per-m
 > transport, the adapter, the scheduler/recovery, and the SkyPilot configs are all ready —
 > only the SGLang block-forward and the live AWS run are left.
 
+## Objectives — what this runbook builds toward
+Full statement: [`docs/cairn-objectives.md`](../docs/cairn-objectives.md). End state:
+1. A **working system** proven up the cost-ladder (rungs 0→5).
+2. **Benchmark metrics** (Chunk C gate artifacts) — cost/token vs on-demand, MTTR, occupancy, split-correctness, induced-interruption — **head-to-head vs SpotServe (54%) + KevlarFlow (MTTR) on their exact models** (gpt-neox-20b, llama-3.1-8b).
+3. A **paper** (GitHub / arXiv).
+4. An **open-source repo** people run in production.
+
+The honest contribution = a **minimal hot-swap failover layer** for pipeline LLM serving on spot: on-demand-grade reliability at ~spot cost. Open source; consulting upside, not a product.
+
 ## What the user provides (the only blockers)
 1. **AWS account access** — admin once: enable the **`eu-south-2` (Spain) opt-in region**, mint
    the scoped key, and file the **G-spot vCPU quota** (Step 2.5 — has review lead time, start early).
 2. **HF token** — to pull model weights (gpt-oss-120b proof; GLM-5.2-NVFP4 headline; a 7–9B for rung-2 bring-up).
 3. **Acceptance of spot spend** — proof ~$0.8/hr, GLM-5.2 headline ~$2.3/hr while a fleet is up; `down.py` scales to zero.
 
-Secrets handling: everything goes in **env vars / a secret store**, never the repo
-(`.gitignore` blocks `*.key`/`*.pem`/`.env`). I never echo or commit a key.
+Secrets handling: put them in **`infra/secrets.env`** (gitignored — `cp infra/secrets.env.example`
+and fill `HF_TOKEN` / `SHARD_PSK` / `CAIRN_CONTROL_URL`). `launch.py` auto-loads it and injects to
+every node at boot, so the HF token transfers to the fleet without hand-copying. Never the repo
+(`.gitignore` blocks `secrets.env`/`*.key`/`*.pem`/`.env`). I never echo or commit a key.
 
 ---
 

@@ -33,12 +33,28 @@ BLOCK_TASK = ROOT / "infra" / "skypilot" / "cairn-block.sky.yaml"
 REQUIRED_SECRETS = ("SHARD_PSK", "HF_TOKEN", "CAIRN_CONTROL_URL")
 
 
+def _load_secrets_file() -> None:
+    """Auto-load infra/secrets.env (gitignored) into the environment, so HF_TOKEN / SHARD_PSK /
+    CAIRN_CONTROL_URL transfer to every fleet node at launch without hand-copying. Explicit env
+    vars win (setdefault). The file is NEVER committed (.gitignore); the repo ships only .example."""
+    f = ROOT / "infra" / "secrets.env"
+    if not f.exists():
+        return
+    for line in f.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
 def _secrets() -> dict:
+    _load_secrets_file()
     missing = [k for k in REQUIRED_SECRETS if not os.environ.get(k)]
     if missing:
         raise SystemExit(
-            f"[launch] missing secrets: {', '.join(missing)}. Export them (or source your "
-            f"secret store) — they are never read from the repo (spec §8)."
+            f"[launch] missing secrets: {', '.join(missing)}. Put them in infra/secrets.env "
+            f"(cp infra/secrets.env.example) or export them — never the repo (spec §8)."
         )
     return {k: os.environ[k] for k in REQUIRED_SECRETS}
 
