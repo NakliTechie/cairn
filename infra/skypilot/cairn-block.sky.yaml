@@ -12,8 +12,10 @@ name: cairn-block
 
 resources:
   cloud: aws
-  region: us-east-1                  # single region for v1.0 (multi-AZ hedge = v1.2)
-  instance_type: g6.xlarge          # 1x L4, 24 GB (spec §3)
+  region: eu-south-2                 # default/proof region (Spain). launch.py OVERRIDES per model from configs/<model>.yaml —
+                                    # GLM-5.2 headline runs in ap-northeast-2 (Seoul): live g7e spot ~40% cheaper there.
+  instance_type: g6.xlarge          # default/proof pool (1x L4, 24 GB). launch.py OVERRIDES this per model from
+                                    # configs/<model>.yaml pool — GLM-5.2 headline = g7e.2xlarge (1x RTX PRO 6000 Blackwell, 96 GB).
   use_spot: true                    # v1.0: spot-only, 0 on-demand floor (spec §5.2)
   disk_size: 256                    # EBS: stage block weights here for fast re-stage (handoff §4)
   labels:

@@ -1,0 +1,64 @@
+# Cairn model-as-config — GLM-5.2 (commercial HEADLINE target, 4-bit/NVFP4 on Blackwell).
+#
+# Spec invariant #3: "model is configuration". Adding this model is a new YAML, never a
+# new code path — only the footprint + pool (g7e.2xlarge) differ.
+#
+# Architecture values are verbatim from zai-org/GLM-5.2 config.json (HF).
+# License: MIT — confirmed, headline v0 license gate cleared.
+#
+# WHY g7e / Blackwell (not the cheaper L4/L40S Ada pools): GLM-5.2 uses DeepSeek Sparse
+# Attention (DSA). DSA attention kernels are gated to Hopper/Blackwell in mainline SGLang
+# (the only Ada path is a ~10 tok/s community port) — so L4/L40S CANNOT production-serve
+# this model regardless of weight quant. NVFP4 4-bit is HW-native on Blackwell (RTX PRO
+# 6000, g7e.2xlarge, 96 GB). See plan/history.md "Dead ends" (non-Blackwell ruled out by DSA).
+
+name: glm-5.2-nvfp4
+source:
+  hf_repo: lukealonso/GLM-5.2-NVFP4   # TODO pin/validate the exact NVFP4 checkpoint (community quants vary;
+                                       # `modelopt` is the legit path) or mint our own with NVIDIA ModelOpt.
+license: MIT                           # zai-org/GLM-5.2 — confirmed Apache-free, fully permissive
+
+arch:
+  num_layers: 78
+  hidden_size: 6144
+  num_attention_heads: 64
+  num_key_value_heads: 64      # NO GQA — full MHA. KV is heavy; DSA cuts attention COMPUTE, not KV STORAGE.
+  head_dim: 192
+  vocab_size: 154880
+  num_local_experts: 256       # MoE; 8 active/tok + 1 shared. Experts ride with their layer (inv #1).
+  num_experts_per_tok: 8
+  intermediate_size: 12288     # dense layers; moe_intermediate_size = 2048 per expert (doc only — not parsed)
+  first_k_dense_replace: 3     # first 3 layers dense, 75 MoE (doc only)
+  index_topk: 2048             # DeepSeek Sparse Attention indexer top-k (doc only — DSA is a serving-engine concern)
+  max_context: 131072          # 128K conservative fit ceiling; DSA enables up to ~1M. TODO confirm max_position_embeddings.
+  sliding_window: null
+  rope_theta: 1000000          # TODO confirm
+  tie_word_embeddings: false
+
+quant:
+  method: nvfp4                # 4-bit NVFP4 (NVIDIA ModelOpt), HW-native on Blackwell. ~0.5 B/param.
+
+precision:
+  kv_dtype: float8             # FP8 KV — realistic for 4-bit serving (float16 KV with 64 heads would be enormous)
+  embedding_dtype: bfloat16    # embed/lm_head/norm/router/indexer kept higher precision (not NVFP4)
+  kv_model: full               # conservative full-attention KV upper bound. TODO refine: DSA top-2048 caps effective KV (§12).
+
+footprint:
+  total_weight_bytes: 402653184000   # ~375 GiB NVFP4 ESTIMATE (753B x ~0.5 B/param + block-scales + non-quant
+                                      # embed/norm/router/indexer). MEASURE the real checkpoint size on the box (§12).
+
+# §12 calc inputs — resolve on real g7e hardware before the headline fit.
+overheads:
+  framework_overhead_bytes: 5368709120   # ~5 GiB: CUDA context + SGLang Blackwell reserved. TODO measure on g7e.
+  activation_buffer_bytes: 1610612736    # ~1.5 GiB: per-stage activation + DSA indexer scratch. TODO measure.
+
+fit_defaults:
+  target_k: 8                  # concurrent streams to reserve KV headroom for (K_min = N)
+  max_context: 8192            # context to size KV headroom against for the fit (NOT the 128K+ ceiling)
+
+pool:
+  instance_type: g7e.2xlarge
+  region: ap-northeast-2        # headline runs in SEOUL — live g7e spot ~40% cheaper than Spain ($0.53 vs $0.88/hr), 5-10% interruption, default-enabled
+  gpu: RTX PRO 6000 Blackwell
+  gpu_vram_bytes: 103079215104  # 96 GiB
+  gpu_count_per_node: 1         # single-GPU instance → blast-radius 1/N preserved (inv #1)

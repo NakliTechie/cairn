@@ -1,5 +1,5 @@
 {
-  "_comment": "Least-privilege policy for SkyPilot to run the Cairn spot fleet, applied to the 'cairn-skypilot' IAM user via infra/aws/bootstrap.sh (AWS CLI, never the console). HARDENED (forward-pass H5/H6): region-locked to us-east-1; destructive instance actions gated on the 'cairn' resource tag (the launch must tag instances cairn=true); IAM scoped to skypilot-* roles with PassRole pinned to EC2. MUST be validated before relying on it: `aws iam simulate-principal-policy` + a live `sky launch`. If SkyPilot fails an action, loosen THAT action specifically — never revert to Resource:* . Cross-check SkyPilot's current documented AWS policy and consider adding a PermissionsBoundary condition to CreateRole. [test: live policy-sim]",
+  "_comment": "Least-privilege policy for SkyPilot to run the Cairn spot fleet, applied to the 'cairn-skypilot' IAM user via infra/aws/bootstrap.sh (AWS CLI, never the console). HARDENED (forward-pass H5/H6): region-locked to TWO regions — eu-south-2 (Spain, opt-in: the g6.xlarge gpt-oss proof) + ap-northeast-2 (Seoul, default-enabled: the g7e.2xlarge GLM-5.2 Blackwell headline, ~40% cheaper g7e spot). The lock covers both pools since the gate is region+tag, not instance type; destructive instance actions gated on the 'cairn' resource tag (the launch must tag instances cairn=true); IAM scoped to skypilot-* roles with PassRole pinned to EC2. MUST be validated before relying on it: `aws iam simulate-principal-policy` + a live `sky launch`. If SkyPilot fails an action, loosen THAT action specifically — never revert to Resource:* . Cross-check SkyPilot's current documented AWS policy and consider adding a PermissionsBoundary condition to CreateRole. [test: live policy-sim]",
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -7,7 +7,7 @@
       "Effect": "Allow",
       "Action": ["ec2:Describe*", "ec2:Get*"],
       "Resource": "*",
-      "Condition": { "StringEquals": { "aws:RequestedRegion": "us-east-1" } }
+      "Condition": { "StringEquals": { "aws:RequestedRegion": ["eu-south-2", "ap-northeast-2"] } }
     },
     {
       "Sid": "ProvisionInRegion",
@@ -25,7 +25,7 @@
         "ec2:CancelSpotInstanceRequests"
       ],
       "Resource": "*",
-      "Condition": { "StringEquals": { "aws:RequestedRegion": "us-east-1" } }
+      "Condition": { "StringEquals": { "aws:RequestedRegion": ["eu-south-2", "ap-northeast-2"] } }
     },
     {
       "Sid": "MutateOnlyCairnTaggedInstances",
@@ -34,7 +34,7 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestedRegion": "us-east-1",
+          "aws:RequestedRegion": ["eu-south-2", "ap-northeast-2"],
           "ec2:ResourceTag/cairn": "true"
         }
       }

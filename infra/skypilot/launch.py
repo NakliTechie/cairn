@@ -33,11 +33,6 @@ BLOCK_TASK = ROOT / "infra" / "skypilot" / "cairn-block.sky.yaml"
 REQUIRED_SECRETS = ("SHARD_PSK", "HF_TOKEN", "CAIRN_CONTROL_URL")
 
 
-def fleet_size(model: str) -> int:
-    cfg = load_model_config(ROOT / "configs" / f"{model}.yaml")
-    return fit(cfg).n
-
-
 def _secrets() -> dict:
     missing = [k for k in REQUIRED_SECRETS if not os.environ.get(k)]
     if missing:
@@ -52,14 +47,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="gpt-oss-120b")
     ap.add_argument("--spares", type=int, default=1, help="warm spares (spec §5.2 v1.0 default: 1)")
-    ap.add_argument("--region", default="us-east-1")
+    ap.add_argument("--region", default=None, help="override the model's pool region (default: from configs/<model>.yaml)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    n = fleet_size(args.model)
+    cfg = load_model_config(ROOT / "configs" / f"{args.model}.yaml")
+    n = fit(cfg).n
+    instance_type = cfg.instance_type   # pool is model-config (inv #3): g6.xlarge proof / g7e.2xlarge GLM-5.2 headline
+    region = args.region or cfg.region  # region is model-config too: proof=eu-south-2 (Spain) / GLM headline=ap-northeast-2 (Seoul)
     total = n + args.spares
     print(f"[launch] {args.model}: N={n} block nodes + {args.spares} warm spare(s) = {total} "
-          f"g6.xlarge spot in {args.region} (one VPC/placement group)")
+          f"{instance_type} spot in {region} (one VPC/placement group)")
 
     if args.dry_run:
         print("[launch] dry-run: no resources provisioned.")
@@ -74,6 +72,11 @@ def main() -> int:
     for i in range(total):
         role = "spare" if i >= n else f"block-{i}"
         task = sky.Task.from_yaml(str(BLOCK_TASK))
+        # Pool is model-config (inv #3): override the template's instance_type per model
+        # (g6.xlarge proof / g7e.2xlarge GLM-5.2 headline) + region. Validate the exact
+        # override field on the pinned SkyPilot version at first live launch (handoff §3).
+        base_res = list(task.resources)[0]
+        task.set_resources(base_res.copy(instance_type=instance_type, region=region))
         task.update_envs({**secrets, "CAIRN_NODE_ROLE": role})
         # Managed job per node → SkyPilot auto-recovers spot preemptions (handoff §4).
         # NOTE(handoff §3): validate this primitive vs a multi-node cluster on the pinned

@@ -51,6 +51,7 @@ fit_defaults:
 
 pool:
   instance_type: g6.xlarge
+  region: eu-south-2           # proof runs in Spain (g6 spot <5% interruption, 3 AZs)
   gpu: L4
   gpu_vram_bytes: 25769803776  # 24 GiB
   gpu_count_per_node: 1

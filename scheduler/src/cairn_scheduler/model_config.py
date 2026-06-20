@@ -27,7 +27,7 @@ _DTYPE_BYTES = {
 
 def dtype_bytes(name: str) -> float:
     key = name.lower()
-    if key in ("int4", "nf4", "mxfp4"):
+    if key in ("int4", "nf4", "mxfp4", "nvfp4", "fp4"):
         return 0.5
     if key not in _DTYPE_BYTES:
         raise ConfigError(f"unknown dtype {name!r}")
@@ -72,6 +72,8 @@ class ModelConfig:
     gpu: str
     gpu_vram_bytes: int
     gpu_count_per_node: int
+    # pool region (hybrid: proof=eu-south-2 Spain, GLM headline=ap-northeast-2 Seoul)
+    region: str = "eu-south-2"
     # provenance
     license: str = "unknown"
     hf_repo: str = ""
@@ -154,6 +156,7 @@ def load_model_config(path) -> ModelConfig:
         gpu=str(pool.get("gpu", "")),
         gpu_vram_bytes=int(_require(pool, "gpu_vram_bytes")),
         gpu_count_per_node=int(pool.get("gpu_count_per_node", 1)),
+        region=str(pool.get("region", "eu-south-2")),
         license=str(source.get("license", raw.get("license", "unknown"))),
         hf_repo=str(source.get("hf_repo", "")),
     )

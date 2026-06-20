@@ -1,6 +1,8 @@
-# Cairn model-as-config — Qwen3.5-397B-A17B (commercial headline target). SKELETON.
+# Cairn model-as-config — Qwen3.5-397B-A17B (Ada COST-LEADER alt; GLM-5.2 is the headline). SKELETON.
 #
-# Spec §3: the headline model. ~397 GB (FP8) / ~200 GB (INT4); pool = g6e.xlarge
+# Standard GQA attention → runs on the cheap L4/L40S Ada pools (unlike GLM-5.2's DSA, which
+# requires Blackwell). The "frontier-class model on $0.16/hr L4 spot" demo.
+# Spec §3: ~397 GB (FP8) / ~200 GB (INT4); pool = g6e.xlarge
 # (1× L40S, 48 GB); N ≈ 9–10 (FP8) / ≈ 5 (INT4) weights-only (real N larger after KV).
 #
 # Architecture values below are PLACEHOLDERS — fill from the real config.json when the
