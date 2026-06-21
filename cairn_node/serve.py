@@ -98,12 +98,22 @@ def main() -> None:
 
     while True:
         msg = edge_in.recv()
-        if isinstance(msg, dict) and msg.get("op") == "stop":
-            try:
-                edge_out.send({"op": "stop"})
-            except Exception:
-                pass
-            break
+        if isinstance(msg, dict) and "op" in msg:
+            if msg["op"] == "stop":
+                try:
+                    edge_out.send({"op": "stop"})
+                except Exception:
+                    pass
+                break
+            if msg["op"] == "set_next":           # live re-stitch: re-point edge_out at a new next (warm spare)
+                try:
+                    edge_out.close()
+                except Exception:
+                    pass
+                edge_out = LanEdge(msg["host"], msg["port"])
+                _connect_retry(edge_out)          # dial the spare (it's pre-warmed + listening)
+                continue
+            continue                              # unknown op — ignore
         h = msg["h"]
         if hasattr(h, "to"):
             h = h.to(a.device)
