@@ -48,3 +48,7 @@ weights/
 # Local cost ledger — per-machine reconciliation record (launchlog.py + cost-report.sh are tracked;
 # the bill-of-record is AWS Cost Explorer by the `cairn` tag — docs/cost-methodology.md).
 infra/skypilot/launch-log.jsonl
+
+# Live HTML report — generated locally each turn (report/gen.py is tracked; its output + journal aren't).
+report/cairn-report.html
+report/journal.jsonl
