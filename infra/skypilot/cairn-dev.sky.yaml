@@ -11,11 +11,13 @@ resources:
   use_spot: true
   disk_size: 128
   labels:
-    cairn: "true"             # IAM destructive-action gate (H5/M13)
+    cairn: "true"             # IAM destructive-action gate (H5/M13) + cost-allocation tag (docs/cost-methodology.md)
+    cairn-purpose: "rung2-dev"   # cost breakdown by purpose; the benchmark runs use spot-proof | ondemand-baseline
 
-# Only the code the harness/forward need (skips scheduler/.venv etc.).
+# Only the code the harness/forward/serving need (skips scheduler/.venv etc.).
 file_mounts:
   /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node   # the multi-node serving layer (cairn_node.serve / .pipeline)
   /cairn/configs: ./configs
   /cairn/infra: ./infra
 
@@ -26,11 +28,12 @@ setup: |
   echo ">>> GPU:"; nvidia-smi || true
   python3 -m venv ~/cairn-env
   ~/cairn-env/bin/pip install -q --upgrade pip
-  echo ">>> torch (cu124 for the L4 driver):"
-  ~/cairn-env/bin/pip install -q torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-  echo ">>> the pinned box image (sglang + transformers + wire deps):"
+  echo ">>> box image: sglang[srt] + torch 2.6 + transformers 4.51.1 + cryptography (wire) ..."
   ~/cairn-env/bin/pip install -q -r /cairn/infra/requirements-gpu.txt
-  ~/cairn-env/bin/python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())" || true
+  echo ">>> force the compressed-tensors pin (pre-masking_utils; belt-and-suspenders over the resolver) ..."
+  ~/cairn-env/bin/pip install -q --no-deps "compressed-tensors==0.9.4"
+  ~/cairn-env/bin/pip install -q pytest                  # the multinode / forward harnesses run under pytest
+  ~/cairn-env/bin/python -c "import torch,sglang,transformers,compressed_tensors,sgl_kernel,cryptography; print('OK torch',torch.__version__,'cuda',torch.cuda.is_available(),'ct',compressed_tensors.__version__)" || true
 
 envs:
   HF_TOKEN: ""
