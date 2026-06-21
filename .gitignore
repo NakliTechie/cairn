@@ -44,3 +44,7 @@ dist/
 *.bin
 *.gguf
 weights/
+
+# Local cost ledger — per-machine reconciliation record (launchlog.py + cost-report.sh are tracked;
+# the bill-of-record is AWS Cost Explorer by the `cairn` tag — docs/cost-methodology.md).
+infra/skypilot/launch-log.jsonl

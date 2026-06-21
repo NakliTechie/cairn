@@ -19,7 +19,10 @@ resources:
   use_spot: true                    # v1.0: spot-only, 0 on-demand floor (spec §5.2)
   disk_size: 256                    # EBS: stage block weights here for fast re-stage (handoff §4)
   labels:
-    cairn: "true"                   # tag instances so the IAM destructive-action gate applies (infra/aws/iam-policy.json, M13/H5)
+    cairn: "true"                   # IAM destructive-action gate (M13/H5) + the cost-allocation tag (docs/cost-methodology.md)
+    cairn-purpose: "fleet"          # the v1.0/v1.1 cost-comparison runs OVERRIDE this per launch (launch.py):
+                                    #   spot-proof | ondemand-baseline → Cost Explorer yields C_spot vs C_od directly
+    # cairn-model: <name>           # set per-launch (gpt-oss-120b | glm-5.2-nvfp4 | gpt-neox-20b | …) for cost-by-model
   # Low intra-pipeline latency: keep the pool in one cluster placement group. SkyPilot
   # passes this through; confirm the exact field on the pinned SkyPilot version (handoff §3).
   # (placement group wiring lives in launch.py via the AWS-specific config.)
