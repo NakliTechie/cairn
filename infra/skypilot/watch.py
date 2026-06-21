@@ -94,6 +94,28 @@ def loop(interval: int) -> None:
         time.sleep(interval)
 
 
+def wait(cluster: str, interval: int = 60, max_wait: int = 7200) -> None:
+    """BLOCK until `cluster` is no longer UP, then exit. Run in the BACKGROUND so its completion WAKES the
+    agent the instant the box dies (the harness re-invokes on background-command exit) — the active-wake
+    counterpart to `loop` (which only prints + desktop-alerts). Waits for the box to appear UP first, so it
+    never false-fires during provisioning. Exit 3 = box died; 0 = max_wait elapsed (box still up)."""
+    print(f"watch-wait: blocking until {cluster} dies (poll ~{interval}s, max {max_wait}s)", flush=True)
+    waited = 0
+    seen_up = False
+    while waited < max_wait:
+        up = _sky_up()
+        if up is not None:
+            if cluster in up:
+                seen_up = True
+            elif seen_up:
+                check()                                   # reconcile: auto-log the down + desktop alert
+                print(f"watch-wait: {cluster} is GONE — exiting to WAKE the agent", flush=True)
+                raise SystemExit(3)
+        time.sleep(interval)
+        waited += interval
+    print(f"watch-wait: max_wait {max_wait}s elapsed ({cluster} still up)", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -101,6 +123,11 @@ def main() -> None:
     lp = sub.add_parser("loop", help="poll continuously")
     lp.add_argument("--interval", type=int, default=150)
     lp.set_defaults(fn=lambda a: loop(a.interval))
+    wp = sub.add_parser("wait", help="block until a cluster dies, then exit (WAKES the agent)")
+    wp.add_argument("--cluster", required=True)
+    wp.add_argument("--interval", type=int, default=60)
+    wp.add_argument("--max-wait", type=int, default=7200)
+    wp.set_defaults(fn=lambda a: wait(a.cluster, a.interval, a.max_wait))
     a = ap.parse_args()
     a.fn(a)
 
