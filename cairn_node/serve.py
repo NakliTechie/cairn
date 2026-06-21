@@ -33,7 +33,7 @@ def _listen(port: int) -> socket.socket:
     return s
 
 
-def _connect_retry(edge, tries: int = 200, delay: float = 0.1) -> None:
+def _connect_retry(edge, tries: int = 600, delay: float = 0.1) -> None:
     for _ in range(tries):
         try:
             edge.connect()
@@ -41,6 +41,21 @@ def _connect_retry(edge, tries: int = 200, delay: float = 0.1) -> None:
         except OSError:
             time.sleep(delay)
     raise SystemExit(f"[serve] could not connect to {edge.peer_host}:{edge.peer_port}")
+
+
+def _load_serialized(rt, device: str) -> None:
+    """Run load_shard under a per-GPU file lock. sglang's init runs a memory-profiling forward whose
+    peak collides and OOMs when two nodes load CONCURRENTLY on one GPU (the dev 2-on-1-L4 case). The
+    lock serializes loads on the SAME device; nodes on DIFFERENT GPUs (the real 2-GPU run) still load
+    in parallel. CPU/mock loads are instant — the lock is uncontended there."""
+    import fcntl
+    safe = device.replace(":", "-").replace("/", "-")
+    with open(f"/tmp/cairn-load-{safe}.lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            rt.load_shard()
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def _runtime_cls(name: str):
@@ -71,11 +86,12 @@ def main() -> None:
     wire.key_from_env("SHARD_PSK")                            # sealed wire; fail-loud if unset
 
     rt = _runtime_cls(a.runtime)(a.model, LayerRange(a.layer_start, a.layer_end), a.device)
-    rt.load_shard()
 
-    lsock = _listen(a.listen_port)                            # listen BEFORE dialing (no deadlock)
+    lsock = _listen(a.listen_port)        # listen BEFORE the (slow) load — peers connect into the backlog
+    _load_serialized(rt, a.device)        # GPU: weights + flashinfer JIT (serialized per-GPU; mock: instant)
+
     edge_out = LanEdge(a.next_host, a.next_port)
-    _connect_retry(edge_out)
+    _connect_retry(edge_out)              # dial next (it listens early too), then accept prev
     conn, _ = lsock.accept()
     edge_in = LanEdge.from_socket(conn)
 
