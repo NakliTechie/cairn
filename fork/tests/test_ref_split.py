@@ -1,9 +1,15 @@
-"""Path-C split-correctness on REAL numerics (transformers), CPU, through build_shard_pipeline.
+"""Path-C correctness on REAL numerics (transformers), CPU, through build_shard_pipeline.
 
-Proves invariant #1 beyond the integer MockBlockRuntime: a model split by contiguous layers —
-each block re-indexed with its own per-seq KV — produces token-for-token identical greedy decode
-to the unsplit model, at any cut points. The SAME `build_shard_pipeline` seam the fleet uses, with
-`runtime_cls=TransformersNodeRuntime`. torch-gated (skipped without torch+transformers)."""
+Two rung-2 gate properties, beyond the integer MockBlockRuntime, on the SAME seam the fleet uses
+(`build_shard_pipeline(runtime_cls=TransformersNodeRuntime)`):
+
+  - **split-correctness (inv #1):** a model split by contiguous layers — each block re-indexed with
+    its own per-seq KV — is token-for-token identical to the unsplit model, at any cut points.
+  - **replay-rebuild (inv #2):** a FRESH pipeline given only the TOKEN HISTORY (not the KV state)
+    reconstructs the exact KV and resumes greedy decode bit-identically. This is the recovery
+    guarantee: token history is truth, KV is derived, recovery = replay (no KV checkpointing needed).
+
+torch-gated (skipped without torch+transformers)."""
 import pathlib
 import sys
 from types import SimpleNamespace
@@ -43,6 +49,30 @@ def _fake_fit(num_layers, cuts):
     )
 
 
+def _make_pipe(path, num_layers, cuts):
+    pipe = build_shard_pipeline(_fake_fit(num_layers, cuts), path, device="cpu",
+                                runtime_cls=TransformersNodeRuntime)
+    for blk in pipe:
+        blk.load()
+    return pipe
+
+
+def _drive(pipe, init_ids, steps):
+    """Greedy-decode `steps` tokens. The first forward ingests init_ids (prefill / replay);
+    each next forward is a single token. Stage 0 embeds ids; the tail returns logits."""
+    cur, out, pos = torch.tensor([list(init_ids)]), [], 0
+    with torch.no_grad():
+        for _ in range(steps):
+            seq_len, h = cur.shape[1], cur
+            for blk in pipe:
+                h = blk.forward("s0", h, pos)
+            nxt = h[:, -1].argmax(-1)
+            out.append(int(nxt))
+            cur = nxt.unsqueeze(0)
+            pos += seq_len
+    return out
+
+
 def _ref_greedy(path):
     from transformers import AutoModelForCausalLM
     from transformers.cache_utils import DynamicCache
@@ -57,27 +87,24 @@ def _ref_greedy(path):
     return out
 
 
-def _split_greedy(path, num_layers, cuts):
-    pipe = build_shard_pipeline(_fake_fit(num_layers, cuts), path, device="cpu",
-                                runtime_cls=TransformersNodeRuntime)
-    for blk in pipe:
-        blk.load()
-    cur, out, pos = torch.tensor([PROMPT]), [], 0
-    with torch.no_grad():
-        for _ in range(NEW):
-            seq_len, h = cur.shape[1], cur
-            for blk in pipe:                    # stage 0 embeds ids; hidden handed off; tail → logits
-                h = blk.forward("s0", h, pos)
-            nxt = h[:, -1].argmax(-1)
-            out.append(int(nxt))
-            cur = nxt.unsqueeze(0)
-            pos += seq_len
-    return out
-
-
 @pytest.mark.parametrize("cuts", [[3], [2, 4], [1, 2, 3, 4, 5]],
                          ids=["2-block", "3-block", "6-block"])
 def test_split_equals_single_ref(tmp_path, cuts):
+    """inv #1: split pipeline == unsplit model, token-for-token, at any cut points."""
     path = str(tmp_path / "tiny")
     num_layers = _build_tiny(path)
-    assert _split_greedy(path, num_layers, cuts) == _ref_greedy(path)
+    assert _drive(_make_pipe(path, num_layers, cuts), PROMPT, NEW) == _ref_greedy(path)
+
+
+def test_replay_rebuild_resumes_uncorrupted(tmp_path):
+    """inv #2: a node is lost at token K; a fresh pipeline replays the TOKEN HISTORY to rebuild
+    the KV and must resume bit-identically — proving KV is derivable from tokens (recovery = replay)."""
+    path = str(tmp_path / "tiny")
+    num_layers = _build_tiny(path)
+    cuts, kill_at = [2, 4], 8
+
+    gen_full = _drive(_make_pipe(path, num_layers, cuts), PROMPT, NEW)        # the uninterrupted run
+    history = PROMPT + gen_full[:kill_at]                                    # the token-history "truth"
+    resumed = _drive(_make_pipe(path, num_layers, cuts), history, NEW - kill_at)  # fresh KV, replay → resume
+
+    assert resumed == gen_full[kill_at:]
