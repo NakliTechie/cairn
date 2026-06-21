@@ -1,0 +1,77 @@
+# Cairn FLEET run — the REAL two-box topology: 2 separate g6.xlarge (L4) spot instances on one VPC,
+# one pipeline node each, talking over the VPC LAN (not localhost). Proves the split + wire survive a
+# real cross-box network. Single-box was proven 4/4 (test_multinode_pipeline); this is the network step.
+#
+#   sky launch -c cairn-fleet infra/skypilot/cairn-fleet.sky.yaml --env HF_TOKEN [--env MODEL=... --env CUT=.. --env NLAYERS=..]
+#
+# Topology (rank from $SKYPILOT_NODE_RANK, peer IPs from $SKYPILOT_NODE_IPS):
+#   rank0 = ENTRY node (layers 0..CUT) + the DRIVER (co-located)
+#   rank1 = TAIL  node (layers CUT..NLAYERS)
+#   wire:  driver -> rank0:7777(entry) -> rank1:7777(tail) -> rank0:7779(driver sink) -> driver
+#
+# NETWORK (M13): the two nodes must reach each other on :7777 and :7779 over the VPC. SkyPilot puts both
+# in one cluster security group; intra-SG traffic is allowed, so no public ingress is opened (the wire is
+# PSK-sealed regardless). VERIFY at launch: if the tail can't dial back, add an intra-SG rule for 7777/7779.
+name: cairn-fleet
+
+num_nodes: 2
+
+resources:
+  cloud: aws
+  region: eu-south-2          # Spain — cheap g6 spot, <5% interruption (the proof region)
+  instance_type: g6.xlarge    # 1x L4 (Ada, sm_89), 24 GB — ONE GPU per box (the real per-node shape)
+  use_spot: true
+  disk_size: 128
+  labels:
+    cairn: "true"             # IAM destructive-action gate (H5/M13) + cost-allocation tag
+    cairn-purpose: "fleet-2box"   # cost breakdown by purpose (vs rung2-dev / ondemand-baseline)
+
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+
+# Same box image as the dev box (verified recipe — infra/requirements.lock).
+setup: |
+  set -uo pipefail
+  echo ">>> GPU:"; nvidia-smi || true
+  python3 -m venv ~/cairn-env
+  ~/cairn-env/bin/pip install -q --upgrade pip
+  ~/cairn-env/bin/pip install -q -r /cairn/infra/requirements-gpu.txt
+  ~/cairn-env/bin/pip install -q --no-deps "compressed-tensors==0.9.4"
+  ~/cairn-env/bin/python -c "import torch,sglang,transformers,compressed_tensors,cryptography; print('OK torch',torch.__version__,'cuda',torch.cuda.is_available())" || true
+
+# Bring up one node per box by rank, then rank0 drives the decode and prints the tokens.
+run: |
+  set -uo pipefail
+  RANK=${SKYPILOT_NODE_RANK}
+  IPS=($SKYPILOT_NODE_IPS); IP0=${IPS[0]}; IP1=${IPS[1]}
+  export PATH=$HOME/cairn-env/bin:/usr/local/cuda/bin:$PATH
+  export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
+  export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.8}   # dedicated GPU per node — no sharing
+  MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}; CUT=${CUT:-12}; NLAYERS=${NLAYERS:-24}
+  PROMPT=${PROMPT:-1,5,9,3,7,2}; NNEW=${NNEW:-5}
+  cd /cairn
+  echo "[fleet] rank=$RANK ip0=$IP0 ip1=$IP1 model=$MODEL split=0..$CUT..$NLAYERS prompt=$PROMPT n=$NNEW"
+  if [ "$RANK" = "0" ]; then
+    # ENTRY node (layers 0..CUT): listen :7777, forward to the TAIL on ip1:7777
+    python -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start 0 --layer-end "$CUT" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP1" --next-port 7777 &
+    NODE_PID=$!
+    # DRIVER (co-located): dial the local entry node, sink :7779 for the tail to dial back, decode + print
+    python -m cairn_node.pipeline remote \
+      --head-host 127.0.0.1 --head-port 7777 --sink-port 7779 --bind-host 0.0.0.0 \
+      --prompt "$PROMPT" --n-new "$NNEW"
+    echo "[fleet] driver done — TOKENS above; compare to the single-box reference for this model"
+    kill $NODE_PID 2>/dev/null || true
+  else
+    # TAIL node (layers CUT..NLAYERS): listen :7777, forward to the DRIVER sink on ip0:7779
+    python -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779
+  fi
+
+envs:
+  HF_TOKEN: ""

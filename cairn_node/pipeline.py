@@ -1,10 +1,14 @@
 """cairn_node.pipeline — drive a multi-process Cairn pipeline + greedy-decode (the multi-node counterpart
-of test_sglang_split's `_drive`). Spawns one `cairn_node.serve` process per stage, wires them
-driver → node0 → … → node(N-1) → driver with LanEdge, feeds a prompt, samples greedily.
+of test_sglang_split's `_drive`). Two drivers share one decode loop (`_drive`):
 
-Used by scheduler/tests/test_multinode_pipeline.py. Runnable directly as a CPU mock self-test (no GPU):
+  • run_pipeline — spawns one `cairn_node.serve` per stage ON ONE HOST (localhost wire), drives, tears down.
+  • run_remote   — drives ALREADY-RUNNING nodes launched separately on their own boxes (the cross-box
+                   fleet over the VPC LAN). Nodes are NOT spawned here; the driver just connects + drives.
 
-    SHARD_PSK=dev python -m cairn_node.pipeline
+Used by scheduler/tests/test_multinode_pipeline.py. Runnable directly:
+
+    SHARD_PSK=dev python -m cairn_node.pipeline                # CPU mock split==unsplit self-test (no GPU)
+    python -m cairn_node.pipeline remote --head-port 7777 --sink-port 7779   # drive a running fleet
 """
 from __future__ import annotations
 
@@ -23,12 +27,35 @@ if str(_ROOT) not in sys.path:
 from cairn_node.serve import _connect_retry, _listen  # noqa: E402
 
 
+def _drive(head, tail, prompt: List[int], n_new: int) -> List[int]:
+    """Greedy-decode `n_new` tokens over an already-connected pipeline: send running token(s) to the head
+    (entry node), recv logits from the tail, argmax, repeat. Host-agnostic — the SAME loop backs the
+    local-spawn driver (run_pipeline) and the cross-box fleet driver (run_remote)."""
+    import torch
+    cur = torch.tensor([list(prompt)])                       # [1, S] token ids
+    out: List[int] = []
+    pos = 0
+    for _ in range(n_new):
+        s_len = cur.shape[1]
+        head.send({"h": cur, "seq": "s0", "pos": pos})
+        msg = tail.recv()
+        nxt = int(msg["h"][:, -1].argmax(-1))
+        out.append(nxt)
+        cur = torch.tensor([[nxt]])
+        pos += s_len
+    try:
+        head.send({"op": "stop"})
+    except Exception:
+        pass
+    return out
+
+
 def run_pipeline(runtime: str, model: str, num_layers: int, cuts: List[int], prompt: List[int],
                  n_new: int, device: str = "cpu", base_port: int = 7100,
                  python_exe: str = "") -> List[int]:
-    """Spawn a stage-per-process pipeline (cut at `cuts`), greedy-decode `n_new` tokens, return them.
-    Stages are torn down on exit. Distinct `base_port` per concurrent call (avoids port clashes)."""
-    import torch
+    """Spawn a stage-per-process pipeline (cut at `cuts`) ON ONE HOST (localhost wire), greedy-decode
+    `n_new` tokens, return them. Stages are torn down on exit. Distinct `base_port` per concurrent call.
+    The cross-box counterpart is run_remote (nodes launched separately, driver only connects)."""
     from shard.transport import LanEdge
     from shard import wire
 
@@ -43,7 +70,7 @@ def run_pipeline(runtime: str, model: str, num_layers: int, cuts: List[int], pro
     env = {**os.environ, "PYTHONPATH": str(_ROOT)}           # SHARD_PSK propagates to the nodes
     # Force the sglang KV-pool fraction into the node env (don't rely on inheritance — the multinode OOM
     # was nodes falling back to the 0.8 default). 0.2 fits two ~6 GiB nodes on one 22 GiB L4; a true
-    # 2-GPU run (one node per GPU) can set CAIRN_SGLANG_MEM_FRACTION higher.
+    # 2-GPU run (one node per GPU, own box) can set CAIRN_SGLANG_MEM_FRACTION higher.
     env["CAIRN_SGLANG_MEM_FRACTION"] = os.environ.get("CAIRN_SGLANG_MEM_FRACTION", "0.2")
 
     procs = []
@@ -57,28 +84,12 @@ def run_pipeline(runtime: str, model: str, num_layers: int, cuts: List[int], pro
 
     head = tail = lsock = None
     try:
-        lsock = _listen(sink)                                # driver's sink — the tail connects here
+        lsock = _listen("127.0.0.1", sink)                   # driver's sink — the tail connects here
         head = LanEdge("127.0.0.1", ports[0])
         _connect_retry(head)                                 # driver -> node0 (entry)
         conn, _ = lsock.accept()
         tail = LanEdge.from_socket(conn)                     # node(N-1) -> driver
-
-        cur = torch.tensor([list(prompt)])                   # [1, S] token ids
-        out: List[int] = []
-        pos = 0
-        for _ in range(n_new):
-            s_len = cur.shape[1]
-            head.send({"h": cur, "seq": "s0", "pos": pos})
-            msg = tail.recv()
-            nxt = int(msg["h"][:, -1].argmax(-1))
-            out.append(nxt)
-            cur = torch.tensor([[nxt]])
-            pos += s_len
-        try:
-            head.send({"op": "stop"})
-        except Exception:
-            pass
-        return out
+        return _drive(head, tail, prompt, n_new)
     finally:
         for e in (head, tail):
             if e is not None:
@@ -90,6 +101,34 @@ def run_pipeline(runtime: str, model: str, num_layers: int, cuts: List[int], pro
                 p.wait(timeout=30)
             except Exception:
                 p.kill()
+
+
+def run_remote(head_host: str, head_port: int, sink_port: int, prompt: List[int], n_new: int,
+               bind_host: str = "0.0.0.0") -> List[int]:
+    """Drive a pipeline of ALREADY-RUNNING remote nodes — the cross-box fleet. Unlike run_pipeline this
+    does NOT spawn: each node runs on its own box (cairn_node.serve --bind-host <private IP>). The driver
+    is co-located with the entry node (rank 0): it dials the head and listens on `sink_port` for the tail
+    to dial back. Topology: head(rank0) -> … -> tail -> driver(rank0:sink_port)."""
+    from shard.transport import LanEdge
+    from shard import wire
+
+    os.environ.setdefault("SHARD_PSK", "cairn-dev-psk")
+    wire.key_from_env("SHARD_PSK")
+
+    head = tail = lsock = None
+    try:
+        lsock = _listen(bind_host, sink_port)                # the tail (the other box) dials this
+        head = LanEdge(head_host, head_port)
+        _connect_retry(head)                                 # driver -> entry node (localhost on rank 0)
+        conn, _ = lsock.accept()
+        tail = LanEdge.from_socket(conn)
+        return _drive(head, tail, prompt, n_new)
+    finally:
+        for e in (head, tail):
+            if e is not None:
+                e.close()
+        if lsock is not None:
+            lsock.close()
 
 
 def _selftest() -> None:
@@ -104,5 +143,25 @@ def _selftest() -> None:
     print(">>> PIPELINE PLUMBING OK (multi-process split == unsplit over the wire)")
 
 
+def _main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description="cairn_node pipeline driver")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("selftest", help="CPU mock split==unsplit self-test (default)")
+    rp = sub.add_parser("remote", help="drive already-running remote nodes (the cross-box fleet)")
+    rp.add_argument("--head-host", default="127.0.0.1")      # entry node (localhost when driver is on rank 0)
+    rp.add_argument("--head-port", type=int, required=True)
+    rp.add_argument("--sink-port", type=int, required=True)  # the tail dials here
+    rp.add_argument("--bind-host", default="0.0.0.0")        # driver sink bind (routable for the tail's box)
+    rp.add_argument("--prompt", default="1,5,9,3,7,2")
+    rp.add_argument("--n-new", type=int, default=8)
+    a = ap.parse_args()
+    if a.cmd == "remote":
+        toks = [int(x) for x in a.prompt.split(",") if x.strip()]
+        print("TOKENS", run_remote(a.head_host, a.head_port, a.sink_port, toks, a.n_new, bind_host=a.bind_host))
+    else:
+        _selftest()
+
+
 if __name__ == "__main__":
-    _selftest()
+    _main()

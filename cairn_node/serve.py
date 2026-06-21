@@ -25,10 +25,10 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-def _listen(port: int) -> socket.socket:
+def _listen(host: str, port: int) -> socket.socket:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", port))
+    s.bind((host, port))                  # 127.0.0.1 single-box; 0.0.0.0 / private IP for the cross-box fleet
     s.listen(1)
     return s
 
@@ -76,6 +76,7 @@ def main() -> None:
     ap.add_argument("--layer-end", type=int, required=True)   # EXCLUSIVE (LayerRange convention)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--listen-port", type=int, required=True)
+    ap.add_argument("--bind-host", default="127.0.0.1")      # 0.0.0.0 / private IP for the cross-box fleet
     ap.add_argument("--next-host", default="127.0.0.1")
     ap.add_argument("--next-port", type=int, required=True)
     a = ap.parse_args()
@@ -87,7 +88,7 @@ def main() -> None:
 
     rt = _runtime_cls(a.runtime)(a.model, LayerRange(a.layer_start, a.layer_end), a.device)
 
-    lsock = _listen(a.listen_port)        # listen BEFORE the (slow) load — peers connect into the backlog
+    lsock = _listen(a.bind_host, a.listen_port)  # listen BEFORE the (slow) load — peers connect into the backlog
     _load_serialized(rt, a.device)        # GPU: weights + flashinfer JIT (serialized per-GPU; mock: instant)
 
     edge_out = LanEdge(a.next_host, a.next_port)
