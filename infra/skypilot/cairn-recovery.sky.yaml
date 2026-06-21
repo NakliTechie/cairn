@@ -49,6 +49,7 @@ run: |
   MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}; CUT=${CUT:-12}; NLAYERS=${NLAYERS:-24}
   PROMPT=${PROMPT:-1,5,9,3,7,2}; NNEW=${NNEW:-8}; DIE=${CAIRN_DIE_AFTER:-0}
   cd /cairn
+  pkill -9 -f "[c]airn_node" 2>/dev/null || true; sleep 2    # clear leftover procs from a prior run (e.g. a hung standby spare holding :7777)
   echo "[recovery] rank=$RANK ips=$IP0,$IP1,$IP2 model=$MODEL die_after=$DIE"
   if [ "$RANK" = "0" ]; then
     # ENTRY (0..CUT) -> tail on IP1:7777 ; never dies
