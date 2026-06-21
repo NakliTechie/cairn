@@ -158,8 +158,4 @@ export class Fleet {
     }
     return { policy: "reassign", reason: "warm spare available, versions match" };
   }
-
-  noteEvictionWarning(nodeId: string): void {
-    this.setState(nodeId, NodeState.Draining);
-  }
 }

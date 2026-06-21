@@ -10,6 +10,10 @@ data-plane logic* running together; only the SGLang block forward is mocked (run
     curl -s localhost:8400/v1/chat/completions \
       -H 'authorization: Bearer sk-cairn-demo' -H 'content-type: application/json' \
       -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":12}'
+    # streaming (SSE) — add "stream":true → a text/event-stream of chat.completion.chunk events + [DONE]
+    curl -N -s localhost:8400/v1/chat/completions \
+      -H 'authorization: Bearer sk-cairn-demo' -H 'content-type: application/json' \
+      -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":12,"stream":true}'
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scheduler" / "src"))
 
-from cairn_scheduler import fit, load_model_config  # noqa: E402
+from cairn_scheduler import fit, load_model_config, load_model_names  # noqa: E402
 from cairn_scheduler.gateway import Gateway, GatewayError  # noqa: E402
 from cairn_scheduler.recovery import RecoveryManager  # noqa: E402
 from cairn_scheduler.runtime import build_mock_pipeline  # noqa: E402
@@ -43,17 +47,23 @@ class Engine:
         self.fit = fit(self.cfg, target_k=8, context_len=4096)
         self.gateway = Gateway(
             api_keys={API_KEY},
-            model_names={self.cfg.name, "qwen3.5-397b-a17b"},
+            # Single-sourced from configs/models.json (invariant #3) — same registry the TS Worker
+            # imports; never a per-gateway hardcoded set. See configs/gen_models.py.
+            model_names=load_model_names(ROOT / "configs" / "models.json"),
             default_version="0.1.0",
         )
 
-    def complete(self, req) -> dict:
+    def run(self, req) -> Stream:
+        """Drive one request through the rung-1 stack and return the completed Stream."""
         sim = Sim()
         sched = Scheduler(sim, build_mock_pipeline(self.fit), vocab_size=self.cfg.vocab_size, k_max=8)
         stream = self.gateway.admit(req)
         sched.submit(stream)
         sim.run()
-        return self.gateway.format_response(req, stream)
+        return stream
+
+    def complete(self, req) -> dict:
+        return self.gateway.format_response(req, self.run(req))
 
     def scenario(self, k: int = 6, evict: bool = True) -> dict:
         sim = Sim()
@@ -97,6 +107,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_sse(self, chunks):
+        """OpenAI-compatible Server-Sent Events (text/event-stream). The handler defaults to HTTP/1.0
+        (no keep-alive), so the body ends at connection close — no chunked framing needed."""
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.end_headers()
+        for chunk in chunks:
+            self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+            self.wfile.flush()
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     def log_message(self, *args):  # quiet
         pass
@@ -149,7 +172,13 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 raise GatewayError(400, "invalid JSON body")
             req = eng.gateway.parse_request(body)
-            self._send(eng.complete(req))
+            if req.stream:
+                # OpenAI-compatible SSE (S7) via gateway.stream_chunks. Run to completion FIRST so any
+                # error still returns a clean status (the mock sim isn't incremental; the event-stream
+                # wire format is what demonstrates streaming compat).
+                self._send_sse(eng.gateway.stream_chunks(req, eng.run(req)))
+            else:
+                self._send(eng.complete(req))
         except GatewayError as e:
             self._send(e.to_error(), e.status)
         except Exception:  # never leak a traceback to the client (M10)

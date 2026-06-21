@@ -1,0 +1,10 @@
+{
+  "models": [
+    "deepseek-v4-flash-nvfp4",
+    "glm-5.2-nvfp4",
+    "gpt-neox-20b",
+    "gpt-oss-120b",
+    "llama-3.1-8b",
+    "qwen3.5-397b-a17b"
+  ]
+}

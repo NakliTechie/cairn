@@ -160,3 +160,19 @@ def load_model_config(path) -> ModelConfig:
         license=str(source.get("license", raw.get("license", "unknown"))),
         hf_repo=str(source.get("hf_repo", "")),
     )
+
+
+def load_model_names(manifest_path) -> set:
+    """The configured model registry — `configs/models.json`, generated from the per-model YAMLs by
+    `configs/gen_models.py` (invariant #3: a model is "known" iff it has a config). Both gateways read
+    THIS file (the TS Worker imports the same JSON), so the gateway model set is single-sourced, never
+    hand-kept per gateway. Conformance: scheduler/tests/test_conformance.py asserts it matches the YAMLs."""
+    import json
+    p = Path(manifest_path)
+    if not p.exists():
+        raise ConfigError(f"model registry not found: {p} (run configs/gen_models.py)")
+    data = json.loads(p.read_text())
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
+        raise ConfigError(f"{p}: expected {{'models': [str, ...]}}")
+    return set(models)

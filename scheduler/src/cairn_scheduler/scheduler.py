@@ -144,6 +144,10 @@ class Scheduler:
             raise ValueError("k_max must be >= 1")
         if vocab_size < 1:
             raise ValueError("vocab_size must be >= 1")
+        if high_watermark < 1:
+            # 0 disables queue_full → an unbounded per-stage queue an operator could grow without
+            # bound (entry feeding never backpressures). Backpressure is the design; reject it (W2).
+            raise ValueError("high_watermark must be >= 1")
         self.sim = sim
         self.vocab = vocab_size
         self.k_max = k_max

@@ -12,7 +12,7 @@ Public surface:
 - `NodeState` — the §5.4 node state machine.
 """
 
-from .model_config import ModelConfig, load_model_config
+from .model_config import ModelConfig, load_model_config, load_model_names
 from .domain import NodeState, BlockAssignment, FitResult
 from . import calcs
 from .fit import fit, FitError
@@ -20,6 +20,7 @@ from .fit import fit, FitError
 __all__ = [
     "ModelConfig",
     "load_model_config",
+    "load_model_names",
     "NodeState",
     "BlockAssignment",
     "FitResult",

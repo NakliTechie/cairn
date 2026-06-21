@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { authenticate, formatResponse, GatewayError, parseRequest } from "../src/gateway";
+import { authenticate, GatewayError, parseRequest } from "../src/gateway";
 
 const KEYS = new Set(["sk-good"]);
 const MODELS = new Set(["gpt-oss-120b"]);
@@ -52,13 +52,11 @@ describe("parseRequest", () => {
   });
 });
 
-describe("formatResponse", () => {
-  it("produces an OpenAI-compatible completion with usage", () => {
-    const req = parseRequest(body({ max_tokens: 3 }), MODELS);
-    const resp = formatResponse("chatcmpl-1", req, "101 102 103", 5, 3);
-    expect(resp.object).toBe("chat.completion");
-    expect(resp.choices[0].message.role).toBe("assistant");
-    expect(resp.choices[0].finish_reason).toBe("stop");
-    expect(resp.usage.total_tokens).toBe(8);
+describe("temperature (W3)", () => {
+  it("keeps a numeric temperature, defaults anything else to 0 — never throws", () => {
+    expect(parseRequest(body({ temperature: 0.7 }), MODELS).temperature).toBe(0.7);
+    for (const bad of ["hot", null, true, [0.5]]) {
+      expect(parseRequest(body({ temperature: bad }), MODELS).temperature).toBe(0);
+    }
   });
 });

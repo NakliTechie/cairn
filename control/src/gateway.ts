@@ -108,31 +108,12 @@ export function parseRequest(body: unknown, modelNames: Set<string>): ChatReques
     messages: messages as ChatMessage[],
     max_tokens: maxTokens,
     stream: Boolean(b.stream),
+    // temperature accepted for OpenAI-compat but IGNORED — v1.0 decode is greedy (W3). Lenient coerce
+    // (a real number → kept; anything else → 0.0), never errors; matches scheduler/.../gateway.py.
     temperature: typeof b.temperature === "number" ? b.temperature : 0.0,
   };
 }
 
-// OpenAI-compatible completion shape. `content` + token counts come from the in-VPC
-// data plane; usage is metadata only (spec §8 — counts, not content).
-export function formatResponse(
-  id: string,
-  req: ChatRequest,
-  content: string,
-  promptTokens: number,
-  completionTokens: number,
-  finishReason: "stop" | "length" = "stop",
-) {
-  return {
-    id,
-    object: "chat.completion",
-    model: req.model,
-    choices: [
-      { index: 0, message: { role: "assistant", content }, finish_reason: finishReason },
-    ],
-    usage: {
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
-      total_tokens: promptTokens + completionTokens,
-    },
-  };
-}
+// NOTE: no response-shaping helper here by design (S6). The Worker is pass-through for completions —
+// on success index.ts relays the in-VPC data plane's response body verbatim, and that body already
+// carries the OpenAI shape (the data plane mirrors the Python gateway's format_response).

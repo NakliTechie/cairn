@@ -28,6 +28,15 @@ def test_parse_valid_request():
     assert req.max_tokens == 8 and req.stream is False
 
 
+def test_temperature_accepted_but_ignored():
+    """W3: temperature is accepted (OpenAI-compat) but coerced leniently — a real number is kept, a
+    bad value (str/None/bool/list) defaults to 0.0 instead of raising. It's ignored downstream (greedy)."""
+    gw = _gw()
+    assert gw.parse_request(_body(temperature=0.7)).temperature == 0.7
+    for bad in ("hot", None, True, [0.5]):
+        assert gw.parse_request(_body(temperature=bad)).temperature == 0.0
+
+
 @pytest.mark.parametrize("body,status", [
     ({"messages": [{"role": "user", "content": "x"}]}, 400),          # missing model
     (_body(model="other-model"), 404),                               # unknown model

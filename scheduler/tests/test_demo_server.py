@@ -82,6 +82,31 @@ def test_unknown_model_404(base_url):
     assert status == 404
 
 
+def _post_raw(url, body, auth=None):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers={"content-type": "application/json"})
+    if auth:
+        req.add_header("authorization", auth)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, r.headers.get("content-type", ""), r.read().decode()
+
+
+def test_streaming_sse(base_url):
+    """S7: stream:true returns an OpenAI-compatible text/event-stream of chat.completion.chunk events
+    terminated by [DONE] (wires the gateway's stream_chunks)."""
+    status, ctype, text = _post_raw(
+        base_url + "/v1/chat/completions",
+        {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "hi"}],
+         "max_tokens": 5, "stream": True},
+        auth=f"Bearer {API_KEY}",
+    )
+    assert status == 200
+    assert "text/event-stream" in ctype
+    assert "chat.completion.chunk" in text
+    assert text.rstrip().endswith("data: [DONE]")
+    assert text.count("data: ") == 7  # 5 token chunks + 1 finish chunk + [DONE]
+
+
 def test_rejects_oversized_body(base_url):
     big = {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "a" * 1_100_000}]}
     status, _ = _post(base_url + "/v1/chat/completions", big, auth=f"Bearer {API_KEY}")

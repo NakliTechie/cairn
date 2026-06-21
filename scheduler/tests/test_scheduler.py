@@ -80,12 +80,15 @@ def test_rejects_bad_streams(gpt_oss_cfg):
 
 
 def test_rejects_bad_config(gpt_oss_cfg):
-    """M2: k_max<1 / vocab_size<1 fail loudly instead of silently admitting nothing."""
+    """M2: k_max<1 / vocab_size<1 — and W2: high_watermark<1 — fail loudly instead of silently
+    admitting nothing / running an unbounded (never-backpressuring) queue."""
     r = fit(gpt_oss_cfg, target_k=8, context_len=4096)
     with pytest.raises(ValueError):
         Scheduler(Sim(), build_mock_pipeline(r), vocab_size=gpt_oss_cfg.vocab_size, k_max=0)
     with pytest.raises(ValueError):
         Scheduler(Sim(), build_mock_pipeline(r), vocab_size=0, k_max=4)
+    with pytest.raises(ValueError):  # W2: high_watermark=0 disables queue_full → unbounded queue
+        Scheduler(Sim(), build_mock_pipeline(r), vocab_size=gpt_oss_cfg.vocab_size, k_max=4, high_watermark=0)
 
 
 def test_call_when_idle_queues_multiple(gpt_oss_cfg):

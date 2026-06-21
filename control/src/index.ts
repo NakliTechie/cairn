@@ -10,6 +10,7 @@
 
 import { authenticate, constantTimeEqual, GatewayError, parseRequest } from "./gateway";
 import { FleetDO } from "./fleet-do";
+import modelRegistry from "../../configs/models.json";
 
 export interface Env {
   SERVICE_VERSION?: string;
@@ -19,7 +20,10 @@ export interface Env {
   FLEET: DurableObjectNamespace<FleetDO>;
 }
 
-const MODELS = new Set(["gpt-oss-120b", "qwen3.5-397b-a17b"]);
+// Single-sourced from configs/models.json (invariant #3) — generated from the per-model YAMLs by
+// configs/gen_models.py, the SAME registry the Python gateway reads (load_model_names). Never a
+// per-gateway literal. Conformance: control/test/conformance.test.ts.
+export const MODELS = new Set<string>(modelRegistry.models);
 const MAX_BODY_BYTES = 1_048_576; // 1 MiB request-body ceiling (H2)
 const UPSTREAM_TIMEOUT_MS = 120_000; // abort a hung data-plane forward (H4)
 const RATE_LIMIT_PER_MIN = 120; // per-key request ceiling (M7)

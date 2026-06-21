@@ -110,9 +110,14 @@ class Gateway:
             raise GatewayError(400, "max_tokens must be a positive integer")
         if max_tokens > self.max_output_tokens:
             raise GatewayError(400, f"max_tokens exceeds ceiling ({self.max_output_tokens})")
+        # temperature is accepted for OpenAI-compat but IGNORED — v1.0 decode is greedy (W3). Coerce
+        # leniently (a real number → kept; bool/null/str/absent → 0.0), never raise (`float('x')` would
+        # 500). Matches control/src/gateway.ts so the two gateways don't drift (cf. M14).
+        temp = body.get("temperature", 0.0)
+        temperature = float(temp) if isinstance(temp, (int, float)) and not isinstance(temp, bool) else 0.0
         return ChatRequest(
             model=model, messages=messages, max_tokens=max_tokens,
-            stream=bool(body.get("stream", False)), temperature=float(body.get("temperature", 0.0)),
+            stream=bool(body.get("stream", False)), temperature=temperature,
         )
 
     def admit(self, req: ChatRequest) -> Stream:
