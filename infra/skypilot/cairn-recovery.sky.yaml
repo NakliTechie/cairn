@@ -1,0 +1,79 @@
+# Cairn Phase-2 LIVE RECOVERY test — 3 separate g6.xlarge (L4) spot nodes on one VPC:
+#   rank0 = ENTRY (layers 0..CUT) + the DRIVER (co-located; its box never dies in the tail-kill test)
+#   rank1 = TAIL  (layers CUT..NLAYERS) — hard-exits after CAIRN_DIE_AFTER forwards (induced spot reclaim)
+#   rank2 = SPARE (layers CUT..NLAYERS) — pre-warmed, idle, standby
+#
+# wire: driver -> rank0:7777(entry) -> rank1:7777(tail) -> rank0:7779(tail-sink); spare -> rank0:7780.
+# On the tail's death the driver re-points the entry at the spare (set_next), replays, resumes.
+#
+#   # 1. launch + REFERENCE run (no death):
+#   sky launch -c cairn-recovery infra/skypilot/cairn-recovery.sky.yaml --env HF_TOKEN --env CAIRN_DIE_AFTER=0
+#   # 2. RECOVERY run (tail dies after 4 forwards) on the live cluster:
+#   sky exec   cairn-recovery infra/skypilot/cairn-recovery.sky.yaml --env HF_TOKEN --env CAIRN_DIE_AFTER=4
+#   # compare the two TOKENS lines (must match) + read MTTR from run 2.
+name: cairn-recovery
+
+num_nodes: 3
+
+resources:
+  cloud: aws
+  region: eu-south-2
+  instance_type: g6.xlarge    # 1x L4 per box — one node each (entry / tail / spare)
+  use_spot: true
+  disk_size: 128
+  labels:
+    cairn: "true"
+    cairn-purpose: "recovery-test"
+
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+
+setup: |
+  set -uo pipefail
+  python3 -m venv ~/cairn-env
+  ~/cairn-env/bin/pip install -q --upgrade pip
+  ~/cairn-env/bin/pip install -q -r /cairn/infra/requirements-gpu.txt
+  ~/cairn-env/bin/pip install -q --no-deps "compressed-tensors==0.9.4"
+  ~/cairn-env/bin/python -c "import torch,sglang,cryptography; print('OK torch',torch.__version__,'cuda',torch.cuda.is_available())" || true
+
+run: |
+  set -uo pipefail
+  RANK=${SKYPILOT_NODE_RANK}
+  IPS=($SKYPILOT_NODE_IPS); IP0=${IPS[0]}; IP1=${IPS[1]}; IP2=${IPS[2]}
+  export PATH=$HOME/cairn-env/bin:/usr/local/cuda/bin:$PATH
+  export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
+  export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.8}
+  MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}; CUT=${CUT:-12}; NLAYERS=${NLAYERS:-24}
+  PROMPT=${PROMPT:-1,5,9,3,7,2}; NNEW=${NNEW:-8}; DIE=${CAIRN_DIE_AFTER:-0}
+  cd /cairn
+  echo "[recovery] rank=$RANK ips=$IP0,$IP1,$IP2 model=$MODEL die_after=$DIE"
+  if [ "$RANK" = "0" ]; then
+    # ENTRY (0..CUT) -> tail on IP1:7777 ; never dies
+    CAIRN_DIE_AFTER=0 python -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start 0 --layer-end "$CUT" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP1" --next-port 7777 &
+    NODE_PID=$!
+    # DRIVER: dial local entry, accept tail (7779) + spare (7780), spare lives at IP2:7777
+    python -m cairn_node.recovery_fleet --entry-host 127.0.0.1 --entry-port 7777 \
+      --tail-sink 7779 --spare-sink 7780 --bind-host 0.0.0.0 \
+      --spare-host "$IP2" --spare-port 7777 --prompt "$PROMPT" --n-new "$NNEW"
+    echo "[recovery] driver done"
+    kill $NODE_PID 2>/dev/null || true
+  elif [ "$RANK" = "1" ]; then
+    # TAIL (CUT..NLAYERS) -> driver tail-sink IP0:7779 ; dies after $DIE forwards
+    CAIRN_DIE_AFTER=$DIE python -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779
+  else
+    # SPARE (CUT..NLAYERS) -> driver spare-sink IP0:7780 ; pre-warmed standby, never dies
+    CAIRN_DIE_AFTER=0 python -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7780
+  fi
+
+envs:
+  HF_TOKEN: ""
+  CAIRN_DIE_AFTER: "0"

@@ -13,6 +13,7 @@ next (retry), then accepts its prev — so all listeners are up before any dial,
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import socket
 import sys
@@ -96,6 +97,8 @@ def main() -> None:
     conn, _ = lsock.accept()
     edge_in = LanEdge.from_socket(conn)
 
+    die_after = int(os.environ.get("CAIRN_DIE_AFTER", "0"))   # induced-death test hook: hard-exit after N forwards
+    nfwd = 0
     while True:
         msg = edge_in.recv()
         if isinstance(msg, dict) and "op" in msg:
@@ -115,12 +118,15 @@ def main() -> None:
                 continue
             continue                              # unknown op — ignore
         h = msg["h"]
+        if die_after and nfwd >= die_after:
+            os._exit(137)                     # simulate a hard crash (spot reclaim) — this forward never returns
         if hasattr(h, "to"):
             h = h.to(a.device)
         out = rt.forward(h, {"seq": msg["seq"], "pos": msg["pos"]})
         if hasattr(out, "detach"):
             out = out.detach().cpu()
         edge_out.send({"h": out, "seq": msg["seq"], "pos": msg["pos"]})
+        nfwd += 1
 
     edge_in.close()
     edge_out.close()
