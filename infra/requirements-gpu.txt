@@ -5,11 +5,22 @@
 #   pip-compile --generate-hashes -o requirements.lock requirements-gpu.txt   # on the GPU box
 #   pip install --require-hashes -r requirements.lock
 # The torch CUDA wheel is driver-specific — install with the matching index, e.g.:
-#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 # per-node serving engine — we wrap it at block granularity, don't rebuild it
-sglang==0.4.6.post5       # TODO confirm exact patch on the box (the block-forward path is SGLang-version-specific)
-torch==2.5.1              # + CUDA wheel via --index-url (L4 driver-specific)
+sglang[srt]==0.4.6.post5  # [srt] = the inference-runtime extra (REQUIRED — confirmed on the L4 box):
+                          # pulls runtime-common (transformers==4.51.1 + pydantic) + the CUDA kernels
+                          # sgl-kernel==0.1.4 + flashinfer_python==0.2.5. Bare `sglang` is only the client
+                          # shell (imports, but can't serve — missing pydantic/transformers/kernels).
+                          # For the g7e/Blackwell headline (sm_100), swap `srt` → the `blackwell` extra.
+torch==2.6.0              # sglang[srt] 0.4.6.post5 REQUIRES 2.6.0 (confirmed: it overrode a pre-pinned
+                          # 2.5.1 on the box). Default PyPI wheel is +cu124 — matches the L4 driver (12.2/12.4).
+
+# compressed-tensors is a sglang[srt] transitive dep, but its resolver pulls the LATEST (0.15+), which
+# imports transformers.masking_utils (a transformers>=4.52 module) — incompatible with sglang's pinned
+# transformers==4.51.1, and it's imported EAGERLY by sglang's quantization init (breaks ALL model loading,
+# even unquantized). Pin it back to the last pre-masking_utils release (CONFIRMED working on the box).
+compressed-tensors==0.9.4
 
 # the wire (fork/shard/wire.py) — required to load any node
 cryptography==43.0.1
@@ -17,7 +28,15 @@ numpy==1.26.4
 
 # model/weight pull
 huggingface-hub==0.25.2
-transformers==4.45.2      # rung-2 reference-block stepping stone (sglang_node.py path C)
+
+# transformers is pulled by sglang[srt] — runtime-common pins it to ==4.51.1 (CONFIRMED on the box),
+# so do NOT hard-pin it here: an independent pin that disagrees with sglang's breaks the install (the
+# old `transformers==4.45.2` pin did exactly this — and it also couldn't run the path-C oracle, which
+# needs transformers 5.x). The `pip-compile --generate-hashes` step (header) freezes the 4.51.1 that
+# sglang resolves, so the no-wildcard guarantee (M12) holds.
+# The path-C correctness oracle (fork/shard/transformers_node.py) uses transformers 5.x
+# (masking_utils.create_causal_mask) — it runs in its OWN env from infra/requirements-ref.txt, never
+# here (sglang's 4.51.1 and the oracle's 5.12 do not co-exist).
 
 # the Cairn scheduler/runtime (installed from the repo, editable on the box)
 pyyaml==6.0.2

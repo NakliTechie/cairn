@@ -78,20 +78,35 @@ aws service-quotas get-service-quota --service-code ec2 --quota-code L-3819A6DF 
 **Done when:** the applied G-spot vCPU value in eu-south-2 covers the fleet you're about to launch.
 
 ## Step 3 — Implement the SGLang block-forward  (Chunk B, the net-new GPU work)
-On a single GPU box first (cheapest iteration):
+On a single GPU box first (cheapest iteration). **Two separate envs — keep them apart**: the path-C
+oracle's transformers 5.x and sglang's ~4.5x do NOT co-exist in one venv.
 ```sh
-pip install -r requirements-gpu.txt                     # pin the torch CUDA wheel to the L4 driver
+# Box / SGLang env — transformers comes TRANSITIVELY via sglang (do not hard-pin it; see the file header)
+pip install -r requirements-gpu.txt                     # pins the torch CUDA wheel to the L4 driver
 pip-compile --generate-hashes -o requirements.lock requirements-gpu.txt   # M12 hash-lock, on the box
+pip show transformers                                   # record the sglang-resolved version in the lock
 ```
+The **path-C oracle** (`infra/requirements-ref.txt`, CPU, its own venv) is **already proven** —
+2026-06-21, 4/4 green locally (split==single-ref + replay-rebuild). On the box it's only an optional
+secondary cross-check, NOT the gate's reference. The split *math* is banked; rung-2 is the SGLang perf path.
+
 Fill the two marked integration points in [`../fork/shard/sglang_node.py`](../fork/shard/sglang_node.py):
 - `load_shard()` — load only `[layer_start, layer_end)` to VRAM + CUDA-graph capture.
 - `forward(hidden, kv_meta)` — run the block over `hidden`, per-seq paged KV for `kv_meta["seq"]`.
-- **Cheapest first step (path C):** a transformers reference block forward (no SGLang) to prove
-  split-correctness + KV-replay, *then* swap to the SGLang path for performance.
-- While here: measure the **§12 numbers** on the real L4 (usable VRAM, framework/activation
-  overhead) and replace the placeholders in `configs/gpt-oss-120b.yaml`.
 
-**Done when:** a single `SglangNodeRuntime` loads a block and `forward` returns the right shape.
+Validate against the **SGLang-unsplit reference** (not transformers — path C already banked the split
+math on CPU): [`../fork/tests/test_sglang_split.py`](../fork/tests/test_sglang_split.py) drives
+`build_shard_pipeline(runtime_cls=SglangNodeRuntime)` and asserts SGLang-split == SGLang-single (one
+stage, no cuts) token-for-token + replay-rebuild on an induced kill. It is the **executable target** —
+it fails until the forward lands, so iterate `forward` → run the harness on the box (no test scaffolding
+written on metered GPU time).
+
+Then measure the **§12 numbers** on the real L4 with [`skypilot/measure.py`](skypilot/measure.py)
+(usable VRAM, framework + activation overhead) and paste them over the DOCUMENTED PLACEHOLDERS in
+`configs/gpt-oss-120b.yaml` (`overheads.*`, `pool.gpu_vram_bytes`).
+
+**Done when:** `test_sglang_split.py` passes on one GPU (split == unsplit + replay-rebuild) and
+`measure.py` has replaced the config placeholders.
 
 ## Step 4 — 2-GPU small-model run  (Chunk B gate — handoff §6 rung 2)
 Split a small 7–9B across 2 GPUs (one box w/ 2 cards, or 2 spot nodes on the LAN):

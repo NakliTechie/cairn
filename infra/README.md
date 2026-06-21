@@ -71,7 +71,9 @@ independently.
 - `skypilot/cairn-block.sky.yaml` — one block node (g6.xlarge spot, setup + serve).
 - `skypilot/launch.py` — provision N (from the fit) + spares; inject secrets.
 - `skypilot/down.py` — cancel all `cairn-*` jobs (scale to zero).
-- `requirements-gpu.txt` — the pinned box image (torch CUDA + SGLang + the fork).
+- `skypilot/measure.py` — on-box §12 probe (usable VRAM + framework/activation overhead → config values).
+- `requirements-gpu.txt` — the pinned box image (torch CUDA + SGLang + the fork; transformers comes via sglang).
+- `requirements-ref.txt` — the CPU path-C oracle env (transformers 5.x), a SEPARATE venv from the box image.
 - `aws/iam-policy.json` + `aws/bootstrap.sh` — least-privilege IAM, created via the CLI.
 
 **Open (validate live, handoff §3):** the SkyPilot primitive (managed jobs vs cluster) for

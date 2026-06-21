@@ -1,0 +1,36 @@
+# Cairn rung-2 single-GPU DEV box — a bare g6.xlarge (L4) spot for ITERATING on the SGLang
+# block-forward. NOT the fleet serve path (cairn-block.sky.yaml runs cairn_node.serve, which
+# doesn't exist yet): this box provisions + installs the GPU env, then stays UP for `sky exec`/SSH.
+# Auto-downs on idle (cost guard); tear down explicitly with `sky down cairn-dev`.
+name: cairn-dev
+
+resources:
+  cloud: aws
+  region: eu-south-2          # Spain — cheap g6 spot, <5% interruption (the proof region)
+  instance_type: g6.xlarge    # 1x L4 (Ada, sm_89), 24 GB
+  use_spot: true
+  disk_size: 128
+  labels:
+    cairn: "true"             # IAM destructive-action gate (H5/M13)
+
+# Only the code the harness/forward need (skips scheduler/.venv etc.).
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+
+# Stable, reliable deps in setup; sglang/flashinfer get verified interactively via `sky exec`
+# (they're the box-version-specific part — react to errors rather than bake a brittle setup).
+setup: |
+  set -uo pipefail
+  echo ">>> GPU:"; nvidia-smi || true
+  python3 -m venv ~/cairn-env
+  ~/cairn-env/bin/pip install -q --upgrade pip
+  echo ">>> torch (cu124 for the L4 driver):"
+  ~/cairn-env/bin/pip install -q torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+  echo ">>> the pinned box image (sglang + transformers + wire deps):"
+  ~/cairn-env/bin/pip install -q -r /cairn/infra/requirements-gpu.txt
+  ~/cairn-env/bin/python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())" || true
+
+envs:
+  HF_TOKEN: ""
