@@ -10,6 +10,10 @@
 #   infra/skypilot/nuke.sh --force    # TERMINATE them all (break glass)
 #
 # Safe: read-only by default; the scoped IAM key only permits terminating cairn=true-tagged instances.
+#
+# WHY tags (not `sky down`): this AWS account + SkyPilot install is SHARED across projects (Cairn,
+# PitchLab, …). Cairn isolates by the cairn=true tag for up/down/report and never touches SkyPilot's
+# shared control plane (API server, jobs controller). See infra/skypilot/README.md.
 set -uo pipefail
 
 PROFILE=${AWS_PROFILE:-cairn-skypilot}
