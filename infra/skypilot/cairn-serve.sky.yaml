@@ -68,8 +68,11 @@ run: |
       --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 \
       --spare-host "$IP2" --spare-sink 7780 --spare-port 7777 2>&1 | tee /tmp/cairn-serve.log
   elif [ "$RANK" = "1" ]; then
-    # TAIL (CUT..NLAYERS) -> the endpoint's tail-sink IP0:7779 ; no auto-die (kill it manually to show recovery)
-    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
+    # TAIL (CUT..NLAYERS) -> the endpoint's tail-sink IP0:7779. PROACTIVE-drain hook armed: it watches the
+    # sentinel /tmp/cairn-drain (a local stand-in for the IMDS spot notice); `touch` it mid-serving and the
+    # tail drains gracefully onto the spare WHILE STILL ALIVE. (Reactive abrupt-kill also works via pkill.)
+    CAIRN_DIE_AFTER=0 CAIRN_SPOT_TEST_FILE=/tmp/cairn-drain CAIRN_SPOT_WATCH_INTERVAL=0.5 \
+      python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
       --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
       --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779 \
       2>&1 | tee /tmp/cairn-node-rank1-tail.log
