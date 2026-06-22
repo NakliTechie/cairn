@@ -174,6 +174,29 @@ class SglangNodeRuntime(NodeRuntime):
         folded = hidden + residual if residual is not None else hidden
         return folded.reshape(1, s_len, -1)                  # [1, S, H] hand-off to the next stage
 
+    # ---- warmup: pre-compile the flashinfer JIT kernels so the first REAL forward isn't where it lands ----
+    def warmup(self, n_tokens: int = 4) -> None:
+        """Run a throwaway prefill + decode to force flashinfer's one-time ~30-45s JIT kernel compile NOW,
+        at load time, instead of on the first real forward. Critical for a warm SPARE: without it the
+        spare's first forward IS the recovery forward, so the compile dominates MTTR (cross-box recovery
+        measured 38.9s — almost all of it this compile). Uses a throwaway seq and frees it; no-op if
+        unloaded. The compiled kernels persist in flashinfer's on-disk cache for this box."""
+        if self._runner is None:
+            return
+        import torch
+        w = self._inner.embed_tokens.weight                  # [vocab, H] — gives H, dtype, device
+        H, dtype, device = w.shape[1], w.dtype, w.device
+        seq = "__cairn_warmup__"
+        try:
+            if self._is_embed:                               # entry: token ids in
+                self.forward(torch.arange(n_tokens, device=device).reshape(1, n_tokens), {"seq": seq, "pos": 0})
+                self.forward(torch.tensor([[0]], device=device), {"seq": seq, "pos": n_tokens})
+            else:                                            # mid/tail: hidden state in
+                self.forward(torch.zeros(1, n_tokens, H, dtype=dtype, device=device), {"seq": seq, "pos": 0})
+                self.forward(torch.zeros(1, 1, H, dtype=dtype, device=device), {"seq": seq, "pos": n_tokens})
+        finally:
+            self.free_seq(seq)                               # drop the throwaway KV — leaves real state untouched
+
     def free_seq(self, seq_id: str) -> None:
         """Drop a seq's KV on this block (on completion, or before a replay-rebuild)."""
         self._steps.pop(seq_id, None)

@@ -92,7 +92,11 @@ def main() -> None:
 
     lsock = _listen(a.bind_host, a.listen_port)  # listen BEFORE the (slow) load — peers connect into the backlog
     _load_serialized(rt, a.device)        # GPU: weights + flashinfer JIT (serialized per-GPU; mock: instant)
-    print(f"[serve] loaded layers [{a.layer_start},{a.layer_end}) on {a.device}; "
+    if hasattr(rt, "warmup"):             # pre-compile flashinfer kernels NOW (at startup) so a promoted spare's
+        t_w = time.time()                 # FIRST forward (the recovery) is instant, not a ~38s JIT compile (MTTR)
+        rt.warmup()
+        print(f"[serve] warmed flashinfer kernels in {time.time() - t_w:.1f}s", flush=True)
+    print(f"[serve] loaded+warmed layers [{a.layer_start},{a.layer_end}) on {a.device}; "
           f"listening :{a.listen_port}, next {a.next_host}:{a.next_port}", flush=True)
 
     edge_out = LanEdge(a.next_host, a.next_port)
