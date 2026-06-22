@@ -7,9 +7,13 @@ def test_kv_bytes_per_token_per_layer(gpt_oss_cfg):
 
 
 def test_usable_vram(gpt_oss_cfg):
-    # card 24 GiB − 3 GiB framework − 0.5 GiB activation.
-    expected = 24 * 1024**3 - 3 * 1024**3 - 512 * 1024**2
-    assert calcs.usable_vram_bytes(gpt_oss_cfg) == expected
+    c = gpt_oss_cfg
+    # §12.1: usable = the (MEASURED) card VRAM minus the framework + activation reserves. Derive from the
+    # config so this doesn't go stale when the VRAM is re-measured (it was a 24 GiB placeholder → 21.96 GiB).
+    assert calcs.usable_vram_bytes(c) == c.gpu_vram_bytes - c.framework_overhead_bytes - c.activation_buffer_bytes
+    # the reserves are the documented conservative design values (replace when the sglang-loaded measure lands).
+    assert c.framework_overhead_bytes == 3 * 1024**3      # 3 GiB CUDA context + framework
+    assert c.activation_buffer_bytes == 512 * 1024**2     # 0.5 GiB activation buffer
 
 
 def test_embedding_and_lm_head(gpt_oss_cfg):

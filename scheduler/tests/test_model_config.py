@@ -12,7 +12,7 @@ def test_load_gpt_oss(gpt_oss_cfg):
     assert c.vocab_size == 201088
     assert c.is_moe and c.num_local_experts == 128
     assert c.license == "Apache-2.0"
-    assert c.gpu_vram_bytes == 24 * 1024**3  # 24 GiB L4
+    assert c.gpu_vram_bytes == 23583784960   # 21.96 GiB — MEASURED on the L4 (measure.py 2026-06-21), not nominal 24 GiB (driver/ECC reserve)
     assert c.tie_word_embeddings is False
 
 
