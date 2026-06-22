@@ -59,8 +59,12 @@ gap was **not** the recovery itself — it was the spare machine doing its *firs
 forces a one-time ~38-second compile of its GPU math routines (see *flashinfer / JIT* in the glossary).
 The spare had the model **loaded** but had never actually "turned the engine over." The lesson: a
 **"warm spare" has to be warm all the way through** — it should do one throwaway calculation at startup so
-it's instant when it's actually needed. Pre-warming should bring recovery back down toward a second. (A
-genuinely useful finding — and a concrete next optimization.)
+it's instant when it's actually needed.
+
+**And it works.** We made every machine do one throwaway calculation at startup (moving that ~38-second
+compile to load time), and the cross-box recovery dropped from **38.9 seconds to 0.023 seconds** — a
+~1,700× speed-up, same word-for-word-identical answer. So the real story is now: a machine dies
+mid-sentence, and the system is back to producing the *identical* answer in **23 milliseconds**.
 
 ---
 
