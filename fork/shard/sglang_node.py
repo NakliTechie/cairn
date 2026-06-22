@@ -198,7 +198,7 @@ class SglangNodeRuntime(NodeRuntime):
             "loaded": self._runner is not None,
             "layers": [self.layer_range.start, self.layer_range.end],
             "device": self.device,
-            "kv_seqs": len(self._kv_seqs),
+            "kv_seqs": len(self._batches),   # seqs with KV cached on this block (renamed from _kv_seqs in the rung-2 rewrite)
         }
         if _HAS_TORCH and torch.cuda.is_available():
             try:

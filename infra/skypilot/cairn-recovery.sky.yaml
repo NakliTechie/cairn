@@ -51,28 +51,37 @@ run: |
   cd /cairn
   pkill -9 -f "[c]airn_node" 2>/dev/null || true; sleep 2    # clear leftover procs from a prior run (e.g. a hung standby spare holding :7777)
   echo "[recovery] rank=$RANK ips=$IP0,$IP1,$IP2 model=$MODEL die_after=$DIE"
+  # -u everywhere + per-node on-box logfiles: buffered stdout over sky-exec is LOST on a kill (how the
+  # first live rec run went silent). The driver also writes a flushed/fsync'd verdict to /tmp/cairn-recovery.log.
   if [ "$RANK" = "0" ]; then
     # ENTRY (0..CUT) -> tail on IP1:7777 ; never dies
-    CAIRN_DIE_AFTER=0 python -m cairn_node.serve --runtime sglang --model "$MODEL" \
+    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
       --layer-start 0 --layer-end "$CUT" --device cuda:0 \
-      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP1" --next-port 7777 &
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP1" --next-port 7777 \
+      > /tmp/cairn-node-rank0-entry.log 2>&1 &
     NODE_PID=$!
     # DRIVER: dial local entry, accept tail (7779) + spare (7780), spare lives at IP2:7777
-    python -m cairn_node.recovery_fleet --entry-host 127.0.0.1 --entry-port 7777 \
+    python -u -m cairn_node.recovery_fleet --entry-host 127.0.0.1 --entry-port 7777 \
       --tail-sink 7779 --spare-sink 7780 --bind-host 0.0.0.0 \
-      --spare-host "$IP2" --spare-port 7777 --prompt "$PROMPT" --n-new "$NNEW"
-    echo "[recovery] driver done"
+      --spare-host "$IP2" --spare-port 7777 --prompt "$PROMPT" --n-new "$NNEW" \
+      --log /tmp/cairn-recovery.log
+    echo "[recovery] driver exited; ---- /tmp/cairn-recovery.log ----"; cat /tmp/cairn-recovery.log || true
+    echo "[recovery] ---- entry node log (/tmp/cairn-node-rank0-entry.log) ----"; cat /tmp/cairn-node-rank0-entry.log || true
     kill $NODE_PID 2>/dev/null || true
   elif [ "$RANK" = "1" ]; then
     # TAIL (CUT..NLAYERS) -> driver tail-sink IP0:7779 ; dies after $DIE forwards
-    CAIRN_DIE_AFTER=$DIE python -m cairn_node.serve --runtime sglang --model "$MODEL" \
+    CAIRN_DIE_AFTER=$DIE python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
       --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
-      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779 \
+      2>&1 | tee /tmp/cairn-node-rank1-tail.log
   else
-    # SPARE (CUT..NLAYERS) -> driver spare-sink IP0:7780 ; pre-warmed standby, never dies
-    CAIRN_DIE_AFTER=0 python -m cairn_node.serve --runtime sglang --model "$MODEL" \
+    # SPARE (CUT..NLAYERS) -> driver spare-sink IP0:7780 ; pre-warmed standby. In a no-death run it is
+    # NEVER promoted and now SELF-EXITS when the driver tears down (serve.py select on prev-vs-downstream)
+    # — it used to block on accept() forever and hang the whole run.
+    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
       --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
-      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7780
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7780 \
+      2>&1 | tee /tmp/cairn-node-rank2-spare.log
   fi
 
 envs:

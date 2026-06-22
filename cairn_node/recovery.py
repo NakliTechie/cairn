@@ -32,13 +32,25 @@ def _next_tok(msg) -> int:
 
 
 def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
-                         prompt: List[int], n_new: int, seq: str = "s0"):
+                         prompt: List[int], n_new: int, seq: str = "s0", on_event=None):
     """Greedy-decode `n_new` tokens through head -> … -> active. DETECT a node death (active.recv raises)
     and recover onto the pre-warmed `spare`: re-point the entry (set_next), replay the committed history
     (its last logit is the token we were waiting for — KV rebuild + resume in one prefill), continue.
-    Returns (tokens, mttr_s | None). The death is induced externally (CAIRN_DIE_AFTER on the node)."""
+    Returns (tokens, mttr_s | None). The death is induced externally (CAIRN_DIE_AFTER on the node).
+
+    `on_event(kind, *payload)` — optional progress hook so a live run leaves a durable per-step trace
+    ("tok", i, tok) / ("death", n_committed) / ("recovered", mttr_s, tok, i). It must never raise; a
+    logging failure cannot be allowed to break the decode (truthful-run discipline)."""
     import torch
     from shard.transport import EDGE_ERRORS
+
+    def _emit(kind, *payload):
+        if on_event is not None:
+            try:
+                on_event(kind, *payload)
+            except Exception:
+                pass
+
     cur = torch.tensor([list(prompt)])
     out: List[int] = []
     pos = 0
@@ -51,6 +63,7 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
         except EDGE_ERRORS:
             if recovered:
                 raise RuntimeError("second node death — out of warm spares (Path-1 single-spare scope)")
+            _emit("death", len(out))                                                # committed tokens before death
             t0 = time.time()
             head.send({"op": "set_next", "host": spare_host, "port": spare_port})   # entry -> warm spare
             active = spare                                                          # read from the spare now
@@ -62,10 +75,12 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
             cur = torch.tensor([[tok]])
             mttr = time.time() - t0
             recovered = True
+            _emit("recovered", mttr, tok, len(out))
             continue
         out.append(tok)
         pos += cur.shape[1]
         cur = torch.tensor([[tok]])
+        _emit("tok", len(out), tok)
     return out[:n_new], mttr
 
 

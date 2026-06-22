@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import select
 import socket
 import sys
 import time
@@ -91,9 +92,24 @@ def main() -> None:
 
     lsock = _listen(a.bind_host, a.listen_port)  # listen BEFORE the (slow) load — peers connect into the backlog
     _load_serialized(rt, a.device)        # GPU: weights + flashinfer JIT (serialized per-GPU; mock: instant)
+    print(f"[serve] loaded layers [{a.layer_start},{a.layer_end}) on {a.device}; "
+          f"listening :{a.listen_port}, next {a.next_host}:{a.next_port}", flush=True)
 
     edge_out = LanEdge(a.next_host, a.next_port)
-    _connect_retry(edge_out)              # dial next (it listens early too), then accept prev
+    _connect_retry(edge_out)              # dial next (it listens early too), then wait for our prev to dial in
+    # Wait for our prev — but ALSO watch edge_out. If the DOWNSTREAM closes first, the run is being torn
+    # down and no prev is ever coming: the canonical case is a pre-warmed standby SPARE in a no-death run
+    # — never promoted, so a bare accept() blocks FOREVER and hangs teardown (the first live rec run +
+    # `sky launch` both hung on exactly this). The spare's edge_out is connected to the driver; when the
+    # driver exits it closes that socket → we see it readable (EOF) and exit cleanly. A prev dialing in
+    # (we got promoted via the entry's set_next) wins the race and we serve normally.
+    rlist, _, _ = select.select([lsock, edge_out], [], [])
+    if lsock not in rlist:
+        print("[serve] downstream closed before any prev connected — standby node exiting (never promoted)",
+              flush=True)
+        edge_out.close()
+        lsock.close()
+        return
     conn, _ = lsock.accept()
     edge_in = LanEdge.from_socket(conn)
 

@@ -114,6 +114,14 @@ class LanEdge:
             self._die()
             raise
 
+    def fileno(self) -> int:
+        """Underlying socket fd, so an edge can be passed straight to select()/poll(). Used by a
+        pre-warmed standby node to wait on TWO events at once: its prev dialing in (it got promoted)
+        vs. this edge's peer closing (the driver tore the run down → it was never needed, exit)."""
+        if self._sock is None:
+            raise ConnectionError(f"edge {self.name} not connected")
+        return self._sock.fileno()
+
     def _die(self) -> None:
         self.alive = False
         self.resets += 1

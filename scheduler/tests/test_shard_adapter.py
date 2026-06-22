@@ -56,9 +56,11 @@ def test_adapter_free_stream_releases_node_kv():
     from shard.sglang_node import SglangNodeRuntime
 
     rt = ShardBlockRuntime(0, 0, 8, "gpt-oss-120b", runtime_cls=SglangNodeRuntime)
-    rt._node._kv_seqs["s"] = 3            # simulate KV cached on the node for stream "s"
+    rt._node._steps["s"] = 3              # simulate a live stream: forward-count...
+    rt._node._batches["s"] = object()     # ...+ a batch handle (KV cached) — the rung-2 internal model
+    assert rt._node.kv_tokens("s") == 3   # cached before free
     rt.free_stream("s")
-    assert rt._node.kv_tokens("s") == 0  # released via free_seq, not just the adapter's counter
+    assert rt._node.kv_tokens("s") == 0  # released via free_seq (pops _steps + _batches), not just the adapter's counter
 
 
 def test_adapter_accepts_sglang_runtime_cls():
