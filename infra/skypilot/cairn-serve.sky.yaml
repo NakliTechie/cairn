@@ -1,0 +1,87 @@
+# Cairn LIVE BYOK ENDPOINT — a usable OpenAI-compatible API backed by the distributed-with-recovery fleet.
+#   rank0 = ENTRY (layers 0..CUT) + the serve_http endpoint (OpenAI /v1/chat/completions on :8000)
+#   rank1 = TAIL  (layers CUT..NLAYERS) — serves; a manual kill (sky exec 'pkill') demonstrates recovery
+#   rank2 = SPARE (layers CUT..NLAYERS) — pre-warmed standby; the endpoint re-stitches to it on a tail death
+#
+# This is the product: a model split across boxes, behind a BYOK key, surviving a reclaim mid-request.
+# The run block BLOCKS (serve_forever) → the cluster stays up serving until `sky down`.
+#
+#   source infra/secrets.env
+#   sky launch -c cairn-serve infra/skypilot/cairn-serve.sky.yaml --env HF_TOKEN --env SHARD_PSK \
+#     --env CAIRN_API_KEY=sk-cairn-demo -i 60 --down -d        # -d = detached (it serves forever)
+#   ssh -L 8888:localhost:8000 cairn-serve -N &                 # tunnel the endpoint to localhost:8888
+#   curl localhost:8888/v1/chat/completions -H 'authorization: Bearer sk-cairn-demo' \
+#     -H 'content-type: application/json' \
+#     -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Say hi in 5 words."}],"max_tokens":32}'
+#   sky exec cairn-serve "pkill -9 -f 'layer-start 12'"         # kill the TAIL → next request recovers onto the spare
+#   sky down cairn-serve
+name: cairn-serve
+
+num_nodes: 3
+
+resources:
+  cloud: aws
+  region: eu-south-2
+  instance_type: g6.xlarge        # 1x L4 per box (entry / tail / spare). $0.16/box — under the per-box gate.
+  use_spot: true
+  disk_size: 128
+  ports: 8000                     # expose the endpoint port (also reachable via `ssh -L`)
+  labels:
+    cairn: "true"
+    cairn-purpose: "serve-endpoint"
+
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+  /cairn/scheduler: ./scheduler
+
+setup: |
+  set -uo pipefail
+  python3 -m venv ~/cairn-env
+  ~/cairn-env/bin/pip install -q --upgrade pip
+  ~/cairn-env/bin/pip install -q -r /cairn/infra/requirements-gpu.txt
+  ~/cairn-env/bin/pip install -q --no-deps "compressed-tensors==0.9.4"
+  ~/cairn-env/bin/python -c "import torch,sglang,cryptography; print('OK torch',torch.__version__,'cuda',torch.cuda.is_available())" || true
+
+run: |
+  set -uo pipefail
+  RANK=${SKYPILOT_NODE_RANK}
+  IPS=($SKYPILOT_NODE_IPS); IP0=${IPS[0]}; IP1=${IPS[1]}; IP2=${IPS[2]}
+  export PATH=$HOME/cairn-env/bin:/usr/local/cuda/bin:$PATH
+  export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
+  export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.8}
+  MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}; CUT=${CUT:-12}; NLAYERS=${NLAYERS:-24}
+  API_KEY=${CAIRN_API_KEY:-sk-cairn-demo}
+  cd /cairn
+  pkill -9 -f "[c]airn_node" 2>/dev/null || true; sleep 2
+  echo "[serve] rank=$RANK ips=$IP0,$IP1,$IP2 model=$MODEL"
+  if [ "$RANK" = "0" ]; then
+    # ENTRY (0..CUT) -> tail on IP1:7777
+    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start 0 --layer-end "$CUT" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP1" --next-port 7777 \
+      > /tmp/cairn-node-rank0-entry.log 2>&1 &
+    # THE ENDPOINT: dial local entry, accept tail (7779) + spare (7780); serve OpenAI on :8000 with recovery armed
+    python -u -m cairn_node.serve_http --model "$MODEL" --port 8000 --bind 0.0.0.0 --api-key "$API_KEY" \
+      --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 \
+      --spare-host "$IP2" --spare-sink 7780 --spare-port 7777 2>&1 | tee /tmp/cairn-serve.log
+  elif [ "$RANK" = "1" ]; then
+    # TAIL (CUT..NLAYERS) -> the endpoint's tail-sink IP0:7779 ; no auto-die (kill it manually to show recovery)
+    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779 \
+      2>&1 | tee /tmp/cairn-node-rank1-tail.log
+  else
+    # SPARE (CUT..NLAYERS) -> the endpoint's spare-sink IP0:7780 ; pre-warmed standby
+    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7780 \
+      2>&1 | tee /tmp/cairn-node-rank2-spare.log
+  fi
+
+envs:
+  HF_TOKEN: ""
+  SHARD_PSK: ""
+  CAIRN_API_KEY: "sk-cairn-demo"
