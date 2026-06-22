@@ -4,8 +4,10 @@ Reactive recovery (test_serve_http / recovery.py) waits for the node to DIE, the
 correct, but there's a brief gap. A real spot reclaim isn't a surprise: AWS posts a ~2-min interruption
 notice on IMDS first. So a node can watch for its OWN notice and tell the driver "I'm draining" WHILE STILL
 ALIVE; the driver pre-emptively re-stitches the entry to the warm spare + replays (priming the spare's KV)
-and the in-flight request continues seamlessly — same set_next + replay mechanism, the only difference is
-the TRIGGER (a draining signal, not a death) and that the old node never died.
+and the in-flight request continues seamlessly — same set_next + replay mechanism, the difference is the
+TRIGGER (a draining signal, not a death) and that there's no gap. The drained node DOES then exit — the
+re-stitch closes its edge_in — so "graceful" is about the STREAM migrating, not the node surviving (the
+node was alive only long enough to emit the signal); asserted below.
 
 This proves it on the CPU mock — no GPU, no spend:
   • entry -> tail -> driver, plus a pre-warmed spare, run a clean NO-DRAIN reference decode (the oracle).
@@ -15,7 +17,8 @@ This proves it on the CPU mock — no GPU, no spend:
     in place of its next forward result; the driver migrates to the spare and finishes the stream.
   • Assert: output is BIT-IDENTICAL to the no-drain reference, NO exception was raised, and on_event shows
     the PROACTIVE path fired (a "draining" event + a "recovered" event) and NOT the reactive "death" path —
-    i.e. the migration was graceful (no EDGE_ERRORS death was ever needed).
+    i.e. the migration was graceful (no EDGE_ERRORS death was ever needed) — and THEN the drained tail
+    exits (the re-stitch closes its edge_in): graceful is about the stream, the tail does not survive.
 
 torch/cryptography-gated (the wire pulls in torch)."""
 import os
@@ -126,8 +129,17 @@ def test_proactive_drain_migrates_to_spare_gracefully(tmp_path):
         assert "recovered" in kinds, f"no 'recovered' event after the drain ({kinds})"
         assert "death" not in kinds, f"a reactive 'death' fired — migration was NOT graceful ({kinds})"
 
-        # 3) The tail was STILL ALIVE through the migration (the whole point — graceful, not a crash).
-        assert tail.poll() is None, "the draining tail exited during the migration — should outlive it"
+        # 3) "Graceful" is about the STREAM, not the tail: the drained tail EXITS shortly after the migration.
+        #    The driver's set_next (in _recover_to_spare) closes the entry->tail edge, so the tail's next
+        #    edge_in.recv() hits peer-closed and the process exits (serve.py). It does NOT outlive the
+        #    migration — it was alive only long enough to emit the draining signal. (The earlier
+        #    `assert tail.poll() is None` passed only because it sampled the one instant before the FIN had
+        #    propagated; the tail exits ~150ms later — measured CPU repro, 2026-06-23.)
+        for _ in range(300):                                    # up to ~3s for the post-re-stitch peer-closed
+            if tail.poll() is not None:
+                break
+            time.sleep(0.01)
+        assert tail.poll() is not None, "drained tail did not exit after the re-stitch closed its edge_in"
 
         # 4) The committed-token count at the drain is consistent with where we triggered it.
         n_at_drain = next(p[0] for k, p in events if k == "draining")

@@ -44,10 +44,11 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
 
       • REACTIVE  — the node DIED: `active.recv()` raises (EDGE_ERRORS). There was a brief gap; the replay
                     rebuilds the spare's KV and re-derives the token we were mid-waiting-for.
-      • PROACTIVE — the node is DRAINING: it saw its own ~2-min spot-interruption notice and, WHILE STILL
-                    ALIVE, sent `{"op":"draining"}` in place of this forward's result. No error, no dropped
-                    token — we pre-emptively re-stitch the entry to the spare + replay BEFORE the node dies,
-                    so the stream continues seamlessly. The graceful path; reactive stays as the fallback.
+      • PROACTIVE — the node is DRAINING: it saw its own ~2-min spot-interruption notice and, while still
+                    alive, sent `{"op":"draining"}` in place of this forward's result. No error, no dropped
+                    token — we pre-emptively re-stitch the entry to the spare + replay, so the STREAM
+                    continues seamlessly. (The drained node then EXITS: the set_next below closes its
+                    edge_in — "graceful" is about the stream, NOT the node surviving.) Reactive is the fallback.
 
     Both do the same thing: set_next (entry -> warm spare), replay the committed history under a FRESH seq
     (entry + fresh spare both prefill cleanly; the replay's last logit IS the pending token), resume on the
@@ -74,8 +75,10 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
 
     def _recover_to_spare():
         """Re-stitch entry -> warm spare + replay the committed history; return (pending_tok, hist_len, mttr).
-        Shared by both triggers — the ONLY difference is reactive had a gap (the node died), proactive did
-        not (the node is still alive, the switch is seamless). Reads the pending token FRESH from the spare."""
+        Shared by both triggers — the difference is reactive had a gap (the node already died) while proactive
+        did not (the switch is seamless: the node signalled while alive). Either way the set_next re-points the
+        entry at the spare, which CLOSES the old node's edge_in — so even the drained (proactive) node then
+        exits, not just the reactively-dead one. Reads the pending token FRESH from the spare."""
         nonlocal active, seq
         t0 = time.time()
         head.send({"op": "set_next", "host": spare_host, "port": spare_port})   # entry -> warm spare

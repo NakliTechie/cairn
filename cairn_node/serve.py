@@ -117,11 +117,17 @@ def main() -> None:
     conn, _ = lsock.accept()
     edge_in = LanEdge.from_socket(conn)
 
-    # PROACTIVE drain — the spot-interruption (~2-min) notice fires WHILE this node is still alive, so
-    # recovery can be graceful (no death, no dropped token) instead of reactive. `_draining` is a 1-slot
-    # flag flipped by either the spot_watch thread (gated on CAIRN_SPOT_WATCH so tests/CI never poll real
-    # IMDS) OR a test op `{"op":"drain"}` injected into the pipeline. When set, the wire loop emits ONE
-    # `{"op":"draining"}` to edge_out (→ the driver), then keeps serving normally until the real stop/death.
+    # PROACTIVE drain — the spot-interruption (~2-min) notice fires WHILE this node is still alive, so the
+    # driver can migrate the in-flight STREAM to the warm spare with no dropped token (graceful) instead of
+    # waiting for a death. `_draining` is a 1-slot flag flipped by either the spot_watch thread (gated on
+    # CAIRN_SPOT_WATCH so tests/CI never poll real IMDS) OR a test op `{"op":"drain"}` injected into the
+    # pipeline. When set, the wire loop emits ONE `{"op":"draining"}` to edge_out (→ the driver) in place of
+    # a forward result, then loops back to recv.
+    #   NOTE — this node does NOT stay alive after the drain. Once the driver re-stitches (it sends the ENTRY
+    #   a `set_next` pointing at the spare — recovery.py), the entry CLOSES this node's edge_in, so our very
+    #   next recv() sees peer-closed and this process EXITS (serve.py:161, ~150ms later — measured CPU repro
+    #   2026-06-23). "Graceful" is about the STREAM (it migrates seamlessly, no gap); the drained node still
+    #   dies — which is fine, its box is being reclaimed anyway. See recovery.py + test_proactive_drain.py.
     # A list (not a bare bool) so the watch thread's closure mutates the SAME object the loop reads.
     _draining = [False]
 
@@ -178,10 +184,11 @@ def main() -> None:
                 _draining[0] = True
                 continue
             continue                              # unknown op — ignore
-        # Draining? Tell the driver ONCE (it pre-emptively re-stitches to the warm spare WHILE we're still
-        # alive), then keep serving normally. We send the notice in PLACE of this forward's result: the
-        # driver reads it as the response to its in-flight send, re-stitches + replays through the spare for
-        # the pending token, and abandons our (orphaned) reply. Cheap + off the hot path until the notice.
+        # Draining? Tell the driver ONCE (it pre-emptively re-stitches the entry to the warm spare), then
+        # loop back to recv. We send the notice in PLACE of this forward's result: the driver reads it as the
+        # response to its in-flight send, re-stitches + replays through the spare for the pending token, and
+        # abandons our (orphaned) reply. We do NOT keep serving — the re-stitch closes our edge_in, so the
+        # next recv() raises peer-closed and we exit (the box is being reclaimed anyway). Off the hot path.
         if _draining[0] and not drained_sent:
             try:
                 edge_out.send({"op": "draining"})
