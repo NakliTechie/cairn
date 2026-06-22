@@ -71,12 +71,19 @@ run: |
   elif [ "$RANK" = "1" ]; then
     # TAIL (CUT..NLAYERS) -> the endpoint's tail-sink IP0:7779. PROACTIVE-drain hook armed: it watches the
     # sentinel /tmp/cairn-drain (a local stand-in for the IMDS spot notice); `touch` it mid-serving and the
-    # tail drains gracefully onto the spare WHILE STILL ALIVE. (Reactive abrupt-kill also works via pkill.)
+    # tail drains gracefully onto the spare WHILE STILL ALIVE. Reactive abrupt-kill (pkill) also works — BUT
+    # the rank's run-command MUST report 0 on the inner death, else SkyPilot's multi-node GANG scheduler reads
+    # the non-zero (137/SIGKILL) as a job failure and tears down ALL ranks — incl. the head's serve_http —
+    # MID-RECOVERY (the 2026-06-23 live finding: serve_http was reaped before it could re-stitch to the spare).
+    # So: direct redirect (NOT `| tee` — pipefail would surface the 137) + `exit 0`, mirroring the tail in
+    # cairn-recovery.sky.yaml. The tail process still dies (serve_http detects the closed edge + recovers onto
+    # the spare exactly as before); the gang scheduler just stays happy and keeps serve_http alive.
     CAIRN_DIE_AFTER=0 CAIRN_SPOT_TEST_FILE=/tmp/cairn-drain CAIRN_SPOT_WATCH_INTERVAL=0.5 \
       python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
       --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
       --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779 \
-      2>&1 | tee /tmp/cairn-node-rank1-tail.log
+      > /tmp/cairn-node-rank1-tail.log 2>&1
+    rc=$?; echo "[serve] tail exited rc=$rc (kill/drain) -> reporting 0 so the gang scheduler keeps serve_http alive"; exit 0
   else
     # SPARE (CUT..NLAYERS) -> the endpoint's spare-sink IP0:7780 ; pre-warmed standby
     CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
