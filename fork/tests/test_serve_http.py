@@ -281,3 +281,23 @@ def test_serve_http_recovers_on_HALF_OPEN_tail_death():
                 p.wait(timeout=5)
             except Exception:
                 pass
+
+
+def test_serve_http_on_event_logs_proactive_drain():
+    """Fix (b): a PROACTIVE drain must be VISIBLE in the serve log. Before this, _on_event only logged
+    the reactive 'death' + 'recovered' events, so a graceful drain-before-death produced NO drain line —
+    indistinguishable from a reactive death except by the ABSENCE of 'TAIL DEATH detected' (exactly why
+    the 2026-06-23 live drain could not be classified as proactive vs reactive). Unit-level: no fleet
+    needed (head/tail unused by _on_event), just the event hook + a capturing log sink."""
+    from cairn_node.serve_http import FleetEngine
+    from shard import wire
+    wire.key_from_env("SHARD_PSK")
+
+    logs = []
+    eng = FleetEngine("mock:8", None, None, spare_host="10.0.0.9", spare_port=7777, log=logs.append)
+    eng._on_event("draining", 3)                                # the proactive-drain event (3 committed tokens)
+    joined = "\n".join(logs)
+    assert "PROACTIVE DRAIN signalled after 3 committed tokens" in joined, joined
+    assert "10.0.0.9:7777" in joined, joined                    # names the warm spare we re-stitch to
+    # and it must NOT be misreported as the reactive death path
+    assert "TAIL DEATH detected" not in joined, joined

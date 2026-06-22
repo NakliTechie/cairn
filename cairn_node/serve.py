@@ -164,7 +164,22 @@ def main() -> None:
     drained_sent = False                                      # emit the draining op AT MOST once
     nfwd = 0
     while True:
-        msg = edge_in.recv()
+        try:
+            msg = edge_in.recv()
+        except EDGE_ERRORS:
+            # The ONE expected recv failure here is the post-drain teardown. After we emitted the draining
+            # notice, the driver re-stitches the ENTRY to the warm spare (recovery.py `_recover_to_spare`'s
+            # set_next), which CLOSES our edge_in — so this recv hits peer-closed. That is the EXPECTED end
+            # of a drained tail's life (its box is being reclaimed anyway): log it and exit CLEANLY (rc=0)
+            # instead of dying on an unhandled ConnectionError (rc=1, which the serve yaml's `exit 0` only
+            # masked). CRITICAL: only when we ACTUALLY drained. If drained_sent is False this is a REAL
+            # upstream death — re-raise so it keeps its current fail-loud behaviour (a genuine peer death
+            # must NOT be swallowed). See test_proactive_drain.py + plan/workplan.md Chunk 0.
+            if drained_sent:
+                print("[serve] drained tail: entry re-stitched to the spare, edge_in closed — "
+                      "exiting cleanly", flush=True)
+                break
+            raise
         if isinstance(msg, dict) and "op" in msg:
             if msg["op"] == "stop":
                 try:

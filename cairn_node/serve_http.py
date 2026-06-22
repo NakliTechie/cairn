@@ -110,9 +110,17 @@ class FleetEngine:
 
     def _on_event(self, kind, *p):
         """on_event hook handed to decode_with_recovery — writes the recovery steps to the serve log so a
-        cross-box run leaves a durable, flushed trace (death detected / recovered / per-token)."""
+        cross-box run leaves a durable, flushed trace (draining / death detected / recovered / per-token).
+
+        The `draining` line is what makes a PROACTIVE migration VISIBLE in the live log. Without it a
+        graceful drain-before-death is indistinguishable from a reactive death except by the ABSENCE of the
+        "TAIL DEATH detected" line — which is exactly why the 2026-06-23 live drain test could not be
+        classified as proactive vs reactive. (See plan/workplan.md Chunk 0.)"""
         try:
-            if kind == "death":
+            if kind == "draining":
+                self._log(f"[serve_http] *** PROACTIVE DRAIN signalled after {p[0]} committed tokens "
+                          f"— pre-emptively re-stitching entry -> warm spare {self.spare_host}:{self.spare_port}")
+            elif kind == "death":
                 self._log(f"[serve_http] *** TAIL DEATH detected after {p[0]} committed tokens "
                           f"— re-stitching entry -> warm spare {self.spare_host}:{self.spare_port}, replaying")
             elif kind == "recovered":
