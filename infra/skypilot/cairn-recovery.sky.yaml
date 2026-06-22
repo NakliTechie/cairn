@@ -60,20 +60,30 @@ run: |
       --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP1" --next-port 7777 \
       > /tmp/cairn-node-rank0-entry.log 2>&1 &
     NODE_PID=$!
-    # DRIVER: dial local entry, accept tail (7779) + spare (7780), spare lives at IP2:7777
-    python -u -m cairn_node.recovery_fleet --entry-host 127.0.0.1 --entry-port 7777 \
+    # DRIVER: dial local entry, accept tail (7779) + spare (7780), spare lives at IP2:7777.
+    # `timeout 600` converts a stall (the original cross-box failure mode — it hung dark ~1.25h) into a
+    # clean completion: the partial /tmp/cairn-recovery.log shows where it hung and sky returns (watcher wakes).
+    timeout 600 python -u -m cairn_node.recovery_fleet --entry-host 127.0.0.1 --entry-port 7777 \
       --tail-sink 7779 --spare-sink 7780 --bind-host 0.0.0.0 \
       --spare-host "$IP2" --spare-port 7777 --prompt "$PROMPT" --n-new "$NNEW" \
       --log /tmp/cairn-recovery.log
-    echo "[recovery] driver exited; ---- /tmp/cairn-recovery.log ----"; cat /tmp/cairn-recovery.log || true
+    DRC=$?; echo "[recovery] driver exit=$DRC (124 = timeout/stall)"
+    echo "[recovery] ---- /tmp/cairn-recovery.log ----"; cat /tmp/cairn-recovery.log || true
     echo "[recovery] ---- entry node log (/tmp/cairn-node-rank0-entry.log) ----"; cat /tmp/cairn-node-rank0-entry.log || true
     kill $NODE_PID 2>/dev/null || true
   elif [ "$RANK" = "1" ]; then
-    # TAIL (CUT..NLAYERS) -> driver tail-sink IP0:7779 ; dies after $DIE forwards
+    # TAIL (CUT..NLAYERS) -> driver tail-sink IP0:7779 ; hard-exits (os._exit 137) after $DIE forwards.
+    # The induced death is EXPECTED, but a 137 looks like a node failure to SkyPilot's multi-node GANG
+    # scheduler -> it tears the gang down (killing the DRIVER on rank0 MID-RECOVERY) and then chokes when
+    # every node's rc is 137 (StopIteration in sky's exit-code aggregation). So run it NOT in a `| tee` pipe
+    # (pipefail would surface the 137) and REPORT 0: the tail process still dies (its edge closes -> the
+    # driver detects the death exactly as before), but the gang scheduler stays happy and lets rank0 finish.
     CAIRN_DIE_AFTER=$DIE python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
       --layer-start "$CUT" --layer-end "$NLAYERS" --device cuda:0 \
       --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779 \
-      2>&1 | tee /tmp/cairn-node-rank1-tail.log
+      > /tmp/cairn-node-rank1-tail.log 2>&1
+    rc=$?; echo "[recovery] tail serve exited rc=$rc (137 = induced death = EXPECTED) -> reporting 0 to the gang scheduler"
+    exit 0
   else
     # SPARE (CUT..NLAYERS) -> driver spare-sink IP0:7780 ; pre-warmed standby. In a no-death run it is
     # NEVER promoted and now SELF-EXITS when the driver tears down (serve.py select on prev-vs-downstream)
