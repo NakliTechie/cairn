@@ -38,14 +38,29 @@ works, measure how much money it saves, and publish it (a research paper + open-
   machine dies you lose its KV cache — but you can **rebuild it by replaying the conversation**. (We
   proved this works; it's called *replay-rebuild*.)
 
-## The two things we proved today (the heart of it)
+## What we've proved (the heart of it)
 
 1. **Split-correctness** — a model split across machines produces the *exact same answer*, word for word,
    as the un-split model. (If splitting changed the answer, the whole idea would be worthless.)
 2. **Replay-rebuild** — when a machine is lost, a fresh one replays the conversation and resumes
    *identically*. (This is the recovery guarantee that makes cheap spot GPUs safe.)
+3. **Live warm-spare recovery — the keystone (proven 2026-06-22).** The two pieces above, combined into
+   the real thing: a model running across **separate rented machines**, one of them **killed mid-sentence**
+   (simulating Amazon yanking a spot GPU), and the system swaps in the warm spare, rebuilds the lost
+   memory, and finishes — **word-for-word identical** to a run where nothing died. Proven twice: on **one
+   machine** (recovery took **0.58 seconds**) and across **3 separate machines over the network**
+   (**38.9 seconds** — see the warm-up note). This is the entire promise of Cairn, demonstrated on real
+   hardware, not a simulation.
 
-Both proven on a real GPU today.
+## The warm-up lesson (from the cross-box recovery)
+
+Recovering on one machine took 0.58 seconds; across separate machines it took 38.9. Almost all of that
+gap was **not** the recovery itself — it was the spare machine doing its *first-ever* calculation, which
+forces a one-time ~38-second compile of its GPU math routines (see *flashinfer / JIT* in the glossary).
+The spare had the model **loaded** but had never actually "turned the engine over." The lesson: a
+**"warm spare" has to be warm all the way through** — it should do one throwaway calculation at startup so
+it's instant when it's actually needed. Pre-warming should bring recovery back down toward a second. (A
+genuinely useful finding — and a concrete next optimization.)
 
 ---
 
@@ -70,8 +85,11 @@ Both proven on a real GPU today.
 - Block / stage / shard (one chunk of layers on one machine)
 - The **"wire"** (how machines send hidden states to each other, encrypted)
 - Scheduler
-- Warm spare
+- Warm spare — and **pre-warming** (making the spare do a throwaway calculation at startup so it's
+  *truly* warm, not just loaded — the cross-box warm-up lesson)
 - Recovery: **"reassign"** vs **"rebuild"**
+- **MTTR** (mean time to recovery) — how long from "a machine died" to "answers flowing again." Lower is
+  better. We measured **0.58s** (one machine) and **38.9s** (across machines, cold spare).
 - Control plane (a small always-on coordinator; ours runs on Cloudflare)
 
 **Cloud / hardware**
@@ -95,6 +113,15 @@ Both proven on a real GPU today.
 - Python "dependency hell" / **ResolutionImpossible** (why software versions fight each other)
 - The **"box image"** (the exact set of software installed on a GPU machine)
 - The cost ledger · tags · the live HTML report
+- **Cheap-first** — prove the logic on ONE cheap machine (~$0.16/hr) before the expensive multi-machine
+  run (~$0.48/hr). It paid off literally: the one cheap machine surfaced three separate bugs that would
+  have been slow + costly to find on the full setup.
+- The **gang scheduler** (the rental tool, SkyPilot, treats several rented machines as one group — if one
+  "fails," it assumes the whole job failed and tears the group down). Our test *deliberately* kills a
+  machine, which looked like a failure, so we had to teach the tool that *this* death is expected.
+- An **environment-variable leak** — a kill-switch meant for ONE machine ("die after 4 steps," our test
+  trigger) was accidentally inherited by ALL the machines, so they all died. Fixed by being explicit about
+  which machine gets the setting. (A classic "a setting meant for one thing quietly affected everything.")
 
 ---
 
