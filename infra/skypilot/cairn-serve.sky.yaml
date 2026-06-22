@@ -70,8 +70,14 @@ run: |
       --spare-host "$IP2" --spare-sink 7780 --spare-port 7777 2>&1 | tee /tmp/cairn-serve.log
   elif [ "$RANK" = "1" ]; then
     # TAIL (CUT..NLAYERS) -> the endpoint's tail-sink IP0:7779. PROACTIVE-drain hook armed: it watches the
-    # sentinel /tmp/cairn-drain (a local stand-in for the IMDS spot notice); `touch` it mid-serving and the
-    # tail drains gracefully onto the spare WHILE STILL ALIVE. Reactive abrupt-kill (pkill) also works — BUT
+    # sentinel /tmp/cairn-drain (a local stand-in for the IMDS spot notice). `touch` it and, on the next
+    # forward, the tail signals the driver to migrate the in-flight STREAM onto the warm spare with no
+    # dropped token; the endpoint serves continuously. The drained tail then EXITS (the entry closes its
+    # edge_in when it re-stitches to the spare) — "graceful" = the stream migrates, NOT the tail surviving.
+    # (Live 2026-06-23: recovery was observed via the REACTIVE death path, not the proactive draining signal
+    # — timing-dependent, and serve_http's on_event doesn't log the 'draining' event so the two are hard to
+    # tell apart in the log; either way the endpoint never dropped. See plan/history.md + workplan.md.)
+    # Reactive abrupt-kill (pkill) also works — BUT
     # the rank's run-command MUST report 0 on the inner death, else SkyPilot's multi-node GANG scheduler reads
     # the non-zero (137/SIGKILL) as a job failure and tears down ALL ranks — incl. the head's serve_http —
     # MID-RECOVERY (the 2026-06-23 live finding: serve_http was reaped before it could re-stitch to the spare).
