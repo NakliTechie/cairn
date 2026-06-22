@@ -87,3 +87,57 @@ def test_serve_http_mock_roundtrip():
                 p.wait(timeout=5)
             except Exception:
                 p.kill()
+
+
+def test_serve_http_recovers_on_abrupt_tail_kill():
+    """The realistic spot-reclaim case (found live, 2026-06-22): ABRUPTLY SIGKILL the tail mid-serving —
+    the endpoint must detect the death, re-stitch to the warm spare, and STILL answer the next request.
+    The graceful CAIRN_DIE_AFTER path misses this: there the tail recv's the entry's send before exiting,
+    so the entry never hits a broken-pipe send. An abrupt kill DOES break that send — and without the
+    entry surviving it (serve.py wraps edge_out.send), it crashes and the driver can never re-stitch it,
+    so recovery hangs forever (exactly the live symptom)."""
+    from cairn_node.serve_http import FleetEngine, connect_fleet
+    from cairn_scheduler.gateway import ChatRequest
+    from shard import wire
+    wire.key_from_env("SHARD_PSK")
+
+    base = 7880
+    entry = _spawn(0, 4, base, base + 1)             # entry 0..4 -> tail :base+1
+    tail = _spawn(4, 8, base + 1, base + 3)           # tail 4..8 -> endpoint tail-sink :base+3
+    spare = _spawn(4, 8, base + 2, base + 4)          # spare 4..8 -> endpoint spare-sink :base+4
+    procs = [entry, tail, spare]
+    head = None
+    try:
+        head, tail_e, spare_e = connect_fleet("127.0.0.1", base, base + 3, bind_host="127.0.0.1",
+                                              spare_sink=base + 4)
+        assert spare_e is not None
+        eng = FleetEngine("mock:8", head, tail_e, spare=spare_e, spare_host="127.0.0.1", spare_port=base + 2)
+        req = ChatRequest(model="mock:8", messages=[{"role": "user", "content": "hello"}], max_tokens=6)
+
+        r1 = eng.complete(req)                                       # baseline — works, no recovery
+        assert len(r1["choices"][0]["message"]["content"]) > 0 and "cairn" not in r1
+
+        tail.kill()                                                 # ABRUPT death (SIGKILL ~ a spot reclaim)
+        time.sleep(0.5)
+
+        result = {}
+        th = threading.Thread(target=lambda: result.setdefault("r", eng.complete(req)), daemon=True)
+        th.start(); th.join(timeout=30)
+        assert "r" in result, "endpoint HUNG after an abrupt tail kill — recovery did not complete"
+        r2 = result["r"]
+        assert len(r2["choices"][0]["message"]["content"]) > 0
+        assert r2.get("cairn", {}).get("recovered") is True         # recovered onto the warm spare
+    finally:
+        if head is not None:
+            try:
+                head.send({"op": "stop"})
+            except Exception:
+                pass
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                pass

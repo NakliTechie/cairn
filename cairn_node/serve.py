@@ -84,7 +84,7 @@ def main() -> None:
     a = ap.parse_args()
 
     from shard.node import LayerRange
-    from shard.transport import LanEdge
+    from shard.transport import LanEdge, EDGE_ERRORS
     from shard import wire
     wire.key_from_env("SHARD_PSK")                            # sealed wire; fail-loud if unset
 
@@ -145,7 +145,15 @@ def main() -> None:
         out = rt.forward(h, {"seq": msg["seq"], "pos": msg["pos"]})
         if hasattr(out, "detach"):
             out = out.detach().cpu()
-        edge_out.send({"h": out, "seq": msg["seq"], "pos": msg["pos"]})
+        try:
+            edge_out.send({"h": out, "seq": msg["seq"], "pos": msg["pos"]})
+        except EDGE_ERRORS:
+            # our NEXT node died ABRUPTLY (a real spot reclaim — the case a graceful CAIRN_DIE_AFTER exit
+            # hides, because there the next recv'd our send before exiting). DON'T crash: the driver detects
+            # the death (its own recv from the tail-sink fails), re-stitches us via `set_next`, and the
+            # recovery REPLAY redoes this forward. Discard it and loop back to recv — the next message is
+            # that set_next. (Without this the entry crashes here and recovery can never re-stitch it.)
+            pass
         nfwd += 1
 
     edge_in.close()
