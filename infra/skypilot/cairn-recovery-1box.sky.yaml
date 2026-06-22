@@ -1,0 +1,66 @@
+# Cairn Phase-2 CHEAP-FIRST recovery proof — ONE g6.xlarge (L4) spot box, all nodes on localhost.
+#
+# Isolates the sglang set_next/replay recovery LOGIC from cross-box networking (already proven by the
+# two-box fleet) so we debug + prove the live sglang recovery on the cheapest possible rig before paying
+# for the 3-box cross-VPC run. Entry + tail + spare + driver all run on 127.0.0.1; the tail hard-exits
+# after CAIRN_DIE_AFTER forwards, the driver re-stitches to the warm spare, replays, resumes — and the
+# rig asserts the recovered tokens == the no-death reference. ~$0.16/hr; the run is minutes.
+#
+#   source infra/secrets.env   # HF_TOKEN + SHARD_PSK (gitignored)
+#   sky launch -c cairn-rec1 infra/skypilot/cairn-recovery-1box.sky.yaml --env HF_TOKEN --env SHARD_PSK -i 15 --down -y
+#   # verdict: ">>> RECOVERY OK" + MTTR in the streamed output (also /tmp/cairn-rec1box.log on the box)
+#   sky down cairn-rec1
+name: cairn-recovery-1box
+
+num_nodes: 1
+
+resources:
+  cloud: aws
+  region: eu-south-2
+  instance_type: g6.xlarge      # 1x L4 (~22 GiB) — entry+tail+spare co-resident at mem-fraction 0.2 each
+  use_spot: true
+  disk_size: 128
+  labels:
+    cairn: "true"
+    cairn-purpose: "recovery-1box"
+
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+
+setup: |
+  set -uo pipefail
+  python3 -m venv ~/cairn-env
+  ~/cairn-env/bin/pip install -q --upgrade pip
+  ~/cairn-env/bin/pip install -q -r /cairn/infra/requirements-gpu.txt
+  ~/cairn-env/bin/pip install -q --no-deps "compressed-tensors==0.9.4"
+  ~/cairn-env/bin/python -c "import torch,sglang,cryptography; print('OK torch',torch.__version__,'cuda',torch.cuda.is_available())" || true
+
+run: |
+  set -uo pipefail
+  export PATH=$HOME/cairn-env/bin:/usr/local/cuda/bin:$PATH
+  export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
+  MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}; NLAYERS=${NLAYERS:-24}; CUT=${CUT:-12}
+  PROMPT=${PROMPT:-1,5,9,3,7,2}; NNEW=${NNEW:-8}; DIE=${CAIRN_DIE_AFTER:-4}
+  unset CAIRN_DIE_AFTER          # death is injected EXPLICITLY via --die-after (tail only); never leave it ambient
+  export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.2}   # 3 co-resident nodes share one L4
+  cd /cairn
+  pkill -9 -f "[c]airn_node" 2>/dev/null || true; sleep 2             # clear any leftover procs from a prior run
+  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+  echo "[rec1box] model=$MODEL layers=$NLAYERS cut=$CUT die_after=$DIE memf=$CAIRN_SGLANG_MEM_FRACTION"
+  # ONE command does ref(no-death) -> spawn entry/tail/spare -> kill tail@DIE -> recover -> compare -> verdict.
+  # `timeout 900` converts a STALL (the original failure mode) into a clean completion: it kills the run,
+  # the partial /tmp/cairn-rec1box.log trace below shows exactly which step hung, and `sky launch` returns
+  # (so the watcher wakes) instead of the box hanging dark.
+  timeout 900 python -u -m cairn_node.recovery --runtime sglang --model "$MODEL" \
+    --num-layers "$NLAYERS" --cut "$CUT" --prompt "$PROMPT" --n-new "$NNEW" \
+    --die-after "$DIE" --device cuda:0 --mem-fraction "$CAIRN_SGLANG_MEM_FRACTION" \
+    --log /tmp/cairn-rec1box.log
+  RC=$?; echo "[rec1box] recovery exit=$RC (124 = timeout/stall)"
+  echo "[rec1box] ---- /tmp/cairn-rec1box.log ----"; cat /tmp/cairn-rec1box.log || true
+
+envs:
+  HF_TOKEN: ""
+  CAIRN_DIE_AFTER: "4"

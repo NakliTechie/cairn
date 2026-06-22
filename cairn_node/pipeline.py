@@ -68,6 +68,7 @@ def run_pipeline(runtime: str, model: str, num_layers: int, cuts: List[int], pro
     ports = [base_port + i for i in range(nstages)]
     sink = base_port + nstages                               # the driver's own listen port (tail dials it)
     env = {**os.environ, "PYTHONPATH": str(_ROOT)}           # SHARD_PSK propagates to the nodes
+    env.pop("CAIRN_DIE_AFTER", None)                         # no-death reference driver: don't inherit an ambient death
     # Force the sglang KV-pool fraction into the node env (don't rely on inheritance — the multinode OOM
     # was nodes falling back to the 0.8 default). 0.2 fits two ~6 GiB nodes on one 22 GiB L4; a true
     # 2-GPU run (one node per GPU, own box) can set CAIRN_SGLANG_MEM_FRACTION higher.

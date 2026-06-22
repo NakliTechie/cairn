@@ -84,10 +84,16 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
     return out[:n_new], mttr
 
 
-def _spawn(runtime, model, ls, le, lp, nh, np_, device="cpu", die_after=None):
+def _spawn(runtime, model, ls, le, lp, nh, np_, device="cpu", die_after=None, mem_fraction=None):
     env = {**os.environ, "PYTHONPATH": str(_ROOT)}
+    env.pop("CAIRN_DIE_AFTER", None)                      # NEVER inherit an ambient death (the yaml exports it
+    #                                                      for the live tail) — only the node we explicitly mark
+    #                                                      below dies; else the no-death ref + entry + spare ALL
+    #                                                      hard-exit too (the silent 'peer closed' seen on the box).
     if die_after:
         env["CAIRN_DIE_AFTER"] = str(die_after)          # node hard-exits after this many forwards
+    if mem_fraction:
+        env["CAIRN_SGLANG_MEM_FRACTION"] = str(mem_fraction)  # share one GPU across co-located nodes (no OOM)
     return subprocess.Popen(
         [sys.executable, "-m", "cairn_node.serve", "--runtime", runtime, "--model", model,
          "--layer-start", str(ls), "--layer-end", str(le), "--device", device,
@@ -95,37 +101,72 @@ def _spawn(runtime, model, ls, le, lp, nh, np_, device="cpu", die_after=None):
         cwd=str(_ROOT), env=env)
 
 
-def _selftest() -> None:
+def prove_recovery(runtime: str, model: str, num_layers: int, cut: int, prompt: List[int], n_new: int,
+                   *, die_after: int, device: str = "cpu", mem_fraction=None, base_port: int = 7900,
+                   log_path: str | None = None):
+    """Single-box live recovery proof (all nodes on localhost). Build the no-death REFERENCE (entry+tail,
+    no spare), then stand up entry / tail / spare, kill the tail after `die_after` forwards, recover onto
+    the warm spare (set_next -> replay -> resume), and assert recovered == reference. Runtime-agnostic:
+    `mock` on CPU (the no-spend self-test) OR `sglang` on ONE GPU — the CHEAP-FIRST proof that the real
+    sglang set_next/replay path works live, before paying for the cross-box run. Returns (ref, rec, mttr).
+
+    `log_path` writes a flushed+fsync'd verdict on the box (survives a kill — truthful-run discipline)."""
     from shard.transport import LanEdge
     from shard import wire
     os.environ.setdefault("SHARD_PSK", "cairn-dev-psk")
     wire.key_from_env("SHARD_PSK")
     from cairn_node.pipeline import run_pipeline
 
-    NL, CUT, PROMPT, NNEW = 8, 4, [1, 5, 9, 3, 7, 2], 6
-    ref = run_pipeline("mock", "mock:8", NL, [CUT], PROMPT, NNEW, base_port=7950)
-    print("ref (no kill) :", ref)
+    _fh = open(log_path, "a", buffering=1) if log_path else None
 
-    # entry 0..CUT (7911 -> tail 7912); tail CUT..NL DIES after 3 fwds (7912 -> driver tail-sink 7914);
-    # spare CUT..NL (7913 -> driver spare-sink 7915). Separate sinks disambiguate tail vs spare.
-    entry = _spawn("mock", "mock:8", 0, CUT, 7911, "127.0.0.1", 7912)
-    tail  = _spawn("mock", "mock:8", CUT, NL, 7912, "127.0.0.1", 7914, die_after=3)
-    spare = _spawn("mock", "mock:8", CUT, NL, 7913, "127.0.0.1", 7915)
+    def log(msg: str) -> None:
+        print(msg, flush=True)
+        if _fh is not None:
+            _fh.write(msg + "\n"); _fh.flush(); os.fsync(_fh.fileno())
+
+    log(f"[prove] runtime={runtime} model={model} layers={num_layers} cut={cut} "
+        f"die_after={die_after} device={device} prompt={prompt} n_new={n_new}")
+
+    # 1) no-death REFERENCE — same 2-stage split, spawned + torn down by run_pipeline.
+    ref = run_pipeline(runtime, model, num_layers, [cut], prompt, n_new, device=device, base_port=base_port)
+    log(f"[prove] ref (no death) = {ref}")
+
+    # 2) entry(0..cut) / tail(cut..NL, dies@die_after) / spare(cut..NL, standby) on localhost; driver recovers.
+    b = base_port + 10
+    pE, pT, pSpare, sinkT, sinkS = b, b + 1, b + 2, b + 3, b + 4
+    entry = _spawn(runtime, model, 0, cut, pE, "127.0.0.1", pT, device=device, mem_fraction=mem_fraction)
+    tail  = _spawn(runtime, model, cut, num_layers, pT, "127.0.0.1", sinkT, device=device,
+                   die_after=die_after, mem_fraction=mem_fraction)
+    spare = _spawn(runtime, model, cut, num_layers, pSpare, "127.0.0.1", sinkS, device=device,
+                   mem_fraction=mem_fraction)
     procs = [entry, tail, spare]
-    sink_t = _listen("127.0.0.1", 7914)
-    sink_s = _listen("127.0.0.1", 7915)
+    sink_t = _listen("127.0.0.1", sinkT)
+    sink_s = _listen("127.0.0.1", sinkS)
     try:
-        head = LanEdge("127.0.0.1", 7911); _connect_retry(head)            # driver -> entry
+        head = LanEdge("127.0.0.1", pE); _connect_retry(head)              # driver -> entry
         ct, _ = sink_t.accept(); tail_e = LanEdge.from_socket(ct)          # tail  -> driver
         cs, _ = sink_s.accept(); spare_e = LanEdge.from_socket(cs)         # spare -> driver (standby)
-        rec, mttr = decode_with_recovery(head, tail_e, spare_e, "127.0.0.1", 7913, PROMPT, NNEW)
-        print("rec (die@3)   :", rec, "MATCH", rec == ref, "| MTTR %.3fs" % (mttr or 0))
+
+        def _on(kind, *p):
+            if kind == "tok":
+                log(f"[prove] tok {p[0]}/{n_new} = {p[1]}")
+            elif kind == "death":
+                log(f"[prove] *** NODE DEATH after {p[0]} committed tokens — re-stitch entry -> spare, replay")
+            elif kind == "recovered":
+                log(f"[prove] *** RECOVERED in {p[0]:.3f}s — resumed at tok {p[2]} = {p[1]}")
+
+        rec, mttr = decode_with_recovery(head, tail_e, spare_e, "127.0.0.1", pSpare, prompt, n_new, on_event=_on)
+        log("[prove] rec (die@%d) = %s  MATCH=%s  MTTR=%s"
+            % (die_after, rec, rec == ref, ("%.3fs" % mttr) if mttr is not None else "none"))
         try:
             head.send({"op": "stop"})
         except Exception:
             pass
-        assert rec == ref, "recovered output != no-kill reference — recovery bug"
-        print(">>> RECOVERY OK (mock node death -> re-stitch to warm spare -> replay -> resume == no-kill)")
+        if rec != ref:
+            log(">>> RECOVERY FAIL — recovered output != no-death reference")
+            raise AssertionError(f"recovered {rec} != reference {ref}")
+        log(">>> RECOVERY OK (node death -> re-stitch to warm spare -> replay -> resume == no-death)")
+        return ref, rec, mttr
     finally:
         for s in (sink_t, sink_s):
             try:
@@ -134,10 +175,37 @@ def _selftest() -> None:
                 pass
         for p in procs:
             try:
-                p.wait(timeout=5)
+                p.wait(timeout=10)
             except Exception:
                 p.kill()
+        if _fh is not None:
+            _fh.close()
+
+
+def _selftest() -> None:
+    """No-spend mock proof (CPU). The runtime-agnostic core is prove_recovery; sglang runs it on one GPU."""
+    prove_recovery("mock", "mock:8", 8, 4, [1, 5, 9, 3, 7, 2], 6, die_after=3, base_port=7950)
+
+
+def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description="single-box live recovery proof (mock on CPU / sglang on one GPU)")
+    ap.add_argument("--runtime", default="mock", choices=["mock", "sglang"])
+    ap.add_argument("--model", default="mock:8")
+    ap.add_argument("--num-layers", type=int, default=8)
+    ap.add_argument("--cut", type=int, default=4)
+    ap.add_argument("--prompt", default="1,5,9,3,7,2")
+    ap.add_argument("--n-new", type=int, default=6)
+    ap.add_argument("--die-after", type=int, default=3)
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--mem-fraction", default=None)       # CAIRN_SGLANG_MEM_FRACTION per node (one-GPU co-tenancy)
+    ap.add_argument("--base-port", type=int, default=7900)
+    ap.add_argument("--log", default=None)
+    a = ap.parse_args()
+    prompt = [int(x) for x in a.prompt.split(",") if x.strip()]
+    prove_recovery(a.runtime, a.model, a.num_layers, a.cut, prompt, a.n_new, die_after=a.die_after,
+                   device=a.device, mem_fraction=a.mem_fraction, base_port=a.base_port, log_path=a.log)
 
 
 if __name__ == "__main__":
-    _selftest()
+    main()
