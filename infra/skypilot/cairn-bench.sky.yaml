@@ -1,0 +1,76 @@
+# Cairn Chunk C — N-box MULTI-STREAM bench fleet. RANK-generic: each node computes its own layer range
+# from the fit boundaries (CUTS) + SKYPILOT_NODE_RANK, so this ONE yaml drives any model at any N (set
+# num_nodes = len(CUTS)+1 and pass MODEL/CUTS/NLAYERS). rank0 = entry + the bench driver; the bench runs
+# the v1.1 gates over the fleet: cross-stream KV-isolation (HARD) + per-stage occupancy under K streams.
+#
+# wire: driver -> rank0:7777(entry) -> rank1:7777 -> … -> rank(N-1):7777(tail) -> rank0:7779(sink).
+#
+#   # gpt-oss-120b (N=4, [9,9,9,9] over 36 layers) — set num_nodes: 4 below:
+#   sky launch -c cairn-bench infra/skypilot/cairn-bench.sky.yaml --env HF_TOKEN --env SHARD_PSK \
+#     --env MODEL=openai/gpt-oss-120b --env CUTS=9,18,27 --env NLAYERS=36 --env K=8 --env NNEW=32 -i 20 --down -y
+#   # verdict: ">>> ... occupancy=… | cross-stream isolation PASS/FAIL" (also /tmp/cairn-bench.log on rank0)
+name: cairn-bench
+
+num_nodes: 4                  # = len(CUTS)+1. EDIT per model (gpt-oss=4, gpt-neox=6, llama-3.1-8b=2, glm-5.2=6)
+
+resources:
+  cloud: aws
+  region: eu-south-2
+  instance_type: g6.xlarge    # 1x L4 per box, one stage each. (glm-5.2/deepseek → g7e Blackwell, ap-northeast-2)
+  use_spot: true
+  disk_size: 256              # headroom for bigger weights (gpt-oss-120b is ~64 GB)
+  labels:
+    cairn: "true"
+    cairn-purpose: "bench-multistream"
+
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+
+setup: |
+  set -uo pipefail
+  python3 -m venv ~/cairn-env
+  ~/cairn-env/bin/pip install -q --upgrade pip
+  ~/cairn-env/bin/pip install -q -r /cairn/infra/requirements-gpu.txt
+  ~/cairn-env/bin/pip install -q --no-deps "compressed-tensors==0.9.4"
+  ~/cairn-env/bin/python -c "import torch,sglang,cryptography; print('OK torch',torch.__version__,'cuda',torch.cuda.is_available())" || true
+
+run: |
+  set -uo pipefail
+  RANK=${SKYPILOT_NODE_RANK}; N=${SKYPILOT_NUM_NODES}
+  IPS=($SKYPILOT_NODE_IPS); IP0=${IPS[0]}
+  export PATH=$HOME/cairn-env/bin:/usr/local/cuda/bin:$PATH
+  export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
+  export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.8}   # one stage per box → use most of the card
+  MODEL=${MODEL:-openai/gpt-oss-120b}; NLAYERS=${NLAYERS:-36}; CUTS=${CUTS:-9,18,27}
+  K=${K:-8}; NNEW=${NNEW:-32}; FLOOR=${FLOOR:-0.8}
+  BND=(0 ${CUTS//,/ } $NLAYERS)                                       # layer boundaries → this rank's [START,END)
+  START=${BND[$RANK]}; END=${BND[$((RANK + 1))]}
+  cd /cairn
+  pkill -9 -f "[c]airn_node" 2>/dev/null || true; sleep 2
+  # next hop: rank i -> rank i+1 (:7777); the TAIL (rank N-1) -> the driver sink (IP0:7779)
+  if [ "$RANK" = "$((N - 1))" ]; then NEXT_HOST=$IP0; NEXT_PORT=7779; else NEXT_HOST=${IPS[$((RANK + 1))]}; NEXT_PORT=7777; fi
+  echo "[bench] rank=$RANK/$N layers [$START,$END) -> $NEXT_HOST:$NEXT_PORT  model=$MODEL K=$K"
+  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+  python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
+    --layer-start "$START" --layer-end "$END" --device cuda:0 \
+    --listen-port 7777 --bind-host 0.0.0.0 --next-host "$NEXT_HOST" --next-port "$NEXT_PORT" \
+    > /tmp/cairn-node-rank$RANK.log 2>&1 &
+  NODE_PID=$!
+  if [ "$RANK" = "0" ]; then
+    # rank0 also runs the bench DRIVER: dial local entry, accept the tail on 7779, run the v1.1 gates.
+    # timeout 900 turns a stall into a clean completion (the partial /tmp/cairn-bench.log shows where).
+    timeout 900 python -u -m cairn_node.bench_fleet remote --head-host 127.0.0.1 --head-port 7777 \
+      --sink-port 7779 --bind-host 0.0.0.0 --k "$K" --n-new "$NNEW" --n-stages "$N" --floor "$FLOOR" \
+      --log /tmp/cairn-bench.log
+    echo "[bench] driver exit=$? ; ---- /tmp/cairn-bench.log ----"; cat /tmp/cairn-bench.log || true
+    kill $NODE_PID 2>/dev/null || true
+  else
+    wait $NODE_PID                                                    # middle/tail nodes: serve until stop
+  fi
+
+envs:
+  HF_TOKEN: ""
+  SHARD_PSK: ""

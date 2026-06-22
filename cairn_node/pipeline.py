@@ -50,12 +50,48 @@ def _drive(head, tail, prompt: List[int], n_new: int) -> List[int]:
     return out
 
 
+def _drive_multi(head, tail, streams, n_new: int, stop: bool = True):
+    """Greedy-decode K CONCURRENT streams over an already-connected pipeline — the multi-stream counterpart
+    of _drive (the Chunk C v1.1 harness). Each stream has its own `seq` + token history; the driver keeps
+    exactly ONE forward per stream in flight, so with K≈N streams all N stages stay busy at once (the
+    occupancy gate). Each returned logit carries its `seq`, so the driver routes it to the right stream
+    (the nodes keep per-seq paged KV, so streams never collide — the cross-stream KV-isolation gate).
+
+    `streams` = [(seq, prompt), …]. Returns {seq: [tokens]}. `stop=False` leaves the pipeline up for another
+    round over the same connection (the bench driver runs multi + baseline + per-stream check rounds, then
+    stops once). (Assumes a modest K — the K prefills go up front; KB-scale hidden states fit the buffers.)"""
+    import torch
+    st = {seq: {"cur": torch.tensor([list(prompt)]), "out": [], "pos": 0} for seq, prompt in streams}
+    for seq in st:                                            # prime: one prefill per stream enters the pipeline
+        head.send({"h": st[seq]["cur"], "seq": seq, "pos": 0})
+    live = set(st)
+    while live:
+        msg = tail.recv()                                    # next finished forward (carries its seq)
+        seq = msg["seq"]
+        s = st[seq]
+        s["pos"] += s["cur"].shape[1]
+        s["out"].append(int(msg["h"][:, -1].argmax(-1)))
+        if len(s["out"]) >= n_new:
+            live.discard(seq)
+            continue
+        s["cur"] = torch.tensor([[s["out"][-1]]])
+        head.send({"h": s["cur"], "seq": seq, "pos": s["pos"]})   # re-inject → keep this stream in flight
+    if stop:
+        try:
+            head.send({"op": "stop"})
+        except Exception:
+            pass
+    return {seq: s["out"][:n_new] for seq, s in st.items()}
+
+
 def run_pipeline(runtime: str, model: str, num_layers: int, cuts: List[int], prompt: List[int],
                  n_new: int, device: str = "cpu", base_port: int = 7100,
-                 python_exe: str = "") -> List[int]:
+                 python_exe: str = "", streams=None):
     """Spawn a stage-per-process pipeline (cut at `cuts`) ON ONE HOST (localhost wire), greedy-decode
     `n_new` tokens, return them. Stages are torn down on exit. Distinct `base_port` per concurrent call.
-    The cross-box counterpart is run_remote (nodes launched separately, driver only connects)."""
+    The cross-box counterpart is run_remote (nodes launched separately, driver only connects).
+    If `streams` (list of (seq, prompt)) is given, drives K CONCURRENT streams and returns {seq: [tokens]}
+    (the v1.1 multi-stream harness); otherwise single-stream, returns [tokens]."""
     from shard.transport import LanEdge
     from shard import wire
 
@@ -90,6 +126,8 @@ def run_pipeline(runtime: str, model: str, num_layers: int, cuts: List[int], pro
         _connect_retry(head)                                 # driver -> node0 (entry)
         conn, _ = lsock.accept()
         tail = LanEdge.from_socket(conn)                     # node(N-1) -> driver
+        if streams is not None:
+            return _drive_multi(head, tail, streams, n_new)
         return _drive(head, tail, prompt, n_new)
     finally:
         for e in (head, tail):
@@ -105,11 +143,12 @@ def run_pipeline(runtime: str, model: str, num_layers: int, cuts: List[int], pro
 
 
 def run_remote(head_host: str, head_port: int, sink_port: int, prompt: List[int], n_new: int,
-               bind_host: str = "0.0.0.0") -> List[int]:
+               bind_host: str = "0.0.0.0", streams=None):
     """Drive a pipeline of ALREADY-RUNNING remote nodes — the cross-box fleet. Unlike run_pipeline this
     does NOT spawn: each node runs on its own box (cairn_node.serve --bind-host <private IP>). The driver
     is co-located with the entry node (rank 0): it dials the head and listens on `sink_port` for the tail
-    to dial back. Topology: head(rank0) -> … -> tail -> driver(rank0:sink_port)."""
+    to dial back. Topology: head(rank0) -> … -> tail -> driver(rank0:sink_port).
+    If `streams` (list of (seq, prompt)) is given, drives K CONCURRENT streams → {seq: [tokens]} (v1.1)."""
     from shard.transport import LanEdge
     from shard import wire
 
@@ -123,6 +162,8 @@ def run_remote(head_host: str, head_port: int, sink_port: int, prompt: List[int]
         _connect_retry(head)                                 # driver -> entry node (localhost on rank 0)
         conn, _ = lsock.accept()
         tail = LanEdge.from_socket(conn)
+        if streams is not None:
+            return _drive_multi(head, tail, streams, n_new)
         return _drive(head, tail, prompt, n_new)
     finally:
         for e in (head, tail):
