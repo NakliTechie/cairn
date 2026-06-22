@@ -35,7 +35,8 @@ file_mounts:
   /cairn/cairn_node: ./cairn_node
   /cairn/configs: ./configs
   /cairn/infra: ./infra
-  /cairn/scheduler: ./scheduler
+  /cairn/scheduler/src: ./scheduler/src   # only the cairn_scheduler package serve_http needs — NOT the
+  #                                         whole dir (a stray scheduler/.venv there rsync-choked SSH -> 255)
 
 setup: |
   set -uo pipefail
