@@ -15,13 +15,35 @@ without a GPU/torch toolchain for structural checks.
 
 from __future__ import annotations
 
+import os
 import socket
 import time
 from typing import Any, Optional, Tuple
 
 # A frame we can't authenticate+parse is surfaced by wire as ConnectionError; these are
 # the errors the per-edge supervision treats as "dead edge → trigger recovery" (spec §5.4).
+# socket.timeout (== TimeoutError, a subclass of OSError) is included DELIBERATELY: a
+# supervised edge with a recv timeout treats a stalled/silent peer as a death, so an
+# ABRUPT cross-box reclaim that leaves the TCP connection HALF-OPEN (no FIN/RST ever
+# reaches us) is detected and recovered instead of blocking recv() forever (the live
+# 2026-06-22 between-requests hang). See LanEdge(recv_timeout=...) below.
 EDGE_ERRORS: Tuple[type, ...] = (ConnectionError, OSError, socket.timeout)
+
+# Generous default recv deadline for a SUPERVISED edge (seconds), overridable per-process via
+# CAIRN_EDGE_RECV_TIMEOUT. It is a LIVENESS guard, NOT a latency SLO: it must be far longer than
+# the slowest real forward (a cold sglang pass across boxes) so it NEVER trips on a healthy-but-slow
+# peer, yet finite so a dead/half-open peer is caught as a death. A value of 0 / "none" disables it
+# (blocking recv). This is opt-in per edge (supervised_recv_timeout=True) — it is applied to the
+# DRIVER's tail/spare sink edges (which only block in recv() while actively decoding a request), and
+# deliberately NOT to a node's upstream edge_in (which legitimately sits idle between requests and
+# must keep blocking, not time out and crash).
+def _default_recv_timeout() -> Optional[float]:
+    raw = os.environ.get("CAIRN_EDGE_RECV_TIMEOUT", "30")
+    try:
+        v = float(raw)
+    except ValueError:
+        return 30.0
+    return v if v > 0 else None
 
 
 class ActivationCodec:
@@ -51,11 +73,21 @@ class LanEdge:
     activations as sealed wire frames; surfaces health() so a stalled edge is caught fast."""
 
     def __init__(self, peer_host: str, peer_port: int, *, name: str = "",
-                 connect_timeout: float = 5.0, codec: Optional[ActivationCodec] = None) -> None:
+                 connect_timeout: float = 5.0, codec: Optional[ActivationCodec] = None,
+                 recv_timeout: Optional[float] = None, supervised_recv_timeout: bool = False) -> None:
         self.peer_host = peer_host
         self.peer_port = peer_port
         self.name = name or f"{peer_host}:{peer_port}"
         self.connect_timeout = connect_timeout
+        # recv liveness deadline (seconds), applied to the socket so a recv() that stalls past it
+        # raises socket.timeout ∈ EDGE_ERRORS → the death/recovery path fires instead of blocking
+        # forever on a half-open peer. Default None = blocking recv (legacy; correct for an idle
+        # node's edge_in). supervised_recv_timeout=True opts into the generous process default
+        # (CAIRN_EDGE_RECV_TIMEOUT) — used by the driver's tail/spare sinks. An explicit
+        # recv_timeout float overrides both (mainly for tests).
+        if recv_timeout is None and supervised_recv_timeout:
+            recv_timeout = _default_recv_timeout()
+        self.recv_timeout: Optional[float] = recv_timeout
         self.codec = codec or ActivationCodec("off")
         self._sock: Optional[socket.socket] = None
         # health — the thing a black-box binary never gave us (spec §10: per-edge health)
@@ -72,12 +104,22 @@ class LanEdge:
         except OSError:
             pass
 
+    def _apply_recv_timeout(self) -> None:
+        """Arm the recv liveness deadline on the live socket. A blocking recv() that stalls longer
+        than recv_timeout then raises socket.timeout — caught as a dead edge (recovery) rather than
+        blocking forever on a half-open peer. recv_timeout is None ⇒ NO-OP: we leave the socket's
+        existing blocking/timeout state untouched, so an edge that didn't opt into supervision keeps
+        its exact legacy behaviour (an idle node's edge_in must keep blocking, not time out)."""
+        if self._sock is not None and self.recv_timeout is not None:
+            self._sock.settimeout(self.recv_timeout)
+
     @classmethod
     def from_socket(cls, sock: socket.socket, **kw: Any) -> "LanEdge":
         """Wrap an already-accepted socket (the receiving side of an edge)."""
         edge = cls("", 0, **kw)
         cls._nodelay(sock)
         edge._sock = sock
+        edge._apply_recv_timeout()        # supervise the read side (if opted in): a silent peer is a death, not a hang
         edge.alive = True
         edge.last_ok = time.monotonic()  # parity with connect() — health()'s age_s starts defined (L3)
         return edge
@@ -87,6 +129,7 @@ class LanEdge:
         sock = socket.create_connection((self.peer_host, self.peer_port), timeout=self.connect_timeout)
         self._nodelay(sock)
         self._sock = sock
+        self._apply_recv_timeout()        # if supervised, swap the dial timeout for the recv deadline; else leave as-is
         self.alive = True
         self.last_ok = time.monotonic()
 

@@ -31,16 +31,31 @@ def _next_tok(msg) -> int:
     return int(msg["h"][:, -1].argmax(-1))
 
 
+def _is_draining(msg) -> bool:
+    """The tail emitted a proactive-drain notice (it saw its own ~2-min spot warning) IN PLACE of this
+    forward's result. A control dict, not a hidden-state result — so it must be caught before _next_tok."""
+    return isinstance(msg, dict) and msg.get("op") == "draining"
+
+
 def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
                          prompt: List[int], n_new: int, seq: str = "s0", on_event=None):
-    """Greedy-decode `n_new` tokens through head -> … -> active. DETECT a node death (active.recv raises)
-    and recover onto the pre-warmed `spare`: re-point the entry (set_next), replay the committed history
-    (its last logit is the token we were waiting for — KV rebuild + resume in one prefill), continue.
-    Returns (tokens, mttr_s | None). The death is induced externally (CAIRN_DIE_AFTER on the node).
+    """Greedy-decode `n_new` tokens through head -> … -> active, surviving the loss of `active` onto the
+    pre-warmed `spare`. TWO triggers, ONE recovery mechanism (set_next -> replay -> resume):
+
+      • REACTIVE  — the node DIED: `active.recv()` raises (EDGE_ERRORS). There was a brief gap; the replay
+                    rebuilds the spare's KV and re-derives the token we were mid-waiting-for.
+      • PROACTIVE — the node is DRAINING: it saw its own ~2-min spot-interruption notice and, WHILE STILL
+                    ALIVE, sent `{"op":"draining"}` in place of this forward's result. No error, no dropped
+                    token — we pre-emptively re-stitch the entry to the spare + replay BEFORE the node dies,
+                    so the stream continues seamlessly. The graceful path; reactive stays as the fallback.
+
+    Both do the same thing: set_next (entry -> warm spare), replay the committed history under a FRESH seq
+    (entry + fresh spare both prefill cleanly; the replay's last logit IS the pending token), resume on the
+    spare. Returns (tokens, mttr_s | None).
 
     `on_event(kind, *payload)` — optional progress hook so a live run leaves a durable per-step trace
-    ("tok", i, tok) / ("death", n_committed) / ("recovered", mttr_s, tok, i). It must never raise; a
-    logging failure cannot be allowed to break the decode (truthful-run discipline)."""
+    ("tok", i, tok) / ("death", n_committed) / ("draining", n_committed) / ("recovered", mttr_s, tok, i).
+    It must never raise; a logging failure cannot be allowed to break the decode (truthful-run discipline)."""
     import torch
     from shard.transport import EDGE_ERRORS
 
@@ -56,33 +71,56 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
     pos = 0
     mttr = None
     recovered = False
+
+    def _recover_to_spare():
+        """Re-stitch entry -> warm spare + replay the committed history; return (pending_tok, hist_len, mttr).
+        Shared by both triggers — the ONLY difference is reactive had a gap (the node died), proactive did
+        not (the node is still alive, the switch is seamless). Reads the pending token FRESH from the spare."""
+        nonlocal active, seq
+        t0 = time.time()
+        head.send({"op": "set_next", "host": spare_host, "port": spare_port})   # entry -> warm spare
+        active = spare                                                          # read from the spare now
+        # FRESH seq id for the rebuild: the surviving entry still holds KV under the OLD seq, so a same-seq
+        # replay makes sglang DECODE one token (shape error: [1,S,-1] over one token's worth) instead of
+        # PREFILL the history. Under a new seq the entry + the fresh spare both prefill the full history
+        # cleanly — KV rebuilt, last logit = the pending token. (The orphaned old-seq KV on the entry is
+        # fine for Path-1 single-spare scope; Path 2 frees it. The stateless mock is unaffected.)
+        seq = seq + "~r"
+        hist = list(prompt) + out                                              # replay rebuilds KV on entry+spare;
+        head.send({"h": torch.tensor([hist]), "seq": seq, "pos": 0})           # last logit = the pending token
+        ptok = _next_tok(active.recv())                                        # RE-READ the pending token from the spare
+        return ptok, len(hist), time.time() - t0
+
     while len(out) < n_new:
         head.send({"h": cur, "seq": seq, "pos": pos})
         try:
-            tok = _next_tok(active.recv())
+            msg = active.recv()
         except EDGE_ERRORS:
+            # REACTIVE: the node died abruptly. Recover onto the spare (with the brief gap).
             if recovered:
                 raise RuntimeError("second node death — out of warm spares (Path-1 single-spare scope)")
             _emit("death", len(out))                                                # committed tokens before death
-            t0 = time.time()
-            head.send({"op": "set_next", "host": spare_host, "port": spare_port})   # entry -> warm spare
-            active = spare                                                          # read from the spare now
-            # FRESH seq id for the rebuild: the surviving entry still holds KV under the OLD seq, so a same-seq
-            # replay makes sglang DECODE one token (shape error: [1,S,-1] over one token's worth) instead of
-            # PREFILL the history. Under a new seq the entry + the fresh spare both prefill the full history
-            # cleanly — KV rebuilt, last logit = the pending token. (The orphaned old-seq KV on the entry is
-            # fine for Path-1 single-spare scope; Path 2 frees it. The stateless mock is unaffected.)
-            seq = seq + "~r"
-            hist = list(prompt) + out                                              # replay rebuilds KV on entry+spare;
-            head.send({"h": torch.tensor([hist]), "seq": seq, "pos": 0})           # last logit = the pending token
-            tok = _next_tok(active.recv())
+            tok, hist_len, mttr = _recover_to_spare()
             out.append(tok)
-            pos = len(hist)
+            pos = hist_len
             cur = torch.tensor([[tok]])
-            mttr = time.time() - t0
             recovered = True
             _emit("recovered", mttr, tok, len(out))
             continue
+        if _is_draining(msg):
+            # PROACTIVE: the node is draining but STILL ALIVE — no error, no dropped token. Pre-emptively
+            # re-stitch to the spare + replay (re-reads the pending token from the spare), then continue.
+            if recovered:
+                continue                                                            # already migrated; ignore a late notice
+            _emit("draining", len(out))                                             # committed tokens at the drain notice
+            tok, hist_len, mttr = _recover_to_spare()
+            out.append(tok)
+            pos = hist_len
+            cur = torch.tensor([[tok]])
+            recovered = True
+            _emit("recovered", mttr, tok, len(out))
+            continue
+        tok = _next_tok(msg)
         out.append(tok)
         pos += cur.shape[1]
         cur = torch.tensor([[tok]])
@@ -149,9 +187,11 @@ def prove_recovery(runtime: str, model: str, num_layers: int, cut: int, prompt: 
     sink_t = _listen("127.0.0.1", sinkT)
     sink_s = _listen("127.0.0.1", sinkS)
     try:
-        head = LanEdge("127.0.0.1", pE); _connect_retry(head)              # driver -> entry
-        ct, _ = sink_t.accept(); tail_e = LanEdge.from_socket(ct)          # tail  -> driver
-        cs, _ = sink_s.accept(); spare_e = LanEdge.from_socket(cs)         # spare -> driver (standby)
+        # supervised read edges: a half-open peer (abrupt reclaim, no FIN) is caught as a death via the
+        # generous CAIRN_EDGE_RECV_TIMEOUT deadline instead of blocking recv() forever (the live hang fix).
+        head = LanEdge("127.0.0.1", pE, supervised_recv_timeout=True); _connect_retry(head)   # driver -> entry
+        ct, _ = sink_t.accept(); tail_e = LanEdge.from_socket(ct, supervised_recv_timeout=True)   # tail  -> driver
+        cs, _ = sink_s.accept(); spare_e = LanEdge.from_socket(cs, supervised_recv_timeout=True)  # spare -> driver (standby)
 
         def _on(kind, *p):
             if kind == "tok":

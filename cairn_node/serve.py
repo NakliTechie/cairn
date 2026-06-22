@@ -117,7 +117,45 @@ def main() -> None:
     conn, _ = lsock.accept()
     edge_in = LanEdge.from_socket(conn)
 
+    # PROACTIVE drain — the spot-interruption (~2-min) notice fires WHILE this node is still alive, so
+    # recovery can be graceful (no death, no dropped token) instead of reactive. `_draining` is a 1-slot
+    # flag flipped by either the spot_watch thread (gated on CAIRN_SPOT_WATCH so tests/CI never poll real
+    # IMDS) OR a test op `{"op":"drain"}` injected into the pipeline. When set, the wire loop emits ONE
+    # `{"op":"draining"}` to edge_out (→ the driver), then keeps serving normally until the real stop/death.
+    # A list (not a bare bool) so the watch thread's closure mutates the SAME object the loop reads.
+    _draining = [False]
+
+    def _on_spot_notice(notice):
+        print(f"[serve] *** spot-interruption notice — DRAINING (still alive): {notice}", flush=True)
+        _draining[0] = True
+
+    # Real path: a background thread polls THIS box's IMDS for its own ~2-min spot notice (opt-in, so
+    # tests/CI never poll the live 169.254.169.254). Test path: CAIRN_SPOT_TEST_FILE points at a sentinel
+    # the test `touch`es mid-decode — a local stand-in for IMDS that drives the SAME drain wire path with
+    # no EC2. Either way the watcher only flips `_draining`; the wire loop does the one-shot emit. Both run
+    # off the hot path (a daemon thread), so steady-state serving pays nothing.
+    _spot_file = os.environ.get("CAIRN_SPOT_TEST_FILE")
+    if os.environ.get("CAIRN_SPOT_WATCH") == "1" or _spot_file:
+        import threading
+        interval = float(os.environ.get("CAIRN_SPOT_WATCH_INTERVAL", "5"))
+        if _spot_file:
+            poll = float(os.environ.get("CAIRN_SPOT_WATCH_INTERVAL", "0.005"))
+            def _watch_file():
+                while not _draining[0]:
+                    if os.path.exists(_spot_file):
+                        _on_spot_notice({"_kind": "test-file", "action": "terminate", "path": _spot_file})
+                        return
+                    time.sleep(poll)
+            threading.Thread(target=_watch_file, daemon=True).start()
+            print(f"[serve] spot drain armed via sentinel file {_spot_file} (test stand-in for IMDS)", flush=True)
+        else:
+            from cairn_node.spot_watch import watch as _spot_watch
+            threading.Thread(target=lambda: _spot_watch(_on_spot_notice, interval=interval),
+                             daemon=True).start()
+            print(f"[serve] spot_watch armed (interval={interval}s) — will drain on the ~2-min notice", flush=True)
+
     die_after = int(os.environ.get("CAIRN_DIE_AFTER", "0"))   # induced-death test hook: hard-exit after N forwards
+    drained_sent = False                                      # emit the draining op AT MOST once
     nfwd = 0
     while True:
         msg = edge_in.recv()
@@ -136,7 +174,22 @@ def main() -> None:
                 edge_out = LanEdge(msg["host"], msg["port"])
                 _connect_retry(edge_out)          # dial the spare (it's pre-warmed + listening)
                 continue
+            if msg["op"] == "drain":              # test hook: inject a drain WITHOUT real IMDS (== a spot notice)
+                _draining[0] = True
+                continue
             continue                              # unknown op — ignore
+        # Draining? Tell the driver ONCE (it pre-emptively re-stitches to the warm spare WHILE we're still
+        # alive), then keep serving normally. We send the notice in PLACE of this forward's result: the
+        # driver reads it as the response to its in-flight send, re-stitches + replays through the spare for
+        # the pending token, and abandons our (orphaned) reply. Cheap + off the hot path until the notice.
+        if _draining[0] and not drained_sent:
+            try:
+                edge_out.send({"op": "draining"})
+                drained_sent = True
+                nfwd += 1
+                continue                          # this forward is redone by the driver's replay on the spare
+            except EDGE_ERRORS:
+                drained_sent = True               # downstream already gone — fall through to the reactive path
         h = msg["h"]
         if die_after and nfwd >= die_after:
             os._exit(137)                     # simulate a hard crash (spot reclaim) — this forward never returns

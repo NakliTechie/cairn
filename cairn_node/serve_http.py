@@ -67,15 +67,24 @@ class _Tok:
 def connect_fleet(entry_host: str, entry_port: int, tail_sink: int, bind_host: str = "0.0.0.0",
                   spare_sink: int | None = None):
     """Dial the local entry node + accept the tail (and optionally the warm spare) dialing back. Returns
-    (head, tail, spare|None) — the persistent fleet connection the endpoint drives every request over."""
+    (head, tail, spare|None) — the persistent fleet connection the endpoint drives every request over.
+
+    The driver's read edges are SUPERVISED (supervised_recv_timeout=True): an abrupt tail reclaim that
+    leaves the TCP connection half-open (no FIN/RST) makes active.recv() raise socket.timeout after the
+    generous CAIRN_EDGE_RECV_TIMEOUT deadline instead of blocking forever — so decode_with_recovery
+    detects the death and re-stitches to the spare. This is the fix for the live between-requests hang
+    (2026-06-22): on localhost a SIGKILL'd peer is reset instantly, but a reclaimed BOX never sends a
+    FIN, so without the deadline recv() hangs forever and recovery never fires."""
     wire.key_from_env("SHARD_PSK")
     sink_t = _listen(bind_host, tail_sink)
     sink_s = _listen(bind_host, spare_sink) if spare_sink else None
-    head = LanEdge(entry_host, entry_port); _connect_retry(head)
-    ct, _ = sink_t.accept(); tail = LanEdge.from_socket(ct)
+    # head is supervised too: during recovery the driver SENDS set_next + replay through it; a stalled
+    # send to a half-open entry should fail fast (death) rather than wedge the recovery.
+    head = LanEdge(entry_host, entry_port, supervised_recv_timeout=True); _connect_retry(head)
+    ct, _ = sink_t.accept(); tail = LanEdge.from_socket(ct, supervised_recv_timeout=True)
     spare = None
     if sink_s is not None:
-        cs, _ = sink_s.accept(); spare = LanEdge.from_socket(cs)
+        cs, _ = sink_s.accept(); spare = LanEdge.from_socket(cs, supervised_recv_timeout=True)
     return head, tail, spare
 
 
@@ -85,7 +94,7 @@ class FleetEngine:
     per spare via decode_with_recovery (after which the spare becomes the tail; Path 2 replenishes)."""
 
     def __init__(self, model: str, head, tail, spare=None, spare_host=None, spare_port=None,
-                 api_key: str | None = None) -> None:
+                 api_key: str | None = None, log=None) -> None:
         self.model = model
         self.tok = _Tok(model)
         self.head, self.tail, self.spare = head, tail, spare
@@ -94,6 +103,23 @@ class FleetEngine:
                                default_version="0.1.0")
         self._lock = threading.Lock()
         self._n = 0
+        # Where recovery progress goes. Default: flushed stdout (the yaml tee's it to /tmp/cairn-serve.log),
+        # so a node death / re-stitch / MTTR is VISIBLE on the box mid-request — the observability that
+        # turned the silent live hang into a diagnosable one. Must never raise (truthful-run discipline).
+        self._log = log if log is not None else (lambda m: print(m, flush=True))
+
+    def _on_event(self, kind, *p):
+        """on_event hook handed to decode_with_recovery — writes the recovery steps to the serve log so a
+        cross-box run leaves a durable, flushed trace (death detected / recovered / per-token)."""
+        try:
+            if kind == "death":
+                self._log(f"[serve_http] *** TAIL DEATH detected after {p[0]} committed tokens "
+                          f"— re-stitching entry -> warm spare {self.spare_host}:{self.spare_port}, replaying")
+            elif kind == "recovered":
+                self._log(f"[serve_http] *** RECOVERED in {p[0]:.3f}s (MTTR) — resumed at token {p[2]} = {p[1]}; "
+                          f"spare is now the tail (out of spares until Path 2)")
+        except Exception:
+            pass
 
     def run(self, req):
         """Tokenize → drive the fleet (with recovery if a spare is attached) → return (out_ids, mttr)."""
@@ -103,7 +129,8 @@ class FleetEngine:
             seq = f"http-{self._n}"
             if self.spare is not None:
                 out, mttr = decode_with_recovery(self.head, self.tail, self.spare, self.spare_host,
-                                                 self.spare_port, ids, req.max_tokens, seq=seq)
+                                                 self.spare_port, ids, req.max_tokens, seq=seq,
+                                                 on_event=self._on_event)
                 if mttr is not None:                                # a node died + we recovered onto the spare:
                     self.tail, self.spare = self.spare, None        # spare is the tail now; out of spares (Path 2)
             else:

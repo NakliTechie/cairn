@@ -71,11 +71,13 @@ def main() -> None:
 
     sink_t = _listen(a.bind_host, a.tail_sink)
     sink_s = _listen(a.bind_host, a.spare_sink)
-    head = LanEdge(a.entry_host, a.entry_port); _connect_retry(head)    # driver -> entry (local)
+    # supervised read edges: a half-open peer (abrupt reclaim, no FIN) is caught as a death via the
+    # generous CAIRN_EDGE_RECV_TIMEOUT deadline instead of blocking recv() forever (the live hang fix).
+    head = LanEdge(a.entry_host, a.entry_port, supervised_recv_timeout=True); _connect_retry(head)  # driver -> entry (local)
     log(f"[recovery] sinks up (tail :{a.tail_sink}, spare :{a.spare_sink}); entry dialed — waiting for tail")
-    ct, _ = sink_t.accept(); tail_e = LanEdge.from_socket(ct)           # tail  -> driver
+    ct, _ = sink_t.accept(); tail_e = LanEdge.from_socket(ct, supervised_recv_timeout=True)   # tail  -> driver
     log("[recovery] tail connected back — waiting for spare (standby)")
-    cs, _ = sink_s.accept(); spare_e = LanEdge.from_socket(cs)          # spare -> driver (standby)
+    cs, _ = sink_s.accept(); spare_e = LanEdge.from_socket(cs, supervised_recv_timeout=True)  # spare -> driver (standby)
     log("[recovery] spare connected — decoding with recovery armed")
 
     def _on_event(kind, *p):
