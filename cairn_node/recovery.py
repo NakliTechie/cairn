@@ -67,7 +67,13 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
             t0 = time.time()
             head.send({"op": "set_next", "host": spare_host, "port": spare_port})   # entry -> warm spare
             active = spare                                                          # read from the spare now
-            hist = list(prompt) + out                                              # replay rebuilds the spare's KV;
+            # FRESH seq id for the rebuild: the surviving entry still holds KV under the OLD seq, so a same-seq
+            # replay makes sglang DECODE one token (shape error: [1,S,-1] over one token's worth) instead of
+            # PREFILL the history. Under a new seq the entry + the fresh spare both prefill the full history
+            # cleanly — KV rebuilt, last logit = the pending token. (The orphaned old-seq KV on the entry is
+            # fine for Path-1 single-spare scope; Path 2 frees it. The stateless mock is unaffected.)
+            seq = seq + "~r"
+            hist = list(prompt) + out                                              # replay rebuilds KV on entry+spare;
             head.send({"h": torch.tensor([hist]), "seq": seq, "pos": 0})           # last logit = the pending token
             tok = _next_tok(active.recv())
             out.append(tok)
