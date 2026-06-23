@@ -1,0 +1,70 @@
+# Cairn model-as-config — DeepSeek-V4-Flash FP8 mixed-precision (Path C variant).
+#
+# DIFFERENT FROM deepseek-v4-flash-nvfp4.yaml: that is the NVIDIA NVFP4 build for DATACENTER Blackwell
+# (sm_100, GB200/B100/B200) — blocked on workstation Blackwell (sm_120 / g7e) where DeepGEMM hard-refuses
+# (DeepSeek: "no plan to be compatible with sm120"). The path-C plan (plan/path-c-deepseek-v4-fork.md)
+# pivots to the official deepseek-ai FP8 build + the `0xSero/deepseek-v4-flash-sm120` community sglang
+# patch — runtime-replaces broken SM120 FlashMLA sparse-decode kernels in
+# `lmsysorg/sglang:deepseek-v4-blackwell`. Benchmark-confirmed on 4× RTX PRO 6000.
+#
+# Arch from deepseek-ai/DeepSeek-V4-Flash config.json (HF); same as the NVFP4 variant — the model is the
+# same, only the quantization differs (FP8 mixed here vs NVFP4 there). License: MIT.
+# 671B params (MoE 256-expert, 6 active + 1 shared), MLA (compressed KV: 1 KV head x 512) + DSA
+# (index_topk 512). Naturally 41-MoE + 2-dense layer layout.
+
+name: deepseek-v4-flash-fp8
+source:
+  hf_repo: deepseek-ai/DeepSeek-V4-Flash       # OFFICIAL DeepSeek FP8 mixed-precision build (matches 0xSero recipe)
+license: MIT
+
+arch:
+  num_layers: 43
+  hidden_size: 4096
+  num_attention_heads: 64
+  num_key_value_heads: 1       # MLA — compressed latent KV (head_dim 512, q_lora_rank 1024). KV is tiny.
+  head_dim: 512
+  vocab_size: 129280
+  num_local_experts: 256       # MoE; 6 active + 1 shared. Experts ride with their layer (inv #1).
+  num_experts_per_tok: 6
+  intermediate_size: 2048      # moe_intermediate_size (doc only — not parsed)
+  index_topk: 512              # DeepSeek Sparse Attention indexer top-k (doc only — serving-engine concern)
+  q_lora_rank: 1024            # MLA (doc only)
+  max_context: 131072          # 128K conservative fit ceiling; model supports up to 1M. TODO confirm.
+  sliding_window: null
+  rope_theta: 10000
+  tie_word_embeddings: false
+
+quant:
+  method: fp8                  # FP8 mixed precision (DeepSeek's own quant — experts + attention)
+
+precision:
+  kv_dtype: float8             # MLA latent KV — already tiny (1 KV head)
+  embedding_dtype: bfloat16
+  kv_model: full               # MLA compresses KV + DSA caps attention compute; conservative full here
+
+footprint:
+  total_weight_bytes: 159609485896   # ~149 GiB FP8 mixed — verified via HF metadata (46 safetensors files). MEASURE on the box.
+
+overheads:
+  framework_overhead_bytes: 5368709120   # ~5 GiB CUDA + SGLang Blackwell. TODO measure on g7e w/ 0xSero patch.
+  activation_buffer_bytes: 1073741824    # ~1 GiB. TODO measure.
+
+fit_defaults:
+  target_k: 8
+  max_context: 8192
+
+pool:
+  instance_type: g7e.2xlarge
+  region: eu-south-2            # SPAIN — cheaper ($1.25/hr vs Seoul $1.43/hr 2026-06-23) + lower interruption (<5%)
+  gpu: RTX PRO 6000 Blackwell   # sm_120 (workstation Blackwell) — REQUIRES the 0xSero patch
+  gpu_vram_bytes: 103079215104  # 96 GiB
+  gpu_count_per_node: 1
+
+# Path-C topology (Cairn-fleet specific — not part of model-as-config invariant):
+#   N=3 contiguous-layer split: stage0 = [0,15), stage1 = [15,29), stage2 = [29,43)
+#   Each stage ≈ 13-14 MoE layers × ~4.36 GB FP8 ≈ 57-62 GB weights per stage
+#   On a 96 GiB card: weights + KV + framework < 70 GiB → ~26 GiB headroom for activations & paged KV
+#   1 warm spare = same shape as any stage (replaceable by `set_next`-style re-stitch in N-stage recovery)
+#   Total: 4× g7e.2xlarge in eu-south-2 = $5.00/hr Linux/UNIX (2026-06-23 live)
+#   REQUIRES path-β loader (sglang pp_size partial-layer load) — Cairn's pp_size=1 default loads the
+#   full 149 GiB checkpoint, which exceeds 96 GiB VRAM. See fork/shard/sglang_node.py + plan/workplan.md.
