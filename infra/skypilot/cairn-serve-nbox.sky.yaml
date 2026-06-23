@@ -1,0 +1,95 @@
+# Cairn LIVE BYOK ENDPOINT — N-STAGE generalisation of cairn-serve.sky.yaml (RANK-generic, like the bench).
+#   rank0       = ENTRY (layers 0..CUT1)        + the serve_http OpenAI endpoint (:8000)
+#   rank1..N-2  = MIDDLE stages                  (transparent to serve_http — wired node->node)
+#   rank N-1    = TAIL (last stage)              -> serve_http's tail-sink IP0:7779
+#
+# serve_http only holds the ENTRY (head) + TAIL edges; the middles are invisible to it (the node
+# --next-host chain forwards through them). So ONE endpoint front serves any N-stage split — this is
+# how a 4-box gpt-oss-120b (CUTS=9,18,27) gets a queryable OpenAI API. All boxes are stages → NO spare
+# → recovery=off (a queryable endpoint, not the recovery demo; +1 box would re-enable warm-spare recovery).
+#
+#   set -a; source infra/secrets.env; set +a   # set -a EXPORTS so `sky --env` sees them (plain source won't)
+#   # gpt-oss-120b, N=4 ([9,9,9,9] over 36 layers) — set num_nodes: 4 below:
+#   sky launch -c cairn-serve infra/skypilot/cairn-serve-nbox.sky.yaml --env HF_TOKEN --env SHARD_PSK \
+#     --env MODEL=openai/gpt-oss-120b --env CUTS=9,18,27 --env NLAYERS=36 --env CAIRN_API_KEY=sk-cairn-demo -d
+#   # or, on an ALREADY-UP fleet (reuse the boxes — no teardown): sky exec cairn-serve <same yaml + --env ...>
+#   ssh -L 8888:localhost:8000 cairn-serve -N &
+#   curl localhost:8888/v1/chat/completions -H 'authorization: Bearer sk-cairn-demo' \
+#     -H 'content-type: application/json' \
+#     -d '{"model":"openai/gpt-oss-120b","messages":[{"role":"user","content":"Say hi."}],"max_tokens":32}'
+#   sky down cairn-serve
+name: cairn-serve
+
+num_nodes: 4                  # = len(CUTS)+1. EDIT per model (gpt-oss=4). All stages, no spare.
+
+resources:
+  cloud: aws
+  region: eu-south-2
+  instance_type: g6.xlarge
+  use_spot: true
+  disk_size: 256              # headroom for big weights (gpt-oss-120b ~64 GB)
+  ports: 8000
+  labels:
+    cairn: "true"
+    cairn-purpose: "serve-endpoint-nbox"
+
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+  /cairn/scheduler/src: ./scheduler/src   # cairn_scheduler.gateway — serve_http's BYOK auth + OpenAI shapes
+
+setup: |
+  set -uo pipefail
+  python3 -m venv ~/cairn-env
+  ~/cairn-env/bin/pip install -q --upgrade pip
+  ~/cairn-env/bin/pip install -q -r /cairn/infra/requirements-gpu.txt
+  ~/cairn-env/bin/pip install -q --no-deps "compressed-tensors==0.9.4"
+  ~/cairn-env/bin/python -c "import torch,sglang,cryptography; print('OK torch',torch.__version__,'cuda',torch.cuda.is_available())" || true
+
+run: |
+  set -uo pipefail
+  RANK=${SKYPILOT_NODE_RANK}; N=${SKYPILOT_NUM_NODES}
+  IPS=($SKYPILOT_NODE_IPS); IP0=${IPS[0]}
+  export PATH=$HOME/cairn-env/bin:/usr/local/cuda/bin:$PATH
+  export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
+  export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.8}
+  MODEL=${MODEL:-openai/gpt-oss-120b}; NLAYERS=${NLAYERS:-36}; CUTS=${CUTS:-9,18,27}
+  API_KEY=${CAIRN_API_KEY:-sk-cairn-demo}
+  BND=(0 ${CUTS//,/ } $NLAYERS)                                       # layer boundaries → this rank's [START,END)
+  START=${BND[$RANK]}; END=${BND[$((RANK + 1))]}
+  cd /cairn
+  pkill -9 -f "[c]airn_node" 2>/dev/null || true; sleep 2
+  if [ "$RANK" = "$((N - 1))" ]; then NEXT_HOST=$IP0; NEXT_PORT=7779; else NEXT_HOST=${IPS[$((RANK + 1))]}; NEXT_PORT=7777; fi
+  echo "[serve-nbox] rank=$RANK/$N layers [$START,$END) -> $NEXT_HOST:$NEXT_PORT  model=$MODEL"
+  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+  if [ "$RANK" = "0" ]; then
+    # ENTRY (0..CUT1) -> rank1 ; PLUS the serve_http OpenAI endpoint (entry local, tail dials back to 7779).
+    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start "$START" --layer-end "$END" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$NEXT_HOST" --next-port "$NEXT_PORT" \
+      > /tmp/cairn-node-rank0-entry.log 2>&1 &
+    export CAIRN_ACTIVITY_FILE=/tmp/cairn-serve-activity   # serve_http stamps each request → idle-autostop watchdog
+    python -u -m cairn_node.serve_http --model "$MODEL" --port 8000 --bind 0.0.0.0 --api-key "$API_KEY" \
+      --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 2>&1 | tee /tmp/cairn-serve.log
+  elif [ "$RANK" = "$((N - 1))" ]; then
+    # TAIL (last stage) -> serve_http tail-sink IP0:7779. gang-survival wrapper (report 0 so a tail death
+    # doesn't make the multi-node gang scheduler reap serve_http — mirrors cairn-serve.sky.yaml).
+    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start "$START" --layer-end "$END" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$NEXT_HOST" --next-port "$NEXT_PORT" \
+      > /tmp/cairn-node-rank$RANK-tail.log 2>&1
+    rc=$?; echo "[serve-nbox] tail exited rc=$rc -> reporting 0 (keep serve_http alive)"; exit 0
+  else
+    # MIDDLE stage -> next rank (transparent to serve_http)
+    CAIRN_DIE_AFTER=0 python -u -m cairn_node.serve --runtime sglang --model "$MODEL" \
+      --layer-start "$START" --layer-end "$END" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$NEXT_HOST" --next-port "$NEXT_PORT" \
+      2>&1 | tee /tmp/cairn-node-rank$RANK-middle.log
+  fi
+
+envs:
+  HF_TOKEN: ""
+  SHARD_PSK: ""
+  CAIRN_API_KEY: "sk-cairn-demo"

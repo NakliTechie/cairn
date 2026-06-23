@@ -21,6 +21,7 @@ import os
 import pathlib
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -36,6 +37,21 @@ from cairn_node.pipeline import _drive_multi  # noqa: E402
 from cairn_node.recovery import decode_with_recovery  # noqa: E402
 
 MAX_BODY_BYTES = 1_048_576
+
+# Optional request heartbeat: if CAIRN_ACTIVITY_FILE is set, stamp it (mtime) on each authed request so an
+# external idle-autostop watchdog can tear the fleet down after N minutes of no queries. Off when unset →
+# the proven serve path is byte-for-byte unchanged. Must never raise (truthful-run discipline).
+_ACTIVITY_FILE = os.environ.get("CAIRN_ACTIVITY_FILE")
+
+
+def _touch_activity() -> None:
+    if not _ACTIVITY_FILE:
+        return
+    try:
+        with open(_ACTIVITY_FILE, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
 
 
 class _Tok:
@@ -198,6 +214,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             eng.gateway.authenticate(self.headers.get("authorization"))
+            _touch_activity()                                       # stamp for the idle-autostop watchdog
             length = int(self.headers.get("content-length", 0) or 0)
             if length > MAX_BODY_BYTES:
                 raise GatewayError(413, "request body too large")
