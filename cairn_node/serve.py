@@ -81,6 +81,13 @@ def main() -> None:
     ap.add_argument("--bind-host", default="127.0.0.1")      # 0.0.0.0 / private IP for the cross-box fleet
     ap.add_argument("--next-host", default="127.0.0.1")
     ap.add_argument("--next-port", type=int, required=True)
+    # N-stage recovery (2026-06-23): a stage knows its own rank so a proactive-drain notice can
+    # tell the driver WHICH stage is draining (the driver then re-stitches the dead stage's
+    # PREDECESSOR, not always the entry). Default 0 = backwards-compatible with the 2-stage
+    # entry+tail run (the driver only cares about the tail's edge_in, and its target_stage
+    # defaults to 0 so set_next reaches the entry just like before).
+    ap.add_argument("--stage-rank", type=int, default=0,
+                    help="position in the pipeline (0=entry; used by N-stage recovery to address set_next)")
     a = ap.parse_args()
 
     from shard.node import LayerRange
@@ -188,15 +195,53 @@ def main() -> None:
                     pass
                 break
             if msg["op"] == "set_next":           # live re-stitch: re-point edge_out at a new next (warm spare)
+                # N-stage routing (2026-06-23): if target_stage is set and ISN'T me, forward the
+                # message down the wire so it reaches the stage that actually owns the re-stitch.
+                # 2-stage runs (and any set_next without target_stage) keep the original behavior:
+                # the first stage receiving it consumes — which for the 2-stage entry+tail case
+                # is the entry, and that's correct (it's the tail's predecessor).
+                target = msg.get("target_stage")
+                if target is not None and target != a.stage_rank:
+                    try:
+                        edge_out.send(msg)
+                    except Exception:
+                        pass
+                    continue
                 try:
                     edge_out.close()
                 except Exception:
                     pass
                 edge_out = LanEdge(msg["host"], msg["port"])
                 _connect_retry(edge_out)          # dial the spare (it's pre-warmed + listening)
+                # If the driver bundled the spare's downstream address in this same set_next, the
+                # spare is replacing a stage that ISN'T the tail — its launch-configured edge_out
+                # (driver's sink) is the wrong target. Tell the spare its new downstream now,
+                # BEFORE any data forwards: spare's edge_in just connected to us, so it'll recv
+                # this set_my_next as its first message and rewire before reading anything else.
+                if "spare_next_host" in msg and "spare_next_port" in msg:
+                    try:
+                        edge_out.send({"op": "set_my_next",
+                                       "host": msg["spare_next_host"],
+                                       "port": msg["spare_next_port"]})
+                    except Exception:
+                        pass
+                continue
+            if msg["op"] == "set_my_next":        # spare promotion: re-point MY edge_out (received as first msg)
+                try:
+                    edge_out.close()
+                except Exception:
+                    pass
+                edge_out = LanEdge(msg["host"], msg["port"])
+                _connect_retry(edge_out)
                 continue
             if msg["op"] == "drain":              # test hook: inject a drain WITHOUT real IMDS (== a spot notice)
                 _draining[0] = True
+                continue
+            if msg["op"] == "draining":           # forwarded from an UPSTREAM stage — propagate so driver hears it
+                try:
+                    edge_out.send(msg)
+                except Exception:
+                    pass
                 continue
             continue                              # unknown op — ignore
         # Draining? Tell the driver ONCE (it pre-emptively re-stitches the entry to the warm spare), then
@@ -206,7 +251,11 @@ def main() -> None:
         # next recv() raises peer-closed and we exit (the box is being reclaimed anyway). Off the hot path.
         if _draining[0] and not drained_sent:
             try:
-                edge_out.send({"op": "draining"})
+                # N-stage: include OUR rank so the driver knows WHICH stage is draining and can
+                # send set_next to the right target (= our rank - 1). 2-stage default rank=0 means
+                # the field is present but the driver's k_dead - 1 = -1 case is the entry-replace
+                # path (driver re-stitches its own outbound) — see cairn_node/recovery.py.
+                edge_out.send({"op": "draining", "stage": a.stage_rank})
                 drained_sent = True
                 nfwd += 1
                 continue                          # this forward is redone by the driver's replay on the spare
