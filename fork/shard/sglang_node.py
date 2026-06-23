@@ -30,7 +30,7 @@ a single block's forward with per-seq paged KV. Candidate paths, to settle on a 
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .node import LayerRange, NodeRuntime
 
@@ -43,6 +43,57 @@ except Exception:  # pragma: no cover
 
 class SglangNotAvailable(RuntimeError):
     pass
+
+
+class _CairnFakePPGroup:
+    """Stand-in for sglang's pipeline-parallel GroupCoordinator (path-β loader).
+
+    sglang's per-model `make_layers(..., pp_rank, pp_size)` reads from `get_pp_group()` and
+    uses `rank_in_group`/`world_size` to compute the layer slice for THIS rank. Layers outside
+    the slice become `PPMissingLayer` placeholders (no weights resident in VRAM).
+
+    Cairn's invariant (2026-06-19): no NCCL between nodes. We get the loader-side partition by
+    monkey-patching `parallel_state.get_pp_group` to return THIS fake. sglang's distributed init
+    stays world_size=1 (no inter-node TCP rendezvous, no NCCL groups). Forward goes through
+    Cairn's own wire (per-layer driven), so the unused collective methods below are never called.
+    Stubbed regardless so a mistaken call crashes loudly rather than hanging on a real NCCL op.
+    """
+
+    def __init__(self, rank: int, size: int) -> None:
+        self.rank_in_group = rank
+        self.world_size = size
+        self.ranks = list(range(size))
+        self.device_group = None
+        self.cpu_group = None
+
+    @property
+    def is_first_rank(self) -> bool:
+        return self.rank_in_group == 0
+
+    @property
+    def is_last_rank(self) -> bool:
+        return self.rank_in_group == self.world_size - 1
+
+    @property
+    def next_rank(self) -> int:
+        return self.ranks[(self.rank_in_group + 1) % self.world_size]
+
+    @property
+    def prev_rank(self) -> int:
+        return self.ranks[(self.rank_in_group - 1) % self.world_size]
+
+    def _refuse(self, name: str):
+        raise RuntimeError(
+            f"_CairnFakePPGroup.{name}() called: Cairn drives layers directly, NCCL inter-stage "
+            "collectives must never fire (would hang on a vanished spot node, spec inv §0)."
+        )
+
+    def all_reduce(self, *a, **kw):  return self._refuse("all_reduce")
+    def all_gather(self, *a, **kw):  return self._refuse("all_gather")
+    def broadcast(self, *a, **kw):   return self._refuse("broadcast")
+    def send(self, *a, **kw):        return self._refuse("send")
+    def recv(self, *a, **kw):        return self._refuse("recv")
+    def barrier(self, *a, **kw):     pass     # tolerate barrier no-op; some init paths call it
 
 
 class SglangNodeRuntime(NodeRuntime):
@@ -66,16 +117,39 @@ class SglangNodeRuntime(NodeRuntime):
         `(hidden, residual)`); at a non-tail boundary we FOLD them — `hidden + residual` — so the wire
         carries ONE tensor and the next stage resumes with `residual=None` (algebraically exact). The
         tail applies `norm` + `lm_head` → next-token logits.
+
+    Path-β partial-layer load (for headline-class models that exceed per-box VRAM at full load):
+      pass `cairn_pp_rank=k, cairn_pp_size=N` (or set `CAIRN_PP_{RANK,SIZE}` env vars). `load_shard`
+      monkey-patches sglang's `get_pp_group()` to return a `_CairnFakePPGroup(k, N)` before
+      ModelRunner construction; sglang's `make_layers` then loads ONLY layers
+      `[k*L/N, (k+1)*L/N)` (the rest become weightless `PPMissingLayer`). sglang's own dist init
+      still runs world_size=1 (no TCP rendezvous between Cairn boxes, no NCCL across nodes — the
+      2026-06-19 invariant). `layer_range` MUST match the sglang partition; `load_shard` asserts.
     """
 
-    _SHARED: Dict = {}   # (model, device) -> ModelRunner; one per process (SGLang global dist state)
+    _SHARED: Dict = {}   # (model, device, pp_rank, pp_size) -> ModelRunner; one per process
 
     def __init__(self, model: str, layer_range: LayerRange, device: str = "cuda:0",
-                 quant=None) -> None:
+                 quant=None, *, cairn_pp_rank: Optional[int] = None,
+                 cairn_pp_size: Optional[int] = None) -> None:
         super().__init__(model, layer_range, device)
         self.quant = quant                       # None = the model's native dtype (don't force a quant)
         parts = device.split(":")                # tolerate "cpu"/"cuda"/"cuda:N" without crashing (L1)
         self.device_index = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        import os
+        rank = cairn_pp_rank if cairn_pp_rank is not None else os.environ.get("CAIRN_PP_RANK")
+        size = cairn_pp_size if cairn_pp_size is not None else os.environ.get("CAIRN_PP_SIZE")
+        self.cairn_pp_rank = int(rank) if rank is not None else None
+        self.cairn_pp_size = int(size) if size is not None else None
+        if (self.cairn_pp_rank is None) != (self.cairn_pp_size is None):
+            raise ValueError("cairn_pp_rank and cairn_pp_size must be set together (or both None)")
+        if self.cairn_pp_size is not None:
+            if not (0 <= self.cairn_pp_rank < self.cairn_pp_size):
+                raise ValueError(
+                    f"cairn_pp_rank ({self.cairn_pp_rank}) must be in [0, cairn_pp_size={self.cairn_pp_size})"
+                )
+            if self.cairn_pp_size < 1:
+                raise ValueError(f"cairn_pp_size must be ≥ 1 (got {self.cairn_pp_size})")
         self._runner = None
         self._inner = None                       # the inner decoder model (.layers/.embed_tokens/.norm)
         self._batches: Dict[str, Any] = {}       # seq_id -> SGLang ScheduleBatch (KV lifecycle)
@@ -93,18 +167,32 @@ class SglangNodeRuntime(NodeRuntime):
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_executor.model_runner import ModelRunner
 
-        key = (self.model, self.device)
+        key = (self.model, self.device, self.cairn_pp_rank, self.cairn_pp_size)
         runner = SglangNodeRuntime._SHARED.get(key)
         if runner is None:
             mem = float(os.environ.get("CAIRN_SGLANG_MEM_FRACTION", "0.8"))
             sock = socket.socket(); sock.bind(("", 0)); port = sock.getsockname()[1]; sock.close()
             sa = ServerArgs(model_path=self.model, tp_size=1, pp_size=1, mem_fraction_static=mem,
                             disable_cuda_graph=True, trust_remote_code=True)
-            runner = ModelRunner(
-                model_config=ModelConfig.from_server_args(sa), mem_fraction_static=mem,
-                gpu_id=self.device_index, tp_rank=0, tp_size=1, pp_rank=0, pp_size=1,
-                nccl_port=port, server_args=sa,
-            )
+            # Path-β: monkey-patch get_pp_group BEFORE ModelRunner so make_layers sees the fake.
+            # sglang's own distributed init still runs world_size=1 (no NCCL across nodes); only the
+            # LOADER's view of pp_rank/pp_size is overridden so it partitions weights to our slice.
+            saved_get_pp_group = None
+            if self.cairn_pp_size is not None and self.cairn_pp_size > 1:
+                import sglang.srt.distributed.parallel_state as _pstate
+                saved_get_pp_group = _pstate.get_pp_group
+                fake = _CairnFakePPGroup(self.cairn_pp_rank, self.cairn_pp_size)
+                _pstate.get_pp_group = lambda fake=fake: fake
+            try:
+                runner = ModelRunner(
+                    model_config=ModelConfig.from_server_args(sa), mem_fraction_static=mem,
+                    gpu_id=self.device_index, tp_rank=0, tp_size=1, pp_rank=0, pp_size=1,
+                    nccl_port=port, server_args=sa,
+                )
+            finally:
+                if saved_get_pp_group is not None:
+                    import sglang.srt.distributed.parallel_state as _pstate
+                    _pstate.get_pp_group = saved_get_pp_group
             SglangNodeRuntime._SHARED[key] = runner
         self._runner = runner
         self._inner = runner.model.model
@@ -112,6 +200,18 @@ class SglangNodeRuntime(NodeRuntime):
         s, e = self.layer_range.start, self.layer_range.end   # end EXCLUSIVE (LayerRange convention)
         if not (0 <= s < e <= n):
             raise ValueError(f"layer_range [{s},{e}) out of [0,{n}] for {self.model}")
+        # Path-β invariant: when cairn_pp_size > 1, layer_range MUST match the sglang loader's slice.
+        # Otherwise we'd try to forward through PPMissingLayer placeholders (no weights, just stubs).
+        if self.cairn_pp_size is not None and self.cairn_pp_size > 1:
+            from sglang.srt.distributed import get_pp_indices  # type: ignore[import-not-found]
+            ps, pe = get_pp_indices(n, self.cairn_pp_rank, self.cairn_pp_size)
+            if (s, e) != (ps, pe):
+                raise ValueError(
+                    f"layer_range [{s},{e}) does not match sglang pp partition [{ps},{pe}) "
+                    f"for cairn_pp_rank={self.cairn_pp_rank} cairn_pp_size={self.cairn_pp_size}, "
+                    f"num_layers={n}. Cairn's scheduler must set layer_range == get_pp_indices(...) "
+                    "or the forward would hit PPMissingLayer placeholders."
+                )
         self._start, self._end, self._n = s, e, n
         self._is_embed = (s == 0)                # stage 0 embeds the token ids
         self._is_tail = (e == n)                 # last stage applies norm + lm_head
