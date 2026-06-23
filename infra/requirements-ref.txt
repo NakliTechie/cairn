@@ -2,9 +2,16 @@
 #
 # This pins the env for fork/shard/transformers_node.py (the reference block runtime) +
 # fork/tests/test_ref_split.py (split-correctness + replay-rebuild). It is DELIBERATELY SEPARATE
-# from infra/requirements-gpu.txt: the oracle uses transformers 5.x APIs
-# (transformers.masking_utils.create_causal_mask, from_pretrained(dtype=)), which do NOT co-exist
-# with the ~4.5x transformers that sglang==0.4.6.post5 pulls. Keep them in separate venvs.
+# from infra/requirements-gpu.txt: it uses a transformers (5.x) that does NOT co-exist with the
+# ~4.5x transformers that sglang==0.4.6.post5 pulls. Keep them in separate venvs.
+#
+# This pin is the BIT-IDENTICAL reproduction; the runtime itself is now version-TOLERANT.
+# transformers churns transformers.masking_utils.create_causal_mask NON-monotonically: 5.12.1 takes
+# `inputs_embeds` and derives cache_position internally; 4.57.x renamed it `input_embeds` and made
+# cache_position required; 4.51.x (the sglang env) differs again. So transformers_node.py introspects
+# the INSTALLED signature and adapts — the oracle runs green outside this venv too (verified on system
+# transformers 4.57.6, 2026-06-23), instead of TypeError-ing on env drift. The split==unsplit asserts
+# still catch any real mask-semantic break, so tolerance costs no rigor. Use this pin for exact numerics.
 #
 # These are the EXACT versions that proved path-C green on 2026-06-21 (inv #1 split==single-ref +
 # inv #2 replay-rebuild, 4/4, on real Llama layers) — pin them so the oracle reproduces bit-identically.
