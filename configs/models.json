@@ -1,5 +1,6 @@
 {
   "models": [
+    "deepseek-v4-flash-fp8",
     "deepseek-v4-flash-nvfp4",
     "glm-5.2-nvfp4",
     "gpt-neox-20b",
