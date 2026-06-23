@@ -6,7 +6,9 @@
 # This is the product: a model split across boxes, behind a BYOK key, surviving a reclaim mid-request.
 # The run block BLOCKS (serve_forever) → the cluster stays up serving until `sky down`.
 #
-#   source infra/secrets.env
+#   set -a; source infra/secrets.env; set +a   # `set -a` EXPORTS them — plain `source` does not, so
+#                                               # `sky --env HF_TOKEN` would die "HF_TOKEN is not set".
+#                                               # (Or just use launch.py, which Python-loads secrets.env.)
 #   sky launch -c cairn-serve infra/skypilot/cairn-serve.sky.yaml --env HF_TOKEN --env SHARD_PSK \
 #     --env CAIRN_API_KEY=sk-cairn-demo -i 60 --down -d        # -d = detached (it serves forever)
 #   ssh -L 8888:localhost:8000 cairn-serve -N &                 # tunnel the endpoint to localhost:8888

@@ -6,7 +6,8 @@
 # after CAIRN_DIE_AFTER forwards, the driver re-stitches to the warm spare, replays, resumes — and the
 # rig asserts the recovered tokens == the no-death reference. ~$0.16/hr; the run is minutes.
 #
-#   source infra/secrets.env   # HF_TOKEN + SHARD_PSK (gitignored)
+#   set -a; source infra/secrets.env; set +a   # HF_TOKEN + SHARD_PSK (gitignored). `set -a` EXPORTS them
+#                                               # so `sky --env` can see them; plain `source` does NOT.
 #   sky launch -c cairn-rec1 infra/skypilot/cairn-recovery-1box.sky.yaml --env HF_TOKEN --env SHARD_PSK -i 15 --down -y
 #   # verdict: ">>> RECOVERY OK" + MTTR in the streamed output (also /tmp/cairn-rec1box.log on the box)
 #   sky down cairn-rec1
