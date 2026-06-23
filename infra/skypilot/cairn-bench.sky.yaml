@@ -28,6 +28,8 @@ file_mounts:
   /cairn/cairn_node: ./cairn_node
   /cairn/configs: ./configs
   /cairn/infra: ./infra
+  /cairn/scheduler/src: ./scheduler/src   # so `sky exec cairn-serve-nbox.sky.yaml` (serve_http needs
+  #                                         cairn_scheduler.gateway) works on a bench-provisioned cluster
 
 setup: |
   set -uo pipefail

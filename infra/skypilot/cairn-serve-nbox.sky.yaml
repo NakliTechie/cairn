@@ -28,7 +28,9 @@ resources:
   instance_type: g6.xlarge
   use_spot: true
   disk_size: 256              # headroom for big weights (gpt-oss-120b ~64 GB)
-  ports: 8000
+  # NB: no `ports:` — access is via `ssh -L 8888:localhost:8000 <cluster>` (tunnel, key-gated, no public
+  # exposure). Declaring ports here also lets this yaml `sky exec` onto a no-ports bench cluster (resources
+  # must match). To expose 8000 publicly on a standalone launch, add `ports: 8000` back.
   labels:
     cairn: "true"
     cairn-purpose: "serve-endpoint-nbox"
