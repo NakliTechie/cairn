@@ -13,6 +13,7 @@ numerical correctness, so loading the whole model and slicing is fine (reference
 """
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict
 
 from .node import LayerRange, NodeRuntime
@@ -73,10 +74,21 @@ class TransformersNodeRuntime(NodeRuntime):
             S = h.shape[1]
             cache_position = torch.arange(pos, pos + S, device=h.device)
             position_ids = cache_position.unsqueeze(0)
-            causal_mask = create_causal_mask(
-                config=self._config, inputs_embeds=h, attention_mask=None,
-                past_key_values=cache, position_ids=position_ids,
-            )
+            # transformers churns create_causal_mask's signature across versions, and NOT monotonically:
+            # 5.12.1 (the pinned oracle env — infra/requirements-ref.txt) takes `inputs_embeds` and derives
+            # cache_position internally; 4.57.x renamed it `input_embeds` and made cache_position required;
+            # 4.51.x (the sglang box env) differs again. Build kwargs against the INSTALLED signature so this
+            # no-spend reference oracle survives an env swap instead of TypeError-ing. This only absorbs
+            # benign kwarg-name/arity churn — the split==unsplit asserts below still catch real mask drift.
+            mask_params = inspect.signature(create_causal_mask).parameters
+            mask_kwargs = {
+                "config": self._config, "attention_mask": None,
+                "past_key_values": cache, "position_ids": position_ids,
+            }
+            mask_kwargs["input_embeds" if "input_embeds" in mask_params else "inputs_embeds"] = h
+            if "cache_position" in mask_params:
+                mask_kwargs["cache_position"] = cache_position
+            causal_mask = create_causal_mask(**mask_kwargs)
             pos_emb = self._inner.rotary_emb(h, position_ids=position_ids)
             for lyr in self._layers:
                 h = lyr(h, attention_mask=causal_mask, position_ids=position_ids,
