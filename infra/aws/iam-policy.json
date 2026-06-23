@@ -99,6 +99,17 @@
       "Effect": "Allow",
       "Action": "s3:ListAllMyBuckets",
       "Resource": "*"
+    },
+    {
+      "Sid": "ServiceQuotasReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:GetServiceQuota",
+        "servicequotas:ListServiceQuotas",
+        "servicequotas:ListRequestedServiceQuotaChangeHistory",
+        "servicequotas:GetRequestedServiceQuotaChange"
+      ],
+      "Resource": "*"
     }
   ]
 }
