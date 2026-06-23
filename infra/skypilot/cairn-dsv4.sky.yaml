@@ -1,0 +1,196 @@
+# Cairn DeepSeek-V4-Flash (Path C) — multi-box layer-split via the 0xSero SM_120 community sglang patch.
+#
+# THIS IS THE MAIDEN MULTI-BOX V4 RUN. Scope of "see what happens" (per 2026-06-23 path-c decision):
+#   (a) prove the 0xSero patch's SM_120 FlashMLA sparse-decode kernels survive Cairn's per-block sglang wrap
+#       (i.e. the patch's sitecustomize hook fires inside our SglangNodeRuntime — Task #1 verdict)
+#   (b) prove path-β loader (fork/shard/sglang_node.py + CAIRN_PP_{RANK,SIZE}) actually slices weights:
+#       only ~50 GiB resident per box (vs the 149 GiB full checkpoint that wouldn't fit)
+#   (c) drive ONE coherent decode through entry -> middle -> tail -> driver and confirm bit-shape
+#   (d) test TAIL-KILL recovery — the existing 2-stage code path handles k_dead=N-1 without the
+#       Task #3 N-stage driver refactor (deferred to a follow-on session per 2026-06-23 user call)
+#
+# OUT OF SCOPE for this run (gaps documented in workplan.md / pending.md):
+#   • Middle-kill (rank 1): needs Task #3 driver refactor + serve.py lsock re-accept
+#   • Entry-kill (rank 0): same + driver-side outbound re-stitch
+#   • Reactive non-tail death: needs heartbeats (Path 2)
+#
+# Topology (N=3 layer-split + 1 tail-shaped spare = 4 nodes total):
+#   rank0 = ENTRY  (layers 0..15)   + serve_http endpoint (OpenAI /v1 on :8000, co-located like cairn-serve.sky.yaml)
+#   rank1 = MIDDLE (layers 15..29)
+#   rank2 = TAIL   (layers 29..43)  — manual `pkill` / sentinel-drain demonstrates recovery
+#   rank3 = SPARE  (layers 29..43)  — pre-warmed standby, takes over on tail death
+# All four = g7e.2xlarge in eu-south-2 (Spain, $1.25/hr spot Linux/UNIX, <5% interruption — 2026-06-23 live).
+# Total fleet ≈ $5/hr. Session ceiling = $30 (≤6h, see plan/workplan.md Chunk 0 + memory box-spinup-cost-gate).
+#
+# Launch (after `aws sso login --profile cairn-skypilot`):
+#   set -a; source infra/secrets.env; set +a
+#   sky launch -c cairn-dsv4 infra/skypilot/cairn-dsv4.sky.yaml --env HF_TOKEN --env SHARD_PSK \
+#     --env CAIRN_API_KEY=sk-cairn-demo -i 60 --down -d
+#   ssh -L 8888:localhost:8000 cairn-dsv4 -N &
+#   curl localhost:8888/v1/chat/completions -H 'authorization: Bearer sk-cairn-demo' \
+#     -H 'content-type: application/json' \
+#     -d '{"model":"deepseek-ai/DeepSeek-V4-Flash","messages":[{"role":"user","content":"hi"}],"max_tokens":48}'
+#   # Tail-kill recovery test:
+#   sky exec cairn-dsv4 "pkill -9 -f 'layer-start 29'"
+#   # Drain-based recovery test (proactive path):
+#   sky exec cairn-dsv4 "touch /tmp/cairn-drain"   # rank 2's sentinel watcher → graceful migrate
+#   sky down cairn-dsv4
+
+name: cairn-dsv4
+
+num_nodes: 4                          # 3 active stages (rank 0/1/2) + 1 spare (rank 3)
+
+resources:
+  cloud: aws
+  region: eu-south-2                  # SPAIN — $1.25/hr spot vs Seoul $1.43 (2026-06-23 live), <5% interruption
+  instance_type: g7e.2xlarge          # 1× RTX PRO 6000 Blackwell (sm_120), 96 GiB VRAM
+  use_spot: true
+  disk_size: 400                      # 150 GiB V4-Flash FP8 + ~5 GiB 0xSero build + system + headroom
+  # Blackwell DLAMI (R580 driver) — REQUIRED. SkyPilot's default Ubuntu AMI ships nvidia 535 which
+  # cannot probe sm_120 ("probe of 0000:2b:00.0 failed with error -1"). Confirmed live 2026-06-23.
+  image_id: ami-02f2234b443117395
+  labels:
+    cairn: "true"
+    cairn-purpose: "dsv4-flash-pathc-maiden"
+
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+  /cairn/scheduler/src: ./scheduler/src   # serve_http imports cairn_scheduler — only this dir (the parent's
+  #                                          stray scheduler/.venv would rsync-choke SSH, see 2026-06-23 history)
+
+setup: |
+  set -uo pipefail
+  # 0xSero runs INSIDE the official lmsysorg/sglang:deepseek-v4-blackwell Docker image (the patch
+  # replaces ONLY the SM_120 sparse-decode kernels in the upstream image; everything else stays).
+  # So setup = pull the image + build the patch + pre-fetch weights. No host-side venv needed for
+  # serving — cairn_node.serve runs INSIDE the container at run time.
+
+  # 1. Docker (DLAMI already ships it but be defensive)
+  if ! command -v docker >/dev/null; then
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo systemctl enable --now docker
+    sudo usermod -aG docker $USER
+  fi
+  # nvidia-container-toolkit (the DLAMI ships it but the runtime config sometimes needs a kick)
+  sudo systemctl restart docker || true
+
+  # 2. Pull the official Blackwell V4 sglang image (this is what 0xSero patches into)
+  sudo docker pull lmsysorg/sglang:deepseek-v4-blackwell
+
+  # 3. Build the 0xSero SM_120 patch (compiles inside the same container; output in ~/dsv4/build-docker)
+  if [ ! -d ~/dsv4 ]; then
+    git clone https://github.com/0xSero/deepseek-v4-flash-sm120 ~/dsv4
+  fi
+  cd ~/dsv4
+  sudo bash scripts/build_in_sglang_docker.sh    # ~30 min one-time CUDA-extension build
+
+  # 4. Pre-fetch FP8 weights (so the actual launch doesn't burn GPU $ on a download)
+  # NOTE: this runs once per spot-instance — if the box is reclaimed mid-build, we lose this.
+  # For a session with multiple iterations, consider an S3-backed model cache (Path-2 territory).
+  pip3 install -q --user "huggingface_hub[cli]" hf_transfer
+  export HF_HUB_ENABLE_HF_TRANSFER=1
+  mkdir -p ~/model
+  python3 -m huggingface_hub.commands.huggingface_cli download deepseek-ai/DeepSeek-V4-Flash \
+    --local-dir ~/model --token "$HF_TOKEN" || true
+
+  # 5. Sanity checks
+  nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
+  ls -la ~/dsv4/build-docker/ || true
+  du -sh ~/model || true
+
+run: |
+  set -uo pipefail
+  RANK=${SKYPILOT_NODE_RANK}
+  IPS=($SKYPILOT_NODE_IPS); IP0=${IPS[0]}; IP1=${IPS[1]}; IP2=${IPS[2]}; IP3=${IPS[3]}
+  export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
+  export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.85}
+  MODEL=${MODEL:-deepseek-ai/DeepSeek-V4-Flash}
+  API_KEY=${CAIRN_API_KEY:-sk-cairn-demo}
+  NLAYERS=43
+
+  # Path-β layer split (43 layers, N=3 → balanced front-loaded):
+  #   rank 0: [0,15)   — entry, embeds tokens
+  #   rank 1: [15,29)  — middle
+  #   rank 2: [29,43)  — tail, applies norm + lm_head
+  #   rank 3: [29,43)  — spare, tail-shaped for this run (first V4 test = tail-kill only)
+  case "$RANK" in
+    0) LS=0;  LE=15; PP_RANK=0; STAGE_NAME="entry"  ;;
+    1) LS=15; LE=29; PP_RANK=1; STAGE_NAME="middle" ;;
+    2) LS=29; LE=43; PP_RANK=2; STAGE_NAME="tail"   ;;
+    3) LS=29; LE=43; PP_RANK=2; STAGE_NAME="spare"  ;;
+  esac
+  echo "[dsv4] rank=$RANK stage=$STAGE_NAME layers=[$LS,$LE) pp_rank=$PP_RANK"
+  echo "[dsv4] ips: rank0=$IP0 rank1=$IP1 rank2=$IP2 rank3=$IP3"
+
+  pkill -9 -f "[c]airn_node" 2>/dev/null || true; sleep 2
+
+  # The common docker invocation: mount cairn + patch + weights, host network so ports work without -p,
+  # pass HF_TOKEN + path-β env vars, run cairn_node.serve INSIDE the patched container.
+  # WORKING DIR = /cairn so `python -u -m cairn_node.serve` resolves.
+  DOCKER_RUN_COMMON="sudo docker run --rm --gpus all --shm-size=64g --ipc=host --network host \
+    -v /home/ubuntu/dsv4/build-docker:/dsv4:ro \
+    -v /home/ubuntu/model:/workspace/model:ro \
+    -v /cairn:/cairn:ro \
+    -w /cairn \
+    -e PYTHONPATH=/dsv4:/cairn:/cairn/fork:/cairn/scheduler/src \
+    -e HF_TOKEN=$HF_TOKEN \
+    -e SHARD_PSK=$SHARD_PSK \
+    -e CAIRN_SGLANG_MEM_FRACTION=$CAIRN_SGLANG_MEM_FRACTION \
+    -e CAIRN_PP_RANK=$PP_RANK \
+    -e CAIRN_PP_SIZE=3 \
+    lmsysorg/sglang:deepseek-v4-blackwell"
+
+  if [ "$RANK" = "0" ]; then
+    # ENTRY (0..15) -> middle on $IP1:7777
+    eval $DOCKER_RUN_COMMON \
+      python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
+        --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
+        --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP1" --next-port 7777 \
+        --stage-rank 0 \
+      > /tmp/cairn-dsv4-rank0-entry.log 2>&1 &
+    sleep 5   # give the entry a head start to bind :7777 before serve_http dials
+    # serve_http endpoint (co-located on rank 0): dial local entry; accept tail-sink (7779) and
+    # spare-sink (7780); serve OpenAI /v1 on :8000 with recovery armed for the tail-kill case.
+    eval $DOCKER_RUN_COMMON \
+      python -u -m cairn_node.serve_http --model "$MODEL" --port 8000 --bind 0.0.0.0 --api-key "$API_KEY" \
+        --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 \
+        --spare-host "$IP3" --spare-sink 7780 --spare-port 7777 \
+      2>&1 | tee /tmp/cairn-dsv4-serve.log
+  elif [ "$RANK" = "1" ]; then
+    # MIDDLE (15..29) -> tail on $IP2:7777
+    eval $DOCKER_RUN_COMMON \
+      python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
+        --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
+        --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP2" --next-port 7777 \
+        --stage-rank 1 \
+      2>&1 | tee /tmp/cairn-dsv4-rank1-middle.log
+  elif [ "$RANK" = "2" ]; then
+    # TAIL (29..43) -> serve_http's tail-sink $IP0:7779. CAIRN_SPOT_TEST_FILE arms the proactive-drain
+    # sentinel for the touch-based recovery test. The `exit 0` shim is REQUIRED (gang-scheduler trap
+    # from 2026-06-23): if the tail dies with rc=137 the gang reaps serve_http mid-recovery, so we
+    # report 0 and let serve_http's own death-detect kick off the re-stitch onto the spare.
+    eval CAIRN_SPOT_TEST_FILE=/tmp/cairn-drain CAIRN_SPOT_WATCH_INTERVAL=0.5 \
+      $DOCKER_RUN_COMMON \
+      python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
+        --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
+        --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779 \
+        --stage-rank 2 \
+      > /tmp/cairn-dsv4-rank2-tail.log 2>&1
+    rc=$?; echo "[dsv4] tail exited rc=$rc (kill/drain) -> reporting 0 so the gang scheduler keeps serve_http alive"; exit 0
+  else
+    # SPARE (29..43, tail-shaped) -> serve_http's spare-sink $IP0:7780
+    eval $DOCKER_RUN_COMMON \
+      python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
+        --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
+        --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7780 \
+        --stage-rank 2 \
+      2>&1 | tee /tmp/cairn-dsv4-rank3-spare.log
+  fi
+
+envs:
+  HF_TOKEN: ""
+  SHARD_PSK: ""
+  CAIRN_API_KEY: "sk-cairn-demo"
