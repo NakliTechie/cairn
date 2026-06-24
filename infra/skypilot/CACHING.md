@@ -8,6 +8,32 @@ The strategy ties directly into **recovery and hotswaps**: a box that comes up f
 can replace a spot-reclaimed stage fast, promote a spare fast, or load a different model fast. Cache
 = cheaper experiments *and* a better recovery story (Path 2 / durable-star).
 
+## The core principle: download once, fan out from in-region S3
+
+**Every artifact is pulled from its slow public origin (HF, Docker Hub, a 30-min compile) EXACTLY
+ONCE, into an in-region S3 bucket. Boxes only ever pull from S3.** This is the default, not an
+optimization to add later.
+
+Why it's not optional at scale — the weights make it obvious:
+
+| Boxes | Per-box-pulls-HF (today) | Download-once-to-S3 (the rule) |
+|---|---|---|
+| 4 | 600 GB HF egress, 4× rate-limit exposure | 150 GB HF once + 4× in-region S3 (backbone) |
+| 20 | **3 TB HF egress**, near-certain throttling, slow | 150 GB HF once + 20× in-region S3 (parallel, fast) |
+
+S3→EC2 in the **same region** is the AWS backbone: high-throughput, parallel across boxes (S3 scales
+horizontally), no public-internet egress, no third-party rate limits. HF (or Docker Hub) sees one
+pull per artifact revision, ever. This is the network-friendly *and* the scalable choice — the same
+decision, twice over.
+
+**Corollary — boxes need read creds to the cache bucket.** The 5 MB kernel rides SkyPilot file_mounts
+(controller-mediated). 150 GB × N boxes must NOT funnel through the controller — each box pulls S3
+directly and in parallel, which means each box needs read access. The scalable answer is an **IAM
+instance profile** scoped read-only to the cache bucket(s), attached to the fleet → boxes get
+short-lived creds from the metadata service, no long-lived keys on disk, `aws s3 sync` runs directly.
+(See "boxes have no creds" below — for scale, we *fix* that with a least-privilege read role, rather
+than route everything through the controller.)
+
 ## The constraint that shapes everything
 
 **Boxes have no AWS credentials** (no instance role — verified 2026-06-24). So:
@@ -18,6 +44,13 @@ can replace a spot-reclaimed stage fast, promote a spare fast, or load a differe
   `aws s3 cp local.tgz s3://...` from the laptop/controller.
 
 → **Populate-once, restore-many.** This is fine: artifacts change rarely (only when their key changes).
+
+**For scale, fix the no-creds default with a read role.** The controller-mediated file_mount is fine
+for the 5 MB kernel but is the wrong tool for 150 GB × N boxes (controller bottleneck). Attach a
+**least-privilege IAM instance profile** to the fleet, scoped read-only to the cache bucket(s)
+(`s3:GetObject`/`ListBucket` on `skypilot-cairn-weights-*` + `skypilot-cairn-artifacts`). Boxes then pull S3
+directly and in parallel via metadata-service creds — no long-lived keys, no controller in the path.
+This is additive to the existing least-priv posture: read-only, cache-bucket-only, no mutate.
 
 Bucket: **`skypilot-cairn-artifacts`** (the `skypilot-*` name matches the cairn-skypilot IAM S3 scope,
 so the least-priv key can read/write it; `s3:CreateBucket` on that pattern is allowed).
@@ -40,15 +73,21 @@ so the least-priv key can read/write it; `s3:CreateBucket` on that pattern is al
   — update the digest in the file_mount and re-populate. A stale/missing prefix degrades gracefully
   to a full rebuild.
 
-### 2. Weights — NEXT (the bigger win, and the hotswap enabler)
-- **Why in-region:** the boxes run in eu-south-2. A same-region S3 mirror means each box pulls 150 GB
-  from S3 over the AWS backbone — faster than HF, no HF rate-limits when 4+ boxes pull at once, and no
-  ~600 GB/run egress from HF. Cross-region defeats the purpose; **the weight bucket must live in the
-  launch region** (unlike the 4.7 MB kernel, where cross-region is negligible).
-- **Mechanism:** SkyPilot S3 file_mount (or `sky storage`) syncs `s3://cairn-weights-eu-south-2/
-  deepseek-v4-flash/<revision>/` → `~/model`. Restore is automatic; populate once from a box that
-  already pulled from HF (or a one-off controller-side `aws s3 sync`).
-- **Cost:** ~150 GB × ~$0.023/GB-mo ≈ **$3.5/mo** per cached model. Trivial vs the GPU-time saved.
+### 2. Weights — NEXT (the bigger win, the hotswap enabler, the scale unlock)
+This is where "download once, fan out" pays off most. See the core principle above.
+- **Bucket lives in the launch region** (`skypilot-cairn-weights-<region>`, e.g. `skypilot-cairn-weights-eu-south-2`).
+  The `skypilot-` prefix is REQUIRED: the cairn-skypilot IAM key's S3 access is scoped to `skypilot-*`/
+  `sky-*` buckets, so a bare `cairn-weights-*` name couldn't be created or populated by the least-priv
+  key (same reason `skypilot-cairn-artifacts` works). Cross-region defeats the purpose — the whole
+  point is the same-region backbone. One bucket per region we launch in; populate lazily per model.
+- **Populate once (per model+revision):** one-time `HF → S3`. Either controller-side
+  (`aws s3 sync` after a single HF pull) or, opportunistically, from a box that already has the
+  weights (give it the read/write role transiently). After that, HF never sees this model again.
+- **Fan out (every box, every launch):** each box `aws s3 sync s3://skypilot-cairn-weights-<region>/
+  <model>/<revision>/ ~/model` — **direct, parallel, in-region**. NOT via SkyPilot file_mounts
+  (don't funnel 150 GB × N through the controller). Requires the read **instance profile** (below).
+- **Cost:** ~150 GB × ~$0.023/GB-mo ≈ **$3.5/mo** per cached model. Trivial vs the GPU-time and HF
+  egress saved — and it drops to near-zero per *box* added (the win compounds with fleet size).
 - **Hotswap / recovery payoff (the reason this matters beyond cost):**
   - **Spare promotion / post-reclaim replacement:** a replacement box loads weights from in-region S3
     in a fraction of the HF time → lower MTTR for the catastrophic-recovery path (Path 2 durable-star).
@@ -63,12 +102,24 @@ It's a *pull*, not a build, and it's digest-pinned (`lmsysorg/sglang:deepseek-v4
 boxes, the right fix is an **ECR mirror in the launch region** (`docker tag` + push once, pull from
 ECR after) — not S3. Low priority until pulls are a measured bottleneck.
 
-## Next steps
+## Next steps (priority order — weights fan-out is the headline)
 - [x] Kernel build → S3, wired into the dsv4 yaml (2026-06-24).
-- [ ] Create `cairn-weights-<region>` bucket(s) **in the launch region**; populate DeepSeek-V4-Flash
-      once; add a weights file_mount + setup branch (S3 hit → skip HF). Gate: after the maiden decode.
+- [ ] **Read instance profile** for the fleet — least-priv `s3:GetObject`/`ListBucket` on
+      `skypilot-cairn-weights-*` + `skypilot-cairn-artifacts`, attached at launch (confirm how SkyPilot 0.12
+      attaches an IAM instance profile). This is the prerequisite for direct parallel S3 fan-out.
+- [ ] **Weights download-once → in-region S3, fan-out to boxes.** Create `skypilot-cairn-weights-<region>`
+      **in the launch region**; populate DeepSeek-V4-Flash once (HF→S3); change the dsv4 setup so each
+      box does `aws s3 sync s3://skypilot-cairn-weights-<region>/<model>/<rev>/ ~/model` (S3 hit → skip HF),
+      falling back to HF only on a cache miss. Gate: right after the maiden decode. This is THE
+      network-friendly pattern and the prerequisite for 10-20-box runs.
 - [ ] Generalize: a small helper (`infra/skypilot/cache.py`?) — `populate <artifact>` /
-      `key <artifact>` — so kernel + weights + future models share one keying/populate convention.
-- [ ] ECR image mirror — only if Docker Hub pull time is measured as a problem.
+      `key <artifact>` / `sync <artifact>` — so kernel + weights + future models share one
+      keying/populate/restore convention (and the same instance-profile read path).
 - [ ] Tie weight-cache into the recovery path: spare/replacement boxes pull from in-region S3 →
       measure the MTTR improvement vs HF (feeds the Path 2 / headline recovery numbers).
+- [ ] ECR image mirror — only if Docker Hub pull time is measured as a problem (lowest priority).
+
+> **Scale note (the reason this is the default, not an optimization):** at 10-20 boxes, per-box HF
+> pulls = multi-TB egress per launch + rate-limit throttling + slow bring-up. Download-once-to-S3 +
+> in-region parallel fan-out keeps HF egress flat (1× per model revision) regardless of fleet size,
+> and makes each added box nearly free to provision. It's the only pattern that scales.
