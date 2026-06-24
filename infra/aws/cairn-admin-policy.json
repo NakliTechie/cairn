@@ -1,0 +1,56 @@
+{
+  "_comment": "DRAFT scoped admin for the occasional Cairn ACCOUNT-admin task (create/manage the project's scoped IAM users, VPC/IGW fixes, bucket + quota management) — an alternative to using ROOT CLI keys. ⚠ HONEST CAVEAT: anything that can manage IAM is privilege-escalation-capable (this key can PutUserPolicy an admin inline policy onto a cairn-* user, then use it), so it is a TRUSTED, powerful key — NOT least-priv like cairn-skypilot/cairn-s3-cache. Protect it with MFA, keep it off any box, and use it only for setup. If you'd rather not have a standing admin key at all, the most-secure option is to delete root access keys and use the ROOT CONSOLE (email+password+MFA, no CLI keys) for the ~monthly admin task. Apply: create IAM user 'cairn-admin' (root console, the last time you need root) → attach THIS inline (minus _comment) → enable MFA → create an access key → store as a named profile (NOT default). EC2 mutate is left region-wide because admin VPC/IGW work spans regions; tighten if desired.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ManageProjectScopedIamUsers",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateUser", "iam:DeleteUser", "iam:GetUser", "iam:TagUser", "iam:UntagUser",
+        "iam:PutUserPolicy", "iam:DeleteUserPolicy", "iam:GetUserPolicy", "iam:ListUserPolicies",
+        "iam:CreateAccessKey", "iam:DeleteAccessKey", "iam:UpdateAccessKey", "iam:ListAccessKeys"
+      ],
+      "Resource": [
+        "arn:aws:iam::615809814090:user/cairn-*",
+        "arn:aws:iam::615809814090:user/sky-*"
+      ]
+    },
+    {
+      "Sid": "IamReadForReview",
+      "Effect": "Allow",
+      "Action": ["iam:ListUsers", "iam:ListPolicies", "iam:GetPolicy", "iam:GetPolicyVersion"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BlockManagedPolicyEscalation",
+      "Effect": "Deny",
+      "Action": ["iam:AttachUserPolicy", "iam:AttachRolePolicy", "iam:CreateRole", "iam:PutRolePolicy"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Ec2InfraAllRegions",
+      "Effect": "Allow",
+      "Action": ["ec2:*"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ProjectBuckets",
+      "Effect": "Allow",
+      "Action": ["s3:*"],
+      "Resource": [
+        "arn:aws:s3:::skypilot-cairn-*", "arn:aws:s3:::skypilot-cairn-*/*",
+        "arn:aws:s3:::sky-cairn-*", "arn:aws:s3:::sky-cairn-*/*"
+      ]
+    },
+    {
+      "Sid": "ServiceQuotas",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:GetServiceQuota", "servicequotas:GetAWSDefaultServiceQuota",
+        "servicequotas:ListServiceQuotas", "servicequotas:RequestServiceQuotaIncrease",
+        "servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
