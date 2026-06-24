@@ -1,0 +1,24 @@
+{
+  "_comment": "Least-privilege READ-ONLY policy for the 'cairn-s3-cache' IAM user (2026-06-24). This key goes ON the GPU/CPU boxes (passed via SkyPilot --env) so they can pull cached artifacts from S3 — kernel build + model weights — WITHOUT carrying the powerful 'cairn-skypilot' key (which can mutate EC2). Scope: GetObject + ListBucket on the cache buckets ONLY (skypilot-cairn-weights-<region> + skypilot-cairn-artifacts); no write, no EC2, no other service. WRITE (populating the cache) stays a controller-side step using cairn-skypilot. To apply: create the IAM user 'cairn-s3-cache' (admin/console — cairn-skypilot cannot create IAM users), attach THIS as an inline policy, create an access key, and store it in infra/secrets.env as CAIRN_S3_CACHE_{ACCESS_KEY_ID,SECRET_ACCESS_KEY}. See infra/skypilot/CACHING.md.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListCacheBuckets",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": [
+        "arn:aws:s3:::skypilot-cairn-weights-*",
+        "arn:aws:s3:::skypilot-cairn-artifacts"
+      ]
+    },
+    {
+      "Sid": "ReadCacheObjects",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::skypilot-cairn-weights-*/*",
+        "arn:aws:s3:::skypilot-cairn-artifacts/*"
+      ]
+    }
+  ]
+}
