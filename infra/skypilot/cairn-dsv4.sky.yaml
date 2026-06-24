@@ -56,6 +56,13 @@ resources:
   #   ap-northeast-2 (Seoul) = ami-02f2234b443117395
   # Re-resolve per region: `aws ec2 describe-images --owners amazon --filters \
   #   "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20260619"`
+  #
+  # us-east-2 (Ohio) + us-west-2 (Oregon) default-VPC FIXED 2026-06-24: their default VPCs had a
+  # DETACHED internet gateway (igw-7f99db17 / igw-930aa8ea) still referenced by the main route table's
+  # 0.0.0.0/0 → a blackhole route. Instances got public IPs but no internet path, so SkyPilot SSH setup
+  # timed out (600s) on every box. Re-attached the IGWs via admin console → routes flipped blackhole→active.
+  # Both NA regions are now usable for spot launches. (cairn-skypilot is least-priv & can't manage IGWs;
+  # this was a one-time admin fix, not a policy change.) Ohio g7e is cheapest-in-world (~$1.19/box).
   image_id: ami-03cc3ae6c38cc7b29
   labels:
     cairn: "true"
