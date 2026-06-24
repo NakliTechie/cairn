@@ -100,7 +100,13 @@ setup: |
     git clone https://github.com/0xSero/deepseek-v4-flash-sm120 ~/dsv4
   fi
   cd ~/dsv4
-  sudo bash scripts/build_in_sglang_docker.sh    # ~30 min one-time CUDA-extension build
+  # idempotency guard: skip the ~30-min CUDA build if the kernel .so is already present (so a
+  # `sky launch` re-run on the same cluster doesn't pay the build again — maiden-run lesson).
+  if ! ls ~/dsv4/build-docker/deepseek_v4_kernel/*.so >/dev/null 2>&1; then
+    sudo bash scripts/build_in_sglang_docker.sh    # ~30 min one-time CUDA-extension build
+  else
+    echo "[setup] 0xSero kernel .so already built — skipping rebuild"
+  fi
 
   # 4. Pre-fetch FP8 weights (so the actual launch doesn't burn GPU $ on a download)
   # NOTE: this runs once per spot-instance — if the box is reclaimed mid-build, we lose this.
@@ -108,8 +114,11 @@ setup: |
   pip3 install -q --user "huggingface_hub[cli]" hf_transfer
   export HF_HUB_ENABLE_HF_TRANSFER=1
   mkdir -p ~/model
-  python3 -m huggingface_hub.commands.huggingface_cli download deepseek-ai/DeepSeek-V4-Flash \
-    --local-dir ~/model --token "$HF_TOKEN" || true
+  # huggingface_hub 1.x REMOVED the `huggingface_hub.commands.huggingface_cli` module path and
+  # renamed the CLI to `hf` (2026-06-24 maiden run: the old `python3 -m ...huggingface_cli download`
+  # threw ModuleNotFoundError, swallowed by `|| true` → empty ~/model → serve crashed). Use the stable
+  # snapshot_download Python API instead. V4-Flash is public (gated=false) so no token is required.
+  python3 -c "from huggingface_hub import snapshot_download; snapshot_download('deepseek-ai/DeepSeek-V4-Flash', local_dir='/home/ubuntu/model', max_workers=8)"
 
   # 5. Sanity checks
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
@@ -145,10 +154,14 @@ run: |
   # The common docker invocation: mount cairn + patch + weights, host network so ports work without -p,
   # pass HF_TOKEN + path-β env vars, run cairn_node.serve INSIDE the patched container.
   # WORKING DIR = /cairn so `python -u -m cairn_node.serve` resolves.
+  # MOUNT FIX (2026-06-24 maiden run): SkyPilot file_mounts land the cairn dirs at
+  # ~/.sky/file_mounts/cairn/ and put SYMLINKS at /cairn pointing there. Mounting `-v /cairn` into
+  # docker carried in dangling symlinks (their target ~/.sky/... isn't mounted) → cairn_node
+  # unimportable, serve crashed in 13s. Mount the REAL synced dir instead.
   DOCKER_RUN_COMMON="sudo docker run --rm --gpus all --shm-size=64g --ipc=host --network host \
     -v /home/ubuntu/dsv4/build-docker:/dsv4:ro \
     -v /home/ubuntu/model:/workspace/model:ro \
-    -v /cairn:/cairn:ro \
+    -v /home/ubuntu/.sky/file_mounts/cairn:/cairn:ro \
     -w /cairn \
     -e PYTHONPATH=/dsv4:/cairn:/cairn/fork:/cairn/scheduler/src \
     -e HF_TOKEN=$HF_TOKEN \
