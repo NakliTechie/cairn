@@ -75,6 +75,13 @@ file_mounts:
   /cairn/infra: ./infra
   /cairn/scheduler/src: ./scheduler/src   # serve_http imports cairn_scheduler — only this dir (the parent's
   #                                          stray scheduler/.venv would rsync-choke SSH, see 2026-06-23 history)
+  # 0xSero KERNEL CACHE (skips the ~30-min CUDA build on a fresh box). SkyPilot syncs this S3 prefix
+  # to the box using the CONTROLLER's creds (the box itself has no instance role). Keyed by the base-
+  # image digest — UPDATE this digest if `lmsysorg/sglang:deepseek-v4-blackwell` is re-pushed (the .so
+  # is ABI-bound to that image's CUDA/python). Populate is a manual controller step (boxes can't write
+  # S3): `aws s3 cp build-docker.tar.gz s3://skypilot-cairn-artifacts/dsv4-kernel/<digest>/`. If the
+  # prefix is empty/missing, setup falls through to a full rebuild. See infra/skypilot/CACHING.md.
+  /cairn-kernel-cache: s3://skypilot-cairn-artifacts/dsv4-kernel/408846afd1b0/
 
 setup: |
   set -uo pipefail
@@ -100,12 +107,21 @@ setup: |
     git clone https://github.com/0xSero/deepseek-v4-flash-sm120 ~/dsv4
   fi
   cd ~/dsv4
-  # idempotency guard: skip the ~30-min CUDA build if the kernel .so is already present (so a
-  # `sky launch` re-run on the same cluster doesn't pay the build again — maiden-run lesson).
-  if ! ls ~/dsv4/build-docker/deepseek_v4_kernel/*.so >/dev/null 2>&1; then
-    sudo bash scripts/build_in_sglang_docker.sh    # ~30 min one-time CUDA-extension build
+  # Kernel acquisition, cheapest-first (maiden-run lesson — the build is ~30 min of g7e time):
+  #   1. already built locally (sky-launch re-run on same cluster) → skip
+  #   2. S3 cache hit (file_mount /cairn-kernel-cache, keyed by image digest) → extract (~seconds)
+  #   3. cache miss → full CUDA build (then re-populate the cache from the controller, see CACHING.md)
+  if ls ~/dsv4/build-docker/deepseek_v4_kernel/*.so >/dev/null 2>&1; then
+    echo "[setup] 0xSero kernel .so already built locally — skipping"
+  elif [ -f /cairn-kernel-cache/build-docker.tar.gz ]; then
+    echo "[setup] restoring 0xSero kernel from S3 cache (skips the ~30-min build)"
+    tar xzf /cairn-kernel-cache/build-docker.tar.gz -C ~/dsv4
+    ls ~/dsv4/build-docker/deepseek_v4_kernel/*.so >/dev/null 2>&1 \
+      && echo "[setup] kernel restored from cache" \
+      || { echo "[setup] cache extract incomplete — falling back to build"; sudo bash scripts/build_in_sglang_docker.sh; }
   else
-    echo "[setup] 0xSero kernel .so already built — skipping rebuild"
+    echo "[setup] no local build, no S3 cache → building (~30 min)"
+    sudo bash scripts/build_in_sglang_docker.sh
   fi
 
   # 4. Pre-fetch FP8 weights (so the actual launch doesn't burn GPU $ on a download)
