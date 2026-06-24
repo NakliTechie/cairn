@@ -96,6 +96,38 @@ class _CairnFakePPGroup:
     def barrier(self, *a, **kw):     pass     # tolerate barrier no-op; some init paths call it
 
 
+def _set_pp_identity(group: Any, rank: int, size: int) -> None:
+    """Override an sglang pp GroupCoordinator's *partition identity* in place (path-β core).
+
+    sglang decides each box's layer slice from `get_pp_group().rank_in_group` / `.world_size`:
+    `DeepseekV*Model.__init__` reads them and passes `pp_rank`/`pp_size` to `make_layers`, which
+    calls `get_pp_indices` to compute `[start,end)`. We must make those read Cairn's `(k, N)`.
+
+    Why mutate-in-place from a `load_model` hook (not replace `get_pp_group` before ModelRunner):
+    `ModelRunner.__init__` runs `init_torch_distributed()` → `initialize_model_parallel(pp_size=1)`,
+    which REBUILDS the real `_PP` at world_size=1 *before* the model is constructed — silently
+    discarding any earlier patch (the 2026-06-24 maiden-run OOM: every box loaded the full model).
+    So we mutate the REAL group object (keeping all its real methods) from inside a wrapper around
+    `ModelRunner.load_model`, which runs AFTER that re-init and right before the model is built. The
+    actual torch process group still has ONE rank → no NCCL collective ever crosses a box (Cairn's
+    own wire drives the forward; `world_size` here is only READ for the loader's layer partition).
+    """
+    group.world_size = size
+    group.rank_in_group = rank
+    try:
+        group.ranks = list(range(size))
+    except Exception:  # pragma: no cover - defensive; .ranks shape varies across sglang versions
+        pass
+    # is_first_rank / is_last_rank gate embed_tokens / norm+lm_head construction. If they're @property
+    # (derive live from the attrs above) we're already correct; if they're plain attributes, set them.
+    for attr, val in (("is_first_rank", rank == 0), ("is_last_rank", rank == size - 1)):
+        if not isinstance(getattr(type(group), attr, None), property):
+            try:
+                setattr(group, attr, val)
+            except Exception:  # pragma: no cover
+                pass
+
+
 class SglangNodeRuntime(NodeRuntime):
     """Serve one contiguous block of layers via SGLang (rung 2/3, GPU).
 
@@ -131,7 +163,8 @@ class SglangNodeRuntime(NodeRuntime):
 
     def __init__(self, model: str, layer_range: LayerRange, device: str = "cuda:0",
                  quant=None, *, cairn_pp_rank: Optional[int] = None,
-                 cairn_pp_size: Optional[int] = None) -> None:
+                 cairn_pp_size: Optional[int] = None,
+                 cairn_pp_partition: Optional[list] = None) -> None:
         super().__init__(model, layer_range, device)
         self.quant = quant                       # None = the model's native dtype (don't force a quant)
         parts = device.split(":")                # tolerate "cpu"/"cuda"/"cuda:N" without crashing (L1)
@@ -141,6 +174,15 @@ class SglangNodeRuntime(NodeRuntime):
         size = cairn_pp_size if cairn_pp_size is not None else os.environ.get("CAIRN_PP_SIZE")
         self.cairn_pp_rank = int(rank) if rank is not None else None
         self.cairn_pp_size = int(size) if size is not None else None
+        # Optional EXPLICIT layer partition (per-stage layer counts, e.g. [15,14,14] for 43 layers).
+        # Pins sglang's slice boundaries to Cairn's via SGLANG_PP_LAYER_PARTITION, instead of relying
+        # on sglang's even-split default — required when Cairn's split differs (it does: front-loaded
+        # vs sglang's remainder-last) and the door to memory-balanced non-uniform splits (MoE layers
+        # are far heavier than the few dense layers). None ⇒ fall back to sglang's even split.
+        part = cairn_pp_partition if cairn_pp_partition is not None else os.environ.get("CAIRN_PP_LAYER_PARTITION")
+        if isinstance(part, str):
+            part = [int(x) for x in part.split(",") if x.strip()] or None
+        self.cairn_pp_partition = list(part) if part else None
         if (self.cairn_pp_rank is None) != (self.cairn_pp_size is None):
             raise ValueError("cairn_pp_rank and cairn_pp_size must be set together (or both None)")
         if self.cairn_pp_size is not None:
@@ -174,15 +216,43 @@ class SglangNodeRuntime(NodeRuntime):
             sock = socket.socket(); sock.bind(("", 0)); port = sock.getsockname()[1]; sock.close()
             sa = ServerArgs(model_path=self.model, tp_size=1, pp_size=1, mem_fraction_static=mem,
                             disable_cuda_graph=True, trust_remote_code=True)
-            # Path-β: monkey-patch get_pp_group BEFORE ModelRunner so make_layers sees the fake.
-            # sglang's own distributed init still runs world_size=1 (no NCCL across nodes); only the
-            # LOADER's view of pp_rank/pp_size is overridden so it partitions weights to our slice.
-            saved_get_pp_group = None
+            # Path-β layer slicing (2026-06-24 root-cause + rewrite — replaces the get_pp_group patch
+            # that was silently discarded by ModelRunner's dist re-init; see _set_pp_identity docstring).
+            #   (1) Pin the exact slice boundaries via SGLANG_PP_LAYER_PARTITION (so sglang's
+            #       get_pp_indices matches Cairn's layer_range — incl. front-loaded / non-uniform splits).
+            #   (2) Wrap ModelRunner.load_model — runs AFTER init_torch_distributed, just before the
+            #       model is built — to mutate the live _PP to (k, N). The model then reads
+            #       get_pp_group() = (k, N) → make_layers slices → only our layers materialize.
+            # ⚠ GPU-UNVERIFIED (box torn down before re-test): confirm on next launch (a) `load_model`
+            # is the post-dist-init hook point, (b) is_first/last_rank derive from the attrs we set,
+            # (c) PPMissingLayer outside the slice + per-box VRAM ~slice-sized, not full.
+            saved_load_model = None
             if self.cairn_pp_size is not None and self.cairn_pp_size > 1:
-                import sglang.srt.distributed.parallel_state as _pstate
-                saved_get_pp_group = _pstate.get_pp_group
-                fake = _CairnFakePPGroup(self.cairn_pp_rank, self.cairn_pp_size)
-                _pstate.get_pp_group = lambda fake=fake: fake
+                k, N = self.cairn_pp_rank, self.cairn_pp_size
+                if self.cairn_pp_partition is not None:
+                    if len(self.cairn_pp_partition) != N:
+                        raise ValueError(
+                            f"cairn_pp_partition {self.cairn_pp_partition} must have cairn_pp_size={N} "
+                            f"entries (one layer-count per stage)"
+                        )
+                    os.environ["SGLANG_PP_LAYER_PARTITION"] = ",".join(str(x) for x in self.cairn_pp_partition)
+                if not hasattr(ModelRunner, "load_model"):
+                    raise RuntimeError(
+                        "path-β: ModelRunner has no 'load_model' to hook — sglang internals changed; "
+                        "update the load_model wrapper hook point in fork/shard/sglang_node.py."
+                    )
+                saved_load_model = ModelRunner.load_model
+
+                def _cairn_load_model(_mr, *a, _orig=saved_load_model, _k=k, _N=N, **kw):
+                    # Runs after ModelRunner.init_torch_distributed() rebuilt the real _PP (world_size=1);
+                    # set it to our (k, N) so the model-under-construction slices to our layers.
+                    import sglang.srt.distributed.parallel_state as _pstate
+                    grp = getattr(_pstate, "_PP", None)
+                    if grp is not None:
+                        _set_pp_identity(grp, _k, _N)
+                    return _orig(_mr, *a, **kw)
+
+                ModelRunner.load_model = _cairn_load_model
             try:
                 runner = ModelRunner(
                     model_config=ModelConfig.from_server_args(sa), mem_fraction_static=mem,
@@ -194,9 +264,8 @@ class SglangNodeRuntime(NodeRuntime):
                     nccl_port=port, server_args=sa,
                 )
             finally:
-                if saved_get_pp_group is not None:
-                    import sglang.srt.distributed.parallel_state as _pstate
-                    _pstate.get_pp_group = saved_get_pp_group
+                if saved_load_model is not None:
+                    ModelRunner.load_model = saved_load_model     # never leak the wrapper to other loads
             SglangNodeRuntime._SHARED[key] = runner
         self._runner = runner
         self._inner = runner.model.model
