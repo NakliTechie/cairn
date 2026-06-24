@@ -52,3 +52,4 @@ infra/skypilot/launch-log.jsonl
 # Live HTML report — generated locally each turn (report/gen.py is tracked; its output + journal aren't).
 report/cairn-report.html
 report/journal.jsonl
+.cache/
