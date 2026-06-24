@@ -187,6 +187,10 @@ class SglangNodeRuntime(NodeRuntime):
                 runner = ModelRunner(
                     model_config=ModelConfig.from_server_args(sa), mem_fraction_static=mem,
                     gpu_id=self.device_index, tp_rank=0, tp_size=1, pp_rank=0, pp_size=1,
+                    # MoE expert-parallel rank/size — REQUIRED by the sglang build in the V4-Blackwell
+                    # image (added for MoE models like V4). Cairn splits by LAYER, not by expert, so
+                    # each box holds ALL experts for its layer slice → no EP sharding (rank 0, size 1).
+                    moe_ep_rank=0, moe_ep_size=1,
                     nccl_port=port, server_args=sa,
                 )
             finally:
