@@ -73,21 +73,34 @@ so the least-priv key can read/write it; `s3:CreateBucket` on that pattern is al
   — update the digest in the file_mount and re-populate. A stale/missing prefix degrades gracefully
   to a full rebuild.
 
-### 2. Weights — NEXT (the bigger win, the hotswap enabler, the scale unlock)
+### 2. Weights — WIRED (lazy, 2026-06-24); populate is the remaining manual step
 This is where "download once, fan out" pays off most. See the core principle above.
-- **Bucket lives in the launch region** (`skypilot-cairn-weights-<region>`, e.g. `skypilot-cairn-weights-eu-south-2`).
-  The `skypilot-` prefix is REQUIRED: the cairn-skypilot IAM key's S3 access is scoped to `skypilot-*`/
-  `sky-*` buckets, so a bare `cairn-weights-*` name couldn't be created or populated by the least-priv
-  key (same reason `skypilot-cairn-artifacts` works). Cross-region defeats the purpose — the whole
-  point is the same-region backbone. One bucket per region we launch in; populate lazily per model.
-- **Populate once (per model+revision):** one-time `HF → S3`. Either controller-side
-  (`aws s3 sync` after a single HF pull) or, opportunistically, from a box that already has the
-  weights (give it the read/write role transiently). After that, HF never sees this model again.
-- **Fan out (every box, every launch):** each box `aws s3 sync s3://skypilot-cairn-weights-<region>/
-  <model>/<revision>/ ~/model` — **direct, parallel, in-region**. NOT via SkyPilot file_mounts
-  (don't funnel 150 GB × N through the controller). Requires the read **instance profile** (below).
-- **Cost:** ~150 GB × ~$0.023/GB-mo ≈ **$3.5/mo** per cached model. Trivial vs the GPU-time and HF
-  egress saved — and it drops to near-zero per *box* added (the win compounds with fleet size).
+- **Buckets EXIST in all 4 launchable regions** (`skypilot-cairn-weights-{eu-south-2,us-east-2,
+  us-west-2,ap-northeast-2}`) so any region can be the cheapest at launch time. The `skypilot-`
+  prefix is REQUIRED (the cairn-skypilot IAM key's S3 scope is `skypilot-*`/`sky-*`). Cross-region
+  defeats the purpose — `cairn-dsv4.sky.yaml` setup auto-detects the box's region (IMDSv2) and pulls
+  from THAT region's bucket.
+- **Fan out — WIRED:** setup step 4 does `aws s3 sync s3://skypilot-cairn-weights-<region>/
+  deepseek-v4-flash/main ~/model` if the object exists, else falls back to HF. Each box pulls
+  directly + in-region (not via the controller). Auth: the **read-only `cairn-s3-cache` key**
+  (CAIRN_S3_CACHE_* in secrets.env, passed via --env) — chosen over an instance profile for now
+  (simpler; instance profile is the scale follow-up below).
+- **Populate (lazy, per region+model) — MANUAL, the remaining step.** First launch in a region is a
+  cache MISS (HF fallback). To make the NEXT launch there a hit, stage the bucket once via a cheap
+  in-region CPU box (HF → S3), using cairn-skypilot WRITE creds (transient box, torn down):
+  ```sh
+  # one-time per region R (e.g. R=us-east-2). ~$0.10, ~30 min, no GPU.
+  sky launch -c wpop --cloud aws --region $R --instance-type m6i.2xlarge --disk-size 400 -y --down \
+    --env HF_TOKEN --env R=$R --env B=skypilot-cairn-weights-$R 'bash -c "
+      export HF_HUB_ENABLE_HF_TRANSFER=1
+      pip install -q hf_transfer huggingface_hub awscli
+      python3 -c \"from huggingface_hub import snapshot_download; snapshot_download('"'"'deepseek-ai/DeepSeek-V4-Flash'"'"', local_dir='"'"'/tmp/m'"'"', max_workers=8)\"
+      aws s3 sync /tmp/m s3://$B/deepseek-v4-flash/main --region $R --only-show-errors"'
+  # NOTE: the populate box needs S3 WRITE — pass cairn-skypilot creds (it has s3:* on skypilot-*), or
+  # better, mint a scoped write key. cairn-s3-cache is read-only by design (it rides on GPU boxes).
+  ```
+- **Cost:** ~150 GB × ~$0.023/GB-mo ≈ **$3.5/mo** per cached model+region. Lazy ⇒ pay only for
+  regions actually used. Drops to near-zero per *box* added (the win compounds with fleet size).
 - **Hotswap / recovery payoff (the reason this matters beyond cost):**
   - **Spare promotion / post-reclaim replacement:** a replacement box loads weights from in-region S3
     in a fraction of the HF time → lower MTTR for the catastrophic-recovery path (Path 2 durable-star).

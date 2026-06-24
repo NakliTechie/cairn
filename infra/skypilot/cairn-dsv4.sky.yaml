@@ -25,7 +25,9 @@
 # Launch (after `aws sso login --profile cairn-skypilot`):
 #   set -a; source infra/secrets.env; set +a
 #   sky launch -c cairn-dsv4 infra/skypilot/cairn-dsv4.sky.yaml --env HF_TOKEN --env SHARD_PSK \
-#     --env CAIRN_API_KEY=sk-cairn-demo -i 60 --down -d
+#     --env CAIRN_API_KEY=sk-cairn-demo \
+#     --env CAIRN_S3_CACHE_ACCESS_KEY_ID --env CAIRN_S3_CACHE_SECRET_ACCESS_KEY -i 60 --down -d
+#   # (the two CAIRN_S3_CACHE_* vars pull weights from in-region S3 if present; absent → HF fallback)
 #   ssh -L 8888:localhost:8000 cairn-dsv4 -N &
 #   curl localhost:8888/v1/chat/completions -H 'authorization: Bearer sk-cairn-demo' \
 #     -H 'content-type: application/json' \
@@ -124,17 +126,32 @@ setup: |
     sudo bash scripts/build_in_sglang_docker.sh
   fi
 
-  # 4. Pre-fetch FP8 weights (so the actual launch doesn't burn GPU $ on a download)
-  # NOTE: this runs once per spot-instance — if the box is reclaimed mid-build, we lose this.
-  # For a session with multiple iterations, consider an S3-backed model cache (Path-2 territory).
-  pip3 install -q --user "huggingface_hub[cli]" hf_transfer
-  export HF_HUB_ENABLE_HF_TRANSFER=1
+  # 4. Acquire FP8 weights, cheapest-first (2026-06-24 — download-once-to-S3, fan-out per CACHING.md):
+  #    1. IN-REGION S3 cache hit → aws s3 sync over the AWS backbone (fast, no HF egress/rate-limits).
+  #       Uses the cairn-s3-cache READ-ONLY key (CAIRN_S3_CACHE_*) — NOT the powerful cairn-skypilot key.
+  #    2. miss → HF download (snapshot_download). huggingface_hub 1.x removed the .commands CLI path, so
+  #       use the stable Python API (V4-Flash is public, no token). A miss = "lazy populate": the
+  #       controller stages this region's bucket once before/after, so the NEXT launch here is a hit.
   mkdir -p ~/model
-  # huggingface_hub 1.x REMOVED the `huggingface_hub.commands.huggingface_cli` module path and
-  # renamed the CLI to `hf` (2026-06-24 maiden run: the old `python3 -m ...huggingface_cli download`
-  # threw ModuleNotFoundError, swallowed by `|| true` → empty ~/model → serve crashed). Use the stable
-  # snapshot_download Python API instead. V4-Flash is public (gated=false) so no token is required.
-  python3 -c "from huggingface_hub import snapshot_download; snapshot_download('deepseek-ai/DeepSeek-V4-Flash', local_dir='/home/ubuntu/model', max_workers=8)"
+  export HF_HUB_ENABLE_HF_TRANSFER=1
+  # auto-detect THIS box's region (IMDSv2) so we shop any region and still pull same-region S3
+  _TOK=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
+  REGION=$(curl -s -H "X-aws-ec2-metadata-token: $_TOK" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+  S3="s3://skypilot-cairn-weights-${REGION}/deepseek-v4-flash/main"
+  HIT=""
+  if [ -n "${CAIRN_S3_CACHE_ACCESS_KEY_ID:-}" ] && command -v aws >/dev/null 2>&1; then
+    if AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
+       aws s3 ls "$S3/config.json" --region "$REGION" >/dev/null 2>&1; then HIT=1; fi
+  fi
+  if [ -n "$HIT" ]; then
+    echo "[setup] S3 cache HIT ($REGION) — syncing weights from $S3 (in-region backbone)"
+    AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
+      aws s3 sync "$S3" ~/model --region "$REGION" --only-show-errors
+  else
+    echo "[setup] S3 cache MISS ($REGION) — downloading weights from HF (lazy-populate the bucket separately)"
+    pip3 install -q --user "huggingface_hub[cli]" hf_transfer
+    python3 -c "from huggingface_hub import snapshot_download; snapshot_download('deepseek-ai/DeepSeek-V4-Flash', local_dir='/home/ubuntu/model', max_workers=8)"
+  fi
 
   # 5. Sanity checks
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
@@ -244,3 +261,7 @@ envs:
   HF_TOKEN: ""
   SHARD_PSK: ""
   CAIRN_API_KEY: "sk-cairn-demo"
+  # cairn-s3-cache READ-ONLY key (in secrets.env) → setup step 4 syncs weights from in-region S3.
+  # Empty default ⇒ setup falls back to HF (so the yaml still works before the key exists).
+  CAIRN_S3_CACHE_ACCESS_KEY_ID: ""
+  CAIRN_S3_CACHE_SECRET_ACCESS_KEY: ""
