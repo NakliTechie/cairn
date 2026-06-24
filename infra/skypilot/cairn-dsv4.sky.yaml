@@ -185,7 +185,13 @@ run: |
     -e CAIRN_SGLANG_MEM_FRACTION=$CAIRN_SGLANG_MEM_FRACTION \
     -e CAIRN_PP_RANK=$PP_RANK \
     -e CAIRN_PP_SIZE=3 \
+    -e CAIRN_PP_LAYER_PARTITION=15,14,14 \
     lmsysorg/sglang:deepseek-v4-blackwell"
+  # CAIRN_PP_LAYER_PARTITION = per-stage layer COUNTS; MUST match the case split above
+  # (rank0 [0,15)=15, rank1 [15,29)=14, rank2 [29,43)=14). The loader pins sglang's
+  # SGLANG_PP_LAYER_PARTITION to this so make_layers slices to exactly these boundaries (the
+  # 2026-06-24 path-β fix — sglang's even-split default is remainder-LAST = 14,14,15, which would
+  # NOT match this front-loaded split). Future: rebalance for MoE memory (experts ≫ dense layers).
 
   if [ "$RANK" = "0" ]; then
     # ENTRY (0..15) -> middle on $IP1:7777
