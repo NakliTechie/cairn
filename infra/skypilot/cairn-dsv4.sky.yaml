@@ -83,7 +83,7 @@ file_mounts:
   # is ABI-bound to that image's CUDA/python). Populate is a manual controller step (boxes can't write
   # S3): `aws s3 cp build-docker.tar.gz s3://skypilot-cairn-artifacts/dsv4-kernel/<digest>/`. If the
   # prefix is empty/missing, setup falls through to a full rebuild. See infra/skypilot/CACHING.md.
-  /cairn-kernel-cache: s3://skypilot-cairn-artifacts/dsv4-kernel/408846afd1b0/
+  /cairn-kernel-cache: s3://skypilot-cairn-artifacts/dsv4-kernel/408846afd1b0
 
 setup: |
   set -uo pipefail
