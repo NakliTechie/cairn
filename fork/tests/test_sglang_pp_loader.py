@@ -476,3 +476,105 @@ def test_load_weights_fix_preserves_tail_and_delegates(monkeypatch):
     proxy = _LoadTimeAllRanksPPGroup(_Real())
     assert proxy.is_first_rank is True and proxy.is_last_rank is True
     assert proxy.world_size == 3 and proxy.rank_in_group == 2   # delegated to the real group
+
+
+# ----------------- (5) post_load_weights skips PPMissingLayer (the step after the norm gate) ------
+#
+# REGRESSION for the 2026-06-25 box error AFTER the norm-gate fix: load_weights passed the strict
+# check, then sglang's post_load_weights V4 APE-hotfix pass did `for layer in self.model.layers:
+# layer.self_attn` (deepseek_v4.py ~L1506) — but out-of-slice layers are weightless PPMissingLayer
+# stubs (the proof slicing works) with no `self_attn` → AttributeError. The fix guards the loop with
+# getattr(layer, "self_attn", None); the hotfix only applies to real in-slice layers.
+
+
+def _install_fake_v4_for_post_load(monkeypatch, *, fp8_wo_a: bool = False):
+    """Install a fake deepseek_v4 whose DeepseekV4ForCausalLM.post_load_weights replicates the real
+    APE-hotfix loop over self.model.layers — with PPMissingLayer stubs interleaved among real layers
+    (as under Cairn's slicing). Returns (model class, hotfixed-layer-id recorder, model instance)."""
+    hotfixed: list = []
+
+    class _PPMissingLayer:                       # the real sglang stub has no .self_attn
+        pass
+
+    class _Compressor:
+        ape_converted = False
+        def apply_ape_hotfix(self):
+            self.ape_converted = True
+
+    class _SelfAttn:
+        def __init__(self, lid):
+            self.layer_id = lid
+            self.compress_ratio = 1              # != 0 → real layers get the compressor hotfix
+            self.compressor = _Compressor()
+            self.indexer = type("I", (), {"compressor": _Compressor()})()
+
+    class _RealLayer:
+        def __init__(self, lid):
+            self.self_attn = _SelfAttn(lid)
+            self.self_attn.compressor._lid = lid
+
+    class _Inner:
+        def __init__(self):
+            # slice [15,29) materialized; layers 0..14 + 29..42 are PPMissingLayer placeholders
+            self.layers = [
+                _RealLayer(i) if 15 <= i < 29 else _PPMissingLayer() for i in range(43)
+            ]
+
+    class DeepseekV4ForCausalLM:
+        def __init__(self):
+            self.model = _Inner()
+        def _setup_fp8_wo_a_scales(self, is_nextn):
+            pass
+        def post_load_weights(self, is_nextn=False, weight_names=None):
+            if getattr(_mod, "_FP8_WO_A_GEMM", False):
+                self._setup_fp8_wo_a_scales(is_nextn)
+            if is_nextn:
+                return
+            for layer in self.model.layers:                  # UNGUARDED (the bug)
+                self_attn = layer.self_attn                  # PPMissingLayer → AttributeError
+                if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
+                    self_attn.compressor.apply_ape_hotfix()
+                    hotfixed.append(self_attn.layer_id)
+
+    for modname in ("sglang", "sglang.srt", "sglang.srt.models"):
+        monkeypatch.setitem(sys.modules, modname, sys.modules.get(modname) or types.ModuleType(modname))
+    _mod = types.ModuleType("sglang.srt.models.deepseek_v4")
+    _mod.DeepseekV4ForCausalLM = DeepseekV4ForCausalLM
+    _mod._FP8_WO_A_GEMM = fp8_wo_a
+    monkeypatch.setitem(sys.modules, "sglang.srt.models.deepseek_v4", _mod)
+    return DeepseekV4ForCausalLM, hotfixed
+
+
+def test_post_load_weights_crashes_on_ppmissing_without_fix(monkeypatch):
+    """CONTROL — reproduce the box AttributeError: the unguarded hotfix loop trips over the
+    PPMissingLayer stubs the layer-split leaves at out-of-slice indices."""
+    cls, _ = _install_fake_v4_for_post_load(monkeypatch)
+    with pytest.raises(AttributeError, match="self_attn"):
+        cls().post_load_weights()
+
+
+def test_post_load_weights_fix_skips_ppmissing(monkeypatch):
+    """THE FIX — after _install_post_load_weights_fix(), the pass skips PPMissingLayer stubs and
+    hotfixes ONLY the real in-slice layers [15,29). (Asserts via the ape_converted flag the fix
+    sets — the installed fix is sglang_node's own impl, not the fake's recorder.)"""
+    from shard.sglang_node import _install_post_load_weights_fix
+    cls, _ = _install_fake_v4_for_post_load(monkeypatch)
+    _install_post_load_weights_fix()
+    m = cls()
+    m.post_load_weights()                         # must NOT raise on the PPMissingLayer stubs
+    for i, layer in enumerate(m.model.layers):
+        sa = getattr(layer, "self_attn", None)
+        if 15 <= i < 29:
+            assert sa is not None and sa.compressor.ape_converted is True   # real layer hotfixed
+        else:
+            assert sa is None                     # PPMissingLayer placeholder, skipped
+
+
+def test_post_load_weights_fix_idempotent(monkeypatch):
+    """Installing twice is a no-op (guard flag)."""
+    from shard.sglang_node import _install_post_load_weights_fix
+    cls, _ = _install_fake_v4_for_post_load(monkeypatch)
+    _install_post_load_weights_fix()
+    once = cls.post_load_weights
+    _install_post_load_weights_fix()
+    assert cls.post_load_weights is once
