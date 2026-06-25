@@ -304,6 +304,7 @@ class SglangNodeRuntime(NodeRuntime):
                 raise ValueError(f"cairn_pp_size must be ≥ 1 (got {self.cairn_pp_size})")
         self._runner = None
         self._inner = None                       # the inner decoder model (.layers/.embed_tokens/.norm)
+        self._is_v4 = False                      # set in load_shard: DeepSeek-V4 hyper-connection forward path
         self._batches: Dict[str, Any] = {}       # seq_id -> SGLang ScheduleBatch (KV lifecycle)
         self._steps: Dict[str, int] = {}         # seq_id -> forward count (0 = needs prefill)
 
@@ -387,6 +388,10 @@ class SglangNodeRuntime(NodeRuntime):
             SglangNodeRuntime._SHARED[key] = runner
         self._runner = runner
         self._inner = runner.model.model
+        # DeepSeek-V4 uses a different layer contract than the residual-stream models the generic
+        # forward was proven on (hyper-connection 3D hidden, internal residual, 5-arg layers,
+        # hc_head+norm tail). Detect it by its hallmark attr and drive it via the V4 forward path.
+        self._is_v4 = hasattr(self._inner, "hc_mult")
         n = len(self._inner.layers)
         s, e = self.layer_range.start, self.layer_range.end   # end EXCLUSIVE (LayerRange convention)
         if not (0 <= s < e <= n):
@@ -434,7 +439,7 @@ class SglangNodeRuntime(NodeRuntime):
                 reqs=[req], req_to_token_pool=self._runner.req_to_token_pool,
                 token_to_kv_pool_allocator=self._runner.token_to_kv_pool_allocator, tree_cache=None,
                 model_config=self._runner.model_config, enable_overlap=False,
-                spec_algorithm=SpeculativeAlgorithm.NONE, enable_custom_logit_processor=False,
+                spec_algorithm=SpeculativeAlgorithm.NONE,   # init_new dropped enable_custom_logit_processor
             )
             batch.prepare_for_extend()
             self._batches[seq] = batch
@@ -446,24 +451,61 @@ class SglangNodeRuntime(NodeRuntime):
         fb = ForwardBatch.init_new(batch.get_model_worker_batch(), self._runner)
         self._runner.attn_backend.init_forward_metadata(fb)   # flashinfer metadata for this batch
 
+        self._steps[seq] = step + 1
+        return self._forward_layers(x, fb, s_len)
+
+    def _forward_layers(self, x: Any, fb: Any, s_len: int) -> Any:
+        """Drive this stage's `[start,end)` layers over the incoming hidden and return the per-stage
+        output: the next-stage hidden hand-off, or — at the tail — next-token logits. Branches on
+        model architecture, since the layer/residual/tail contract differs.
+
+        V4 (DeepSeek-V4-Flash, hyper-connection): hidden is 3D `[S, hc_mult, H]` (embed then
+        `unsqueeze(1).repeat(1,hc,1)`); each layer is
+        `(positions, hidden_states, input_ids, forward_batch, input_ids_global) -> tensor` with the
+        residual folded INTERNALLY (nothing crosses the wire but the one hidden tensor); the tail does
+        `hc_head` (collapse the hc dim) -> single-arg `norm` -> `lm_head`. `input_ids_global == input_ids`
+        at tp=1/dp=1. NOTE: mid/tail stages pass dummy `input_ids` (the wire carries only hidden); V4's
+        MoE routes on the hidden and only touches input_ids in the bypassed DP/EP gather, so this is
+        correct for single-GPU stages — if a decode ever comes out incoherent, carry real ids on the wire.
+
+        Residual-stream (PROVEN on L4 2026-06-21; e.g. Llama): flat `[S, H]` hidden, layers return
+        `(hidden, residual)`, the boundary folds `hidden+residual`, the tail is `norm(hidden, residual)`."""
+        m = self._runner.model
+        ids = fb.input_ids                                    # real on entry; dummy [0]* on mid/tail
+        if self._is_v4:
+            hc = self._inner.hc_mult
+            if self._is_embed:
+                hidden = self._inner.embed_tokens(ids)                       # [S, H]
+                hidden = hidden.unsqueeze(1).repeat(1, hc, 1)               # [S, hc_mult, H]
+            else:
+                hidden = x.reshape(-1, hc, x.shape[-1])                     # wire [1,S,hc,H] -> [S,hc,H]
+            for i in range(self._start, self._end):
+                hidden = self._inner.layers[i](
+                    positions=fb.positions, hidden_states=hidden,
+                    input_ids=ids, forward_batch=fb, input_ids_global=ids,
+                )
+            if self._is_tail:
+                hidden = self._inner.hc_head(                                # collapse the hc_mult dim
+                    hidden, self._inner.hc_head_fn, self._inner.hc_head_scale, self._inner.hc_head_base)
+                hidden = self._inner.norm(hidden)                           # V4 norm: single-arg
+                logits = m.logits_processor(ids, hidden, m.lm_head, fb).next_token_logits
+                return logits.reshape(1, -1, logits.shape[-1])              # [1, 1, V]
+            return hidden.reshape(1, s_len, hc, -1)                         # [1, S, hc_mult, H] -> next
+
         if self._is_embed:
-            hidden = self._inner.embed_tokens(fb.input_ids)
+            hidden = self._inner.embed_tokens(ids)
             residual = None
         else:
-            hidden = x.reshape(-1, x.shape[-1])          # [1,S,H] -> flat [S,H] (SGLang token layout)
+            hidden = x.reshape(-1, x.shape[-1])                            # [1,S,H] -> flat [S,H]
             residual = None
         for i in range(self._start, self._end):
             hidden, residual = self._inner.layers[i](fb.positions, hidden, fb, residual)
-        self._steps[seq] = step + 1
-
         if self._is_tail:
             hidden, _ = self._inner.norm(hidden, residual)
-            logits = self._runner.model.logits_processor(
-                fb.input_ids, hidden, self._runner.model.lm_head, fb
-            ).next_token_logits
-            return logits.reshape(1, -1, logits.shape[-1])   # [1, 1, V] — the harness takes [:, -1]
+            logits = m.logits_processor(ids, hidden, m.lm_head, fb).next_token_logits
+            return logits.reshape(1, -1, logits.shape[-1])                 # [1, 1, V]
         folded = hidden + residual if residual is not None else hidden
-        return folded.reshape(1, s_len, -1)                  # [1, S, H] hand-off to the next stage
+        return folded.reshape(1, s_len, -1)                                # [1, S, H] -> next stage
 
     # ---- warmup: pre-compile the flashinfer JIT kernels so the first REAL forward isn't where it lands ----
     def warmup(self, n_tokens: int = 4) -> None:
