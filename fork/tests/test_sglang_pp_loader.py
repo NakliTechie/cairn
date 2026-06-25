@@ -348,3 +348,131 @@ def test_pp_size_in_shared_cache_key(monkeypatch):
     b.load_shard()
     assert a._runner is not b._runner   # different keys → different runners
     SglangNodeRuntime._SHARED.clear()
+
+
+# ----------------- (4) load-time norm-gate fix (V4 per-layer compressor.norm) --------------------
+#
+# REGRESSION for the 2026-06-25 box failure: slicing engaged (the maiden-run OOM was gone), but the
+# run died one step later at sglang's strict weight-init check — `model.layers.{29..42}.self_attn.
+# {compressor,indexer.compressor}.norm.weight` + `model.norm.weight` "not initialized". Root cause:
+# deepseek_v4.py load_weights skips embed weights when `not pp_group.is_first_rank` and skips ANY
+# `.norm.` weight when `not pp_group.is_last_rank`. Those are @property values derived from the
+# GLOBAL torch rank (0) — NOT the rank_in_group our slicing sets — so is_last_rank is False on every
+# stage, dropping V4's per-layer compressor.norm (which also matches `.norm.`). The fix forces both
+# gates open for the load via a pp_group proxy (safe: embed/norm/lm_head are built unconditionally,
+# so loading them on every stage is memory-neutral; the LAYER-slice gate uses start/end_layer).
+
+
+def _install_fake_v4_model(monkeypatch, *, is_last_rank: bool, is_first_rank: bool = True):
+    """Install a fake `sglang.srt.models.deepseek_v4` whose DeepseekV4ForCausalLM.load_weights
+    replicates the real per-stage skip gate + strict check (deepseek_v4.py ~L1814/1818/1934).
+    is_first/is_last_rank are @property on pp_group (as in the real GroupCoordinator) so they can't
+    be setattr'd — only the load-time proxy can override them. Returns (model class, loaded-name set)."""
+    loaded: set = set()
+
+    class _PPGroup:
+        world_size = 3            # plain attrs the proxy must DELEGATE (the layer-slice gate reads them)
+        rank_in_group = 1
+        @property
+        def is_first_rank(self):  # noqa: ANN001 — derived like the real GroupCoordinator; not setattr-able
+            return is_first_rank
+        @property
+        def is_last_rank(self):
+            return is_last_rank
+
+    class DeepseekV4ForCausalLM:
+        def __init__(self):
+            self.pp_group = _PPGroup()
+        def load_weights(self, weights):
+            loaded.clear()
+            params = set(weights)                         # stand-in for params_dict (all are real params)
+            for name in weights:
+                if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                    continue
+                if ".norm." in name and not self.pp_group.is_last_rank:   # the over-broad gate
+                    continue
+                loaded.add(name)
+            unloaded = params - loaded
+            if unloaded:                                  # mirrors deepseek_v4.py:1934
+                raise RuntimeError(f"Some weights are not initialized from checkpoints: {unloaded}")
+            return loaded
+
+    for modname in ("sglang", "sglang.srt", "sglang.srt.models"):
+        monkeypatch.setitem(sys.modules, modname, sys.modules.get(modname) or types.ModuleType(modname))
+    mod = types.ModuleType("sglang.srt.models.deepseek_v4")
+    mod.DeepseekV4ForCausalLM = DeepseekV4ForCausalLM
+    monkeypatch.setitem(sys.modules, "sglang.srt.models.deepseek_v4", mod)
+    return DeepseekV4ForCausalLM, loaded
+
+
+# the weights a non-tail stage must load: V4's per-layer sparse-attn norms + a non-norm control.
+_STAGE_WEIGHTS = [
+    "model.layers.29.self_attn.compressor.norm.weight",
+    "model.layers.29.self_attn.indexer.compressor.norm.weight",
+    "model.norm.weight",
+    "model.layers.29.self_attn.wkv.weight",     # non-norm control — always loads
+]
+
+
+def test_load_weights_gate_drops_norms_without_fix(monkeypatch):
+    """CONTROL — reproduce the box failure: with is_last_rank False the gate drops EVERY `.norm.`
+    weight (incl. the per-layer compressor.norm) → the strict check raises 'not initialized'."""
+    cls, _ = _install_fake_v4_model(monkeypatch, is_last_rank=False)
+    with pytest.raises(RuntimeError, match="not initialized from checkpoints") as ei:
+        cls().load_weights(_STAGE_WEIGHTS)
+    assert "compressor.norm.weight" in str(ei.value)     # the V4 per-layer norm was dropped
+
+
+def test_load_weights_rank_fix_loads_norms(monkeypatch):
+    """THE FIX — after _install_load_weights_rank_fix(), load_weights views pp_group as all-ranks-
+    True, so the per-layer compressor.norm/indexer.compressor.norm (+ final norm) load even on a
+    stage whose real is_last_rank is False. No strict-check raise."""
+    from shard.sglang_node import _install_load_weights_rank_fix
+    cls, loaded = _install_fake_v4_model(monkeypatch, is_last_rank=False)
+    _install_load_weights_rank_fix()
+    cls().load_weights(_STAGE_WEIGHTS)                    # must NOT raise
+    for n in _STAGE_WEIGHTS:
+        assert n in loaded, f"{n} should load with the fix"
+
+
+def test_load_weights_rank_fix_restores_pp_group(monkeypatch):
+    """The proxy is installed only for the call — pp_group must be the real group again afterward
+    (no leak: post-load code reading is_last_rank must see the true value)."""
+    from shard.sglang_node import _install_load_weights_rank_fix, _LoadTimeAllRanksPPGroup
+    cls, _ = _install_fake_v4_model(monkeypatch, is_last_rank=False)
+    _install_load_weights_rank_fix()
+    m = cls()
+    real = m.pp_group
+    m.load_weights(["model.norm.weight"])
+    assert m.pp_group is real and not isinstance(m.pp_group, _LoadTimeAllRanksPPGroup)
+    assert m.pp_group.is_last_rank is False              # true value restored
+
+
+def test_load_weights_rank_fix_idempotent(monkeypatch):
+    """Installing twice must not double-wrap (guard flag) — else nested proxies / leaks."""
+    from shard.sglang_node import _install_load_weights_rank_fix
+    cls, _ = _install_fake_v4_model(monkeypatch, is_last_rank=False)
+    _install_load_weights_rank_fix()
+    once = cls.load_weights
+    _install_load_weights_rank_fix()
+    assert cls.load_weights is once                      # second install is a no-op
+
+
+def test_load_weights_fix_preserves_tail_and_delegates(monkeypatch):
+    """Sanity: on the true tail (is_last_rank True) the fix is harmless (norms already load), and the
+    proxy DELEGATES non-rank attrs (world_size/rank_in_group) so the layer-slice gate is unaffected."""
+    from shard.sglang_node import _install_load_weights_rank_fix, _LoadTimeAllRanksPPGroup
+    cls, loaded = _install_fake_v4_model(monkeypatch, is_last_rank=True)
+    _install_load_weights_rank_fix()
+    cls().load_weights(_STAGE_WEIGHTS)
+    assert all(n in loaded for n in _STAGE_WEIGHTS)
+    class _Real:
+        world_size = 3
+        rank_in_group = 2
+        @property
+        def is_last_rank(self): return False
+        @property
+        def is_first_rank(self): return False
+    proxy = _LoadTimeAllRanksPPGroup(_Real())
+    assert proxy.is_first_rank is True and proxy.is_last_rank is True
+    assert proxy.world_size == 3 and proxy.rank_in_group == 2   # delegated to the real group

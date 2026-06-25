@@ -118,14 +118,86 @@ def _set_pp_identity(group: Any, rank: int, size: int) -> None:
         group.ranks = list(range(size))
     except Exception:  # pragma: no cover - defensive; .ranks shape varies across sglang versions
         pass
-    # is_first_rank / is_last_rank gate embed_tokens / norm+lm_head construction. If they're @property
-    # (derive live from the attrs above) we're already correct; if they're plain attributes, set them.
+    # is_first_rank / is_last_rank: in the V4-Blackwell sglang build these are @property values
+    # derived from the GLOBAL torch rank (0) + ranks list — NOT from rank_in_group — so setting
+    # rank_in_group above does NOT make them per-stage-correct (is_last_rank stays False on every
+    # stage; GPU-confirmed 2026-06-25). They don't gate model CONSTRUCTION (embed/norm/lm_head are
+    # built unconditionally — deepseek_v4.py L1189/1211/1374), only the load-time weight-skip gates,
+    # which we handle separately in _install_load_weights_rank_fix(). This loop still helps on sglang
+    # versions where they ARE plain attributes (then setattr makes them correct; on this build it's a
+    # no-op because they're properties).
     for attr, val in (("is_first_rank", rank == 0), ("is_last_rank", rank == size - 1)):
         if not isinstance(getattr(type(group), attr, None), property):
             try:
                 setattr(group, attr, val)
             except Exception:  # pragma: no cover
                 pass
+
+
+class _LoadTimeAllRanksPPGroup:
+    """A pp-group view whose is_first_rank/is_last_rank both read True — installed ONLY for the
+    duration of the model's load_weights call (see _install_load_weights_rank_fix).
+
+    Why (GPU-confirmed 2026-06-25): sglang's DeepseekV4 load_weights skips embed weights when
+    `not pp_group.is_first_rank` and skips ANY `.norm.` weight when `not pp_group.is_last_rank`
+    (deepseek_v4.py ~L1814/1818). That `.norm.` gate assumes the only norm is the final
+    `model.norm.weight`, but V4's sparse attention adds per-layer `…compressor.norm.weight` /
+    `…indexer.compressor.norm.weight` (they also contain `.norm.`), which live on whatever stage
+    owns the layer. Under Cairn's (k,N) layer-split, is_first/is_last_rank are @property values
+    derived from the GLOBAL torch rank (0, world_size=1 — our slicing only sets rank_in_group/
+    world_size), so is_last_rank is False on every stage → every stage drops its compressor.norm/
+    indexer.compressor.norm (+ the final norm) → the strict "weights not initialized from
+    checkpoints" RuntimeError.
+
+    Safe because embed_tokens / norm / lm_head are built UNCONDITIONALLY on every stage
+    (deepseek_v4.py L1189/1211/1374 — not pp-gated), so forcing both gates open is memory-neutral
+    (the params are already allocated) and correct: each stage still loads only its sliced LAYERS'
+    weights (that gate uses start/end_layer, untouched) PLUS the unconditional embed/norm/lm_head —
+    harmless on the stages that don't use them, since Cairn's wire decides which stage embeds the
+    tokens / applies the final norm+lm_head."""
+
+    def __init__(self, real: Any) -> None:
+        object.__setattr__(self, "_real", real)
+
+    @property
+    def is_first_rank(self) -> bool:
+        return True
+
+    @property
+    def is_last_rank(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+
+def _install_load_weights_rank_fix() -> None:
+    """Patch DeepseekV4ForCausalLM.load_weights to view its pp_group as all-ranks-True for the
+    call, so the per-stage embed/norm weight-skip gates don't drop V4's per-layer norms (see
+    _LoadTimeAllRanksPPGroup). Idempotent; no-op if the V4 model class isn't importable (non-V4
+    images / CPU-mock tests). The class patch is left installed; it only swaps pp_group for the
+    duration of each load_weights call and restores it in a finally, so it never leaks."""
+    try:
+        import sglang.srt.models.deepseek_v4 as _m
+    except Exception:  # pragma: no cover - only present in the V4-Blackwell image
+        return
+    cls = getattr(_m, "DeepseekV4ForCausalLM", None)
+    if cls is None or getattr(getattr(cls, "load_weights", None), "_cairn_norm_gate_fix", False):
+        return
+    _orig_load_weights = cls.load_weights
+
+    def load_weights(self, *a, **kw):
+        real = getattr(self, "pp_group", None)
+        if real is None or isinstance(real, _LoadTimeAllRanksPPGroup):
+            return _orig_load_weights(self, *a, **kw)
+        self.pp_group = _LoadTimeAllRanksPPGroup(real)
+        try:
+            return _orig_load_weights(self, *a, **kw)
+        finally:
+            self.pp_group = real
+
+    load_weights._cairn_norm_gate_fix = True
+    cls.load_weights = load_weights
 
 
 class SglangNodeRuntime(NodeRuntime):
@@ -253,6 +325,11 @@ class SglangNodeRuntime(NodeRuntime):
                     return _orig(_mr, *a, **kw)
 
                 ModelRunner.load_model = _cairn_load_model
+                # V4-Flash: sglang's load_weights skips embed/`.norm.` weights by is_first/is_last_rank,
+                # but those @properties read the GLOBAL rank (0) not our (k,N) → every stage would drop
+                # its per-layer compressor.norm/indexer.compressor.norm (+ final norm). Force the gates
+                # open for the load only (GPU-confirmed 2026-06-25; see _LoadTimeAllRanksPPGroup).
+                _install_load_weights_rank_fix()
             try:
                 runner = ModelRunner(
                     model_config=ModelConfig.from_server_args(sa), mem_fraction_static=mem,
