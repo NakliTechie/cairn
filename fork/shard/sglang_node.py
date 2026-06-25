@@ -200,6 +200,44 @@ def _install_load_weights_rank_fix() -> None:
     cls.load_weights = load_weights
 
 
+def _install_post_load_weights_fix() -> None:
+    """Patch DeepseekV4ForCausalLM.post_load_weights to SKIP PPMissingLayer placeholders.
+
+    Why (GPU-confirmed 2026-06-25, the step right after the norm-gate fix): post_load_weights runs
+    a V4 sparse-attention "APE hotfix" pass — `for layer in self.model.layers: layer.self_attn…`
+    (deepseek_v4.py ~L1506). Under Cairn's (k,N) layer-split the OUT-OF-SLICE layers are weightless
+    `PPMissingLayer` stubs (the very thing that proves slicing works) with no `self_attn`, so the
+    unguarded `layer.self_attn` raises `AttributeError: 'PPMissingLayer' object has no attribute
+    'self_attn'`. Upstream never hits this (single-stage runs have no PPMissingLayer); it's specific
+    to V4 + multi-stage PP = Cairn. Faithful re-implementation of the short method with a
+    `getattr(layer, 'self_attn', None)` guard (the hotfix only applies to the real layers in-slice).
+    Idempotent; no-op if the V4 model class isn't importable."""
+    try:
+        import sglang.srt.models.deepseek_v4 as _m
+    except Exception:  # pragma: no cover - only present in the V4-Blackwell image
+        return
+    cls = getattr(_m, "DeepseekV4ForCausalLM", None)
+    if cls is None or getattr(getattr(cls, "post_load_weights", None), "_cairn_ppmissing_fix", False):
+        return
+
+    def post_load_weights(self, is_nextn=False, weight_names=None):
+        if getattr(_m, "_FP8_WO_A_GEMM", False):
+            self._setup_fp8_wo_a_scales(is_nextn)
+        if is_nextn:
+            return
+        for layer in self.model.layers:
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is None:      # PPMissingLayer (out-of-slice) — no attn to hotfix
+                continue
+            if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
+                self_attn.compressor.apply_ape_hotfix()
+            if self_attn.compress_ratio == 4 and not self_attn.indexer.compressor.ape_converted:
+                self_attn.indexer.compressor.apply_ape_hotfix()
+
+    post_load_weights._cairn_ppmissing_fix = True
+    cls.post_load_weights = post_load_weights
+
+
 class SglangNodeRuntime(NodeRuntime):
     """Serve one contiguous block of layers via SGLang (rung 2/3, GPU).
 
@@ -330,6 +368,9 @@ class SglangNodeRuntime(NodeRuntime):
                 # its per-layer compressor.norm/indexer.compressor.norm (+ final norm). Force the gates
                 # open for the load only (GPU-confirmed 2026-06-25; see _LoadTimeAllRanksPPGroup).
                 _install_load_weights_rank_fix()
+                # And skip PPMissingLayer stubs in V4's post-load APE-hotfix pass (out-of-slice layers
+                # have no .self_attn under the layer-split; GPU-confirmed 2026-06-25).
+                _install_post_load_weights_fix()
             try:
                 runner = ModelRunner(
                     model_config=ModelConfig.from_server_args(sa), mem_fraction_static=mem,
