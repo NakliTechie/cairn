@@ -38,6 +38,14 @@ if [ "$got" != "$EXPECT_ARN" ]; then
 fi
 echo "[launch] identity OK: $got"
 
+# (~/Code/infra/aws/gpu-pricing-page.py) throw up the live GPU spot-pricing page to eyeball before launch
+# — best-effort + opt-out (SKIP_PRICING_PAGE=1); never blocks the launch on failure.
+PRICING_PAGE="${PRICING_PAGE:-$HOME/Code/infra/aws/gpu-pricing-page.py}"
+if [ -z "${SKIP_PRICING_PAGE:-}" ] && [ -f "$PRICING_PAGE" ]; then
+  echo "[launch] GPU spot-pricing page (eyeball before launch; SKIP_PRICING_PAGE=1 to skip) ..."
+  AWS_PROFILE="$PROFILE" python3 "$PRICING_PAGE" --open >/dev/null 2>&1 || true
+fi
+
 # 1. force the shared local api server to (re)start under THIS identity (gotcha #9).
 #    NOTE: this briefly stops the shared server used by mela/pitch/quorum — it restarts on the next
 #    sky command. Run one project at a time on this machine.
