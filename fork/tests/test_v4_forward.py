@@ -72,8 +72,11 @@ def _make_v4_runtime(*, is_embed, is_tail, start, end, n=4, hc=2, H=8, V=16):
             self.next_token_logits = logits
 
     class _LP:
-        def __call__(self, ids, hidden, lm_head, fb):
+        # canonical DeepseekV4ForCausalLM signature: aux_hidden_states + hidden_states_before_norm
+        def __call__(self, ids, hidden, lm_head, fb, aux_hidden_states=None,
+                     hidden_states_before_norm=None):
             calls["lp"] += 1
+            assert aux_hidden_states is None and hidden_states_before_norm is None
             return _Result(torch.zeros(int(hidden.shape[0]), V))
 
     class _Model:
@@ -152,3 +155,41 @@ def test_residual_stream_path_unchanged():
     rt._is_embed, rt._is_tail, rt._start, rt._end = True, False, 0, 2
     out = rt._forward_layers(x=None, fb=_FB(torch.arange(3), torch.zeros(3)), s_len=3)
     assert out.shape == (1, 3, H)                            # flat hand-off, not 4D
+
+
+def test_tree_cache_built_from_runner_pools_and_cached(monkeypatch):
+    """`_get_tree_cache` must build a ChunkCache from the runner's pools (sglang's V4 KV-alloc path
+    now calls `tree_cache.supports_swa()` UNCONDITIONALLY, so `tree_cache=None` AttributeErrors), and
+    cache the instance (one tree_cache per runtime, like sglang's scheduler). Injects a fake
+    `sglang.srt.mem_cache.chunk_cache` module so the construction path runs without real sglang."""
+    import types
+
+    built = []
+
+    class _FakeChunkCache:
+        def __init__(self, params):
+            built.append(params)
+            self.params = params
+
+    fake_mod = types.ModuleType("sglang.srt.mem_cache.chunk_cache")
+    fake_mod.ChunkCache = _FakeChunkCache
+    for name in ("sglang", "sglang.srt", "sglang.srt.mem_cache", "sglang.srt.mem_cache.chunk_cache"):
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.chunk_cache", fake_mod)
+
+    rt = SglangNodeRuntime("m", LayerRange(0, 2), device="cpu")
+    rt._runner = type("R", (), {
+        "req_to_token_pool": "RTP", "token_to_kv_pool_allocator": "ALLOC",
+        "page_size": 1, "sliding_window_size": 4096,
+    })()
+
+    tc1 = rt._get_tree_cache()
+    tc2 = rt._get_tree_cache()
+    assert tc1 is tc2                                        # cached — built once
+    assert len(built) == 1
+    p = tc1.params
+    assert p.req_to_token_pool == "RTP"
+    assert p.token_to_kv_pool_allocator == "ALLOC"
+    assert p.page_size == 1
+    assert p.sliding_window_size == 4096                    # carried for a later SWAChunkCache swap
