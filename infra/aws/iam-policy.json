@@ -1,11 +1,17 @@
 {
-  "_comment": "Least-privilege policy for SkyPilot to run the Cairn spot fleet, attached to the 'cairn-skypilot' IAM user. DEPLOYED AS A CUSTOMER-MANAGED policy named 'cairn-skypilot' (account AWS_ACCOUNT_ID) — migrated from an inline user policy on 2026-06-24 because adding the NA regions pushed the non-whitespace size past the 2048-char INLINE cap (managed cap = 6144). Re-apply via `aws iam create-policy-version` (admin) or the console JSON editor (paste this doc minus '_comment'). HARDENED + SkyPilot-aligned (2026-06-21, after `sky check`; NA regions added 2026-06-24 after a spot-price sweep found us-east-2/us-west-2 cheapest): the H5/H6 region-lock applies ONLY to MUTATING actions — provisioning is locked to [eu-south-2, ap-northeast-2, us-east-2, us-west-2] and destructive instance actions are additionally gated on the 'cairn=true' tag. Read-only ec2:Describe*/Get* is allowed in ANY region because SkyPilot must enumerate regions/AZs/capacity to launch (read-only, no cost, no resource creation → low blast radius). S3 is scoped to skypilot-*/sky-* buckets (+ global ListAllMyBuckets, a names-only list SkyPilot's check requires). iam:CreateServiceLinkedRole is limited to spot.amazonaws.com. Re-validate with `sky check aws` + a live launch; if an action still fails, add THAT action specifically — never Resource:*. [test: live sky check + launch]",
+  "_comment": "Least-privilege policy for SkyPilot to run the Cairn spot fleet, attached to the 'cairn-skypilot' IAM user. DEPLOYED AS A CUSTOMER-MANAGED policy named 'cairn-skypilot' (account AWS_ACCOUNT_ID) — migrated from an inline user policy on 2026-06-24 because adding the NA regions pushed the non-whitespace size past the 2048-char INLINE cap (managed cap = 6144). Re-apply via `aws iam create-policy-version` (admin) or the console JSON editor (paste this doc minus '_comment'). HARDENED + SkyPilot-aligned (2026-06-21, after `sky check`; NA regions added 2026-06-24 after a spot-price sweep found us-east-2/us-west-2 cheapest): the H5/H6 region-lock applies ONLY to MUTATING actions — provisioning is locked to [eu-south-2, ap-northeast-2, us-east-2, us-west-2] and destructive instance actions are additionally gated on the 'cairn=true' tag. Read-only ec2:Describe*/Get* is allowed in ANY region because SkyPilot must enumerate regions/AZs/capacity to launch (+ pricing:GetProducts/DescribeServices/GetAttributeValues — the read-only, any-region Price List API for on-demand price discovery that feeds the GPU spot inventory) (read-only, no cost, no resource creation → low blast radius). S3 is scoped to skypilot-*/sky-* buckets (+ global ListAllMyBuckets, a names-only list SkyPilot's check requires). iam:CreateServiceLinkedRole is limited to spot.amazonaws.com. Re-validate with `sky check aws` + a live launch; if an action still fails, add THAT action specifically — never Resource:*. [test: live sky check + launch]",
   "Version": "2012-10-17",
   "Statement": [
     {
       "Sid": "ReadOnlyDescribeAnyRegion",
       "Effect": "Allow",
       "Action": ["ec2:Describe*", "ec2:Get*"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadOnlyPricing",
+      "Effect": "Allow",
+      "Action": ["pricing:GetProducts", "pricing:DescribeServices", "pricing:GetAttributeValues"],
       "Resource": "*"
     },
     {
