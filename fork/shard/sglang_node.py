@@ -238,6 +238,24 @@ def _install_post_load_weights_fix() -> None:
     cls.post_load_weights = post_load_weights
 
 
+class _CairnCacheInitParams:
+    """Duck-typed stand-in for sglang's `CacheInitParams` — just enough to build a `ChunkCache`.
+
+    `ChunkCache.__init__(params)` reads `params.{req_to_token_pool, token_to_kv_pool_allocator,
+    page_size}`; `SWAChunkCache` additionally reads `params.{sliding_window_size, chunked_prefill_size}`
+    (verified against `.cache/sglang-ref/chunk_cache.py`). The params object is consumed only by
+    `__init__` and discarded, so a shim avoids coupling to `cache_init_params.py`'s constructor.
+    See `SglangNodeRuntime._get_tree_cache` for why the fork now needs a real tree_cache at all."""
+
+    def __init__(self, req_to_token_pool, token_to_kv_pool_allocator, page_size,
+                 sliding_window_size=None, chunked_prefill_size=-1):
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.page_size = page_size
+        self.sliding_window_size = sliding_window_size
+        self.chunked_prefill_size = chunked_prefill_size
+
+
 class SglangNodeRuntime(NodeRuntime):
     """Serve one contiguous block of layers via SGLang (rung 2/3, GPU).
 
@@ -307,6 +325,7 @@ class SglangNodeRuntime(NodeRuntime):
         self._is_v4 = False                      # set in load_shard: DeepSeek-V4 hyper-connection forward path
         self._batches: Dict[str, Any] = {}       # seq_id -> SGLang ScheduleBatch (KV lifecycle)
         self._steps: Dict[str, int] = {}         # seq_id -> forward count (0 = needs prefill)
+        self._tree_cache: Any = None             # lazily-built ChunkCache: satisfies sglang's KV-alloc interface (see _get_tree_cache)
 
     # ---- load: build/attach the in-process ModelRunner + this block's layer view ----
     def load_shard(self) -> None:
@@ -412,6 +431,39 @@ class SglangNodeRuntime(NodeRuntime):
         self._is_embed = (s == 0)                # stage 0 embeds the token ids
         self._is_tail = (e == n)                 # last stage applies norm + lm_head
 
+    def _get_tree_cache(self) -> Any:
+        """Build (once) a `ChunkCache` to hand `ScheduleBatch` as its `tree_cache`.
+
+        The fork bypasses sglang's scheduler and used to pass `tree_cache=None`, managing paged KV by
+        hand. That worked on older sglang. The V4-Blackwell build couples KV allocation to the cache
+        UNCONDITIONALLY: `prepare_for_*` → `alloc_for_extend`/`alloc_for_decode` → `batch.maybe_evict_swa()`
+        → `self.tree_cache.supports_swa()` — which AttributeErrors on `None` (V4 uses sliding-window attn;
+        the KV pools carry an `swa` dim). So a real tree_cache is now mandatory.
+
+        `ChunkCache` (verified against `.cache/sglang-ref/chunk_cache.py` — the exact box build) is the
+        right one: it does NO prefix reuse and `supports_swa()` is False (inherited `BasePrefixCache`), so
+        `maybe_evict_swa` is a no-op, and `evict_from_tree_cache` early-returns on `is_chunk_cache()` — i.e.
+        the cache never touches the KV pools. The fork keeps owning alloc/free manually (`free_seq`); the
+        ChunkCache is a passive interface-satisfier, not an active cache. (`SWAChunkCache`, which needs a
+        `sliding_window_size` and does real SWA eviction, is the long-context follow-up once the V4 decode
+        is proven end-to-end.)
+
+        Built from a duck-typed params shim rather than the real `CacheInitParams`: `ChunkCache.__init__`
+        reads exactly three attributes (`req_to_token_pool`, `token_to_kv_pool_allocator`, `page_size`) and
+        the params object is discarded after construction, so the shim is pinned to the grabbed source and
+        avoids coupling to `cache_init_params.py`'s (ungrabbed) constructor signature. The extra SWA attrs
+        make a later `SWAChunkCache` swap a one-liner."""
+        if self._tree_cache is None:
+            from sglang.srt.mem_cache.chunk_cache import ChunkCache
+            self._tree_cache = ChunkCache(_CairnCacheInitParams(
+                req_to_token_pool=self._runner.req_to_token_pool,
+                token_to_kv_pool_allocator=self._runner.token_to_kv_pool_allocator,
+                page_size=getattr(self._runner, "page_size", 1),
+                sliding_window_size=getattr(self._runner, "sliding_window_size", None),
+                chunked_prefill_size=getattr(self._runner, "chunked_prefill_size", -1),
+            ))
+        return self._tree_cache
+
     # ---- forward: run this block's layers over `hidden_states`; per-seq paged KV stays here ----
     def forward(self, hidden_states: Any, kv_meta: Dict[str, Any]) -> Any:
         if self._runner is None:
@@ -437,7 +489,8 @@ class SglangNodeRuntime(NodeRuntime):
             req.logprob_start_len = len(ids) - 1
             batch = ScheduleBatch.init_new(
                 reqs=[req], req_to_token_pool=self._runner.req_to_token_pool,
-                token_to_kv_pool_allocator=self._runner.token_to_kv_pool_allocator, tree_cache=None,
+                token_to_kv_pool_allocator=self._runner.token_to_kv_pool_allocator,
+                tree_cache=self._get_tree_cache(),   # ChunkCache: sglang's V4 KV-alloc now requires non-None (no-op cache)
                 model_config=self._runner.model_config, enable_overlap=False,
                 spec_algorithm=SpeculativeAlgorithm.NONE,   # init_new dropped enable_custom_logit_processor
             )
@@ -488,7 +541,11 @@ class SglangNodeRuntime(NodeRuntime):
                 hidden = self._inner.hc_head(                                # collapse the hc_mult dim
                     hidden, self._inner.hc_head_fn, self._inner.hc_head_scale, self._inner.hc_head_base)
                 hidden = self._inner.norm(hidden)                           # V4 norm: single-arg
-                logits = m.logits_processor(ids, hidden, m.lm_head, fb).next_token_logits
+                # Canonical V4 call (DeepseekV4ForCausalLM.forward): the 5th/6th args are aux_hidden_states
+                # and hidden_states_before_norm — both None in the default (no aux-capture / no MTP-hc) path.
+                logits = m.logits_processor(
+                    ids, hidden, m.lm_head, fb, None, hidden_states_before_norm=None,
+                ).next_token_logits
                 return logits.reshape(1, -1, logits.shape[-1])              # [1, 1, V]
             return hidden.reshape(1, s_len, hc, -1)                         # [1, S, hc_mult, H] -> next
 
