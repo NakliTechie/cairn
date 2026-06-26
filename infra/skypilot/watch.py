@@ -63,6 +63,13 @@ def _alert(msg: str) -> None:
                        timeout=10, capture_output=True)
     except Exception:
         pass
+    try:  # signal the HUMAN remotely (ntfy/Slack/CallMeBot via CAIRN_ALERT_WEBHOOK / CALLMEBOT_*) — the
+          # abrupt-death safety net: the box-side notice can't fire if AWS kills it without the ~2-min warning.
+        sys.path.insert(0, str(ROOT))
+        from cairn_node import notify
+        notify.alert(msg, title="Cairn watch")
+    except Exception:
+        pass
 
 
 def _run(*args) -> None:
