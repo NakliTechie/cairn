@@ -229,8 +229,12 @@ run: |
   # (DEEPSEEK-V4-FLASH.md "Required mounts and environment"). They route the indexer / SWA-prepare /
   # MHC / paged-MQA-logits kernels to TileLang/torch impls that support Blackwell sm_120. The .so patch
   # only covers sparse-DECODE; WITHOUT SGLANG_OPT_USE_TILELANG_INDEXER=1 the C4 indexer falls through to
-  # csrc/apis/attention.hpp -> "Unsupported architecture" (GPU-confirmed 2026-06-26). DeepGEMM/FP4 off
-  # (no sm_120 path). Cairn drives sglang directly but these are read globally at kernel-dispatch time.
+  # csrc/apis/attention.hpp -> "Unsupported architecture" (GPU-confirmed 2026-06-26). Cairn drives sglang
+  # directly but these are read globally at kernel-dispatch time.
+  #   NB: 0xSero's SGLANG_DSV4_FP4_EXPERTS=0 is deliberately OMITTED. They run TP=4 (experts sharded
+  #   across 4 GPUs) so can afford full-precision experts; Cairn is TP=1 + LAYER-split (each box holds
+  #   ALL experts for its slice), so disabling FP4 OOMs the box (GPU-confirmed: 94.36/95 GiB in MoE
+  #   create_weights). Left at the checkpoint default -> the proven ~58 GiB/box load.
   DOCKER_RUN_COMMON="sudo docker run --rm --gpus all --shm-size=64g --ipc=host --network host \
     -v /home/ubuntu/dsv4/build-docker:/dsv4:ro \
     -v /home/ubuntu/model:/workspace/model:ro \
@@ -247,7 +251,6 @@ run: |
     -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
     -e SGLANG_ENABLE_JIT_DEEPGEMM=0 \
     -e SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 \
-    -e SGLANG_DSV4_FP4_EXPERTS=0 \
     -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 \
     -e SGLANG_OPT_USE_TILELANG_INDEXER=1 \
     -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 \
