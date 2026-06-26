@@ -344,8 +344,16 @@ class SglangNodeRuntime(NodeRuntime):
         if runner is None:
             mem = float(os.environ.get("CAIRN_SGLANG_MEM_FRACTION", "0.8"))
             sock = socket.socket(); sock.bind(("", 0)); port = sock.getsockname()[1]; sock.close()
+            # sm_120 (RTX PRO 6000 Blackwell) GEMM/MoE kernel selection (0xSero's --fp8-gemm-backend /
+            # --moe-runner-backend triton). Default "auto" picks the trtllm FP8 GEMM, which has no sm_120
+            # path → flashinfer BackendSupportedError: "gemm_fp8_nt_groupwise does not support backend
+            # 'trtllm' with capability 120" (GPU-confirmed 2026-06-26). triton has the sm_120 path. These
+            # select the COMPUTE kernel, not weight quant (unlike SGLANG_DSV4_FP4_EXPERTS — no mem impact).
+            # attention_backend left auto (correctly selects the V4 compressed/radix backend); kv_cache_dtype
+            # auto (resolves to fp8_e4m3 for V4). The sm_120 TileLang kernel env is set in the docker run.
             sa = ServerArgs(model_path=self.model, tp_size=1, pp_size=1, mem_fraction_static=mem,
-                            disable_cuda_graph=True, trust_remote_code=True)
+                            disable_cuda_graph=True, trust_remote_code=True,
+                            fp8_gemm_runner_backend="triton", moe_runner_backend="triton")
             # Path-β layer slicing (2026-06-24 root-cause + rewrite — replaces the get_pp_group patch
             # that was silently discarded by ModelRunner's dist re-init; see _set_pp_identity docstring).
             #   (1) Pin the exact slice boundaries via SGLANG_PP_LAYER_PARTITION (so sglang's
