@@ -412,6 +412,19 @@ class SglangNodeRuntime(NodeRuntime):
             finally:
                 if saved_load_model is not None:
                     ModelRunner.load_model = saved_load_model     # never leak the wrapper to other loads
+            # The fork drives ModelRunner directly, bypassing sglang's Scheduler — which is what runs
+            # init_moe_gemm_config() to populate the PROCESS-GLOBAL kernel-backend configs from server_args.
+            # ModelRunner already does set_global_server_args_for_scheduler(sa), but NOT these. Without them
+            # FP8_GEMM_RUNNER_BACKEND etc. stay None -> default AUTO -> trtllm, which has no sm_120 path
+            # (GPU-confirmed 2026-06-26: "gemm_fp8_nt_groupwise does not support backend 'trtllm' with
+            # capability 120"). Replicate the Scheduler's init sequence (scheduler.py init_moe_gemm_config)
+            # AFTER load so our triton fp8_gemm_runner_backend/moe_runner_backend actually take effect.
+            from sglang.srt.layers.moe import initialize_moe_config
+            from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+            from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+            initialize_moe_config(sa)
+            initialize_fp8_gemm_config(sa)
+            initialize_fp4_gemm_config(sa)
             SglangNodeRuntime._SHARED[key] = runner
         self._runner = runner
         self._inner = runner.model.model
