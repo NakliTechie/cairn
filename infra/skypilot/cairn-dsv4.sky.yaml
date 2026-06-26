@@ -116,6 +116,9 @@ setup: |
     local ECR_REGION="eu-south-2"
     local ECR_REPO="AWS_ACCOUNT_ID.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
     local ECR_IMG="${ECR_REPO}:deepseek-v4-blackwell"
+    if sudo docker image inspect "$IMG" >/dev/null 2>&1; then
+      echo "[setup] image $IMG already present locally — skipping pull (warm re-run)"; return
+    fi
     if [ -n "${CAIRN_S3_WRITE_ACCESS_KEY_ID:-}" ] && command -v aws >/dev/null 2>&1 \
        && AWS_ACCESS_KEY_ID="$CAIRN_S3_WRITE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_WRITE_SECRET_ACCESS_KEY" \
             aws ecr get-login-password --region "$ECR_REGION" 2>/dev/null \

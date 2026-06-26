@@ -483,7 +483,11 @@ class SglangNodeRuntime(NodeRuntime):
             ids = x[0].tolist() if self._is_embed else [0] * s_len   # mid blocks don't embed → dummy ids
             req = Req(rid=rid, origin_input_text="", origin_input_ids=ids,
                       sampling_params=SamplingParams(temperature=0.0, max_new_tokens=1))
-            req.prefix_indices = []
+            # prefix_indices must be an empty TENSOR, not []: V4-Blackwell sglang's alloc_for_extend ->
+            # write_cache_indices does `[t.data_ptr() for t in prefix_tensors]` on the triton path
+            # (GPU-confirmed 2026-06-26: `'list' object has no attribute 'data_ptr'`). Older sglang
+            # tolerated the list; this build needs a 0-length int64 tensor (no prefix reuse — fresh seq).
+            req.prefix_indices = torch.empty(0, dtype=torch.int64, device=x.device)
             req.fill_ids = req.origin_input_ids
             req.extend_input_len = len(ids)
             req.logprob_start_len = len(ids) - 1
