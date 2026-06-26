@@ -101,56 +101,87 @@ setup: |
   # nvidia-container-toolkit (the DLAMI ships it but the runtime config sometimes needs a kick)
   sudo systemctl restart docker || true
 
-  # 2. Pull the official Blackwell V4 sglang image (this is what 0xSero patches into)
-  sudo docker pull lmsysorg/sglang:deepseek-v4-blackwell
+  # 2–4 PARALLELIZED (2026-06-26): the image acquire, kernel restore, and the 159 GB in-region weight
+  #     sync are independent I/O on different sources — running them serially left all 4 GPU boxes
+  #     idle-billing through the SUM. Run image + weights CONCURRENTLY (logs to temp files so output
+  #     isn't interleaved); the kernel restore overlaps both. The ONE real dependency is the kernel
+  #     *build* fallback (compiles inside the image), so it's deferred until after the image is present.
 
-  # 3. Build the 0xSero SM_120 patch (compiles inside the same container; output in ~/dsv4/build-docker)
-  if [ ! -d ~/dsv4 ]; then
-    git clone https://github.com/0xSero/deepseek-v4-flash-sm120 ~/dsv4
-  fi
+  # 2. Acquire the Blackwell V4 sglang image — prefer the IN-REGION ECR mirror (skypilot-cairn cache),
+  #    fall back to Docker Hub. A ~82 GB Docker Hub pull on every node is the dominant setup cost + a
+  #    rate-limit risk; the ECR pull rides the AWS backbone and is layer-cached. Auth: the scoped cache
+  #    key (CAIRN_S3_WRITE_*, via --env) — ECR read on the cairn-sglang repo.
+  acquire_image() {
+    local IMG="lmsysorg/sglang:deepseek-v4-blackwell"
+    local ECR_REGION="eu-south-2"
+    local ECR_REPO="615809814090.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
+    local ECR_IMG="${ECR_REPO}:deepseek-v4-blackwell"
+    if [ -n "${CAIRN_S3_WRITE_ACCESS_KEY_ID:-}" ] && command -v aws >/dev/null 2>&1 \
+       && AWS_ACCESS_KEY_ID="$CAIRN_S3_WRITE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_WRITE_SECRET_ACCESS_KEY" \
+            aws ecr get-login-password --region "$ECR_REGION" 2>/dev/null \
+            | sudo docker login --username AWS --password-stdin "$ECR_REPO" >/dev/null 2>&1 \
+       && sudo docker pull "$ECR_IMG"; then
+      sudo docker tag "$ECR_IMG" "$IMG"   # retag to the canonical name the run: block uses
+      echo "[setup] image acquired from in-region ECR mirror ($ECR_IMG)"
+    else
+      echo "[setup] ECR mirror miss — pulling $IMG from Docker Hub (slower; mirror via infra/skypilot/cache-image.sh)"
+      sudo docker pull "$IMG"
+    fi
+  }
+
+  # 4. Acquire FP8 weights — IN-REGION S3 sync (cache hit, AWS backbone, no HF egress) else HF snapshot
+  #    (lazy-populate: the controller stages this region's bucket once so the NEXT launch is a hit).
+  acquire_weights() {
+    mkdir -p ~/model
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    local _TOK REGION S3
+    _TOK=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
+    REGION=$(curl -s -H "X-aws-ec2-metadata-token: $_TOK" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+    S3="s3://skypilot-cairn-weights-${REGION}/deepseek-v4-flash/main"
+    if [ -n "${CAIRN_S3_CACHE_ACCESS_KEY_ID:-}" ] && command -v aws >/dev/null 2>&1 \
+       && AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
+            aws s3 ls "$S3/config.json" --region "$REGION" >/dev/null 2>&1; then
+      echo "[setup] S3 cache HIT ($REGION) — syncing weights from $S3 (in-region backbone)"
+      AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
+        aws s3 sync "$S3" ~/model --region "$REGION" --only-show-errors
+    else
+      echo "[setup] S3 cache MISS ($REGION) — downloading weights from HF (lazy-populate the bucket separately)"
+      pip3 install -q --user "huggingface_hub[cli]" hf_transfer
+      python3 -c "from huggingface_hub import snapshot_download; snapshot_download('deepseek-ai/DeepSeek-V4-Flash', local_dir='/home/ubuntu/model', max_workers=8)"
+    fi
+  }
+
+  # Kick off image + weights CONCURRENTLY.
+  acquire_image   > /tmp/setup-image.log   2>&1 &  PID_I=$!
+  acquire_weights > /tmp/setup-weights.log 2>&1 &  PID_W=$!
+
+  # 3. 0xSero SM_120 kernel — restore now if possible (independent of the image, ~seconds); else mark
+  #    for build-after-image (the build runs INSIDE the image, so it must wait on the image pull).
+  if [ ! -d ~/dsv4 ]; then git clone https://github.com/0xSero/deepseek-v4-flash-sm120 ~/dsv4; fi
   cd ~/dsv4
-  # Kernel acquisition, cheapest-first (maiden-run lesson — the build is ~30 min of g7e time):
-  #   1. already built locally (sky-launch re-run on same cluster) → skip
-  #   2. S3 cache hit (file_mount /cairn-kernel-cache, keyed by image digest) → extract (~seconds)
-  #   3. cache miss → full CUDA build (then re-populate the cache from the controller, see CACHING.md)
+  NEED_BUILD=""
   if ls ~/dsv4/build-docker/deepseek_v4_kernel/*.so >/dev/null 2>&1; then
     echo "[setup] 0xSero kernel .so already built locally — skipping"
   elif [ -f /cairn-kernel-cache/build-docker.tar.gz ]; then
     echo "[setup] restoring 0xSero kernel from S3 cache (skips the ~30-min build)"
     tar xzf /cairn-kernel-cache/build-docker.tar.gz -C ~/dsv4
     ls ~/dsv4/build-docker/deepseek_v4_kernel/*.so >/dev/null 2>&1 \
-      && echo "[setup] kernel restored from cache" \
-      || { echo "[setup] cache extract incomplete — falling back to build"; sudo bash scripts/build_in_sglang_docker.sh; }
+      && echo "[setup] kernel restored from cache" || NEED_BUILD=1
   else
-    echo "[setup] no local build, no S3 cache → building (~30 min)"
-    sudo bash scripts/build_in_sglang_docker.sh
+    NEED_BUILD=1
   fi
 
-  # 4. Acquire FP8 weights, cheapest-first (2026-06-24 — download-once-to-S3, fan-out per CACHING.md):
-  #    1. IN-REGION S3 cache hit → aws s3 sync over the AWS backbone (fast, no HF egress/rate-limits).
-  #       Uses the cairn-s3-cache READ-ONLY key (CAIRN_S3_CACHE_*) — NOT the powerful cairn-skypilot key.
-  #    2. miss → HF download (snapshot_download). huggingface_hub 1.x removed the .commands CLI path, so
-  #       use the stable Python API (V4-Flash is public, no token). A miss = "lazy populate": the
-  #       controller stages this region's bucket once before/after, so the NEXT launch here is a hit.
-  mkdir -p ~/model
-  export HF_HUB_ENABLE_HF_TRANSFER=1
-  # auto-detect THIS box's region (IMDSv2) so we shop any region and still pull same-region S3
-  _TOK=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
-  REGION=$(curl -s -H "X-aws-ec2-metadata-token: $_TOK" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
-  S3="s3://skypilot-cairn-weights-${REGION}/deepseek-v4-flash/main"
-  HIT=""
-  if [ -n "${CAIRN_S3_CACHE_ACCESS_KEY_ID:-}" ] && command -v aws >/dev/null 2>&1; then
-    if AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
-       aws s3 ls "$S3/config.json" --region "$REGION" >/dev/null 2>&1; then HIT=1; fi
+  # Barrier: both background downloads must complete before the run (and before any build).
+  echo "[setup] waiting for concurrent image + weights downloads ..."
+  wait "$PID_I"; RC_I=$?; cat /tmp/setup-image.log
+  wait "$PID_W"; RC_W=$?; cat /tmp/setup-weights.log
+  if [ "$RC_I" -ne 0 ] || [ "$RC_W" -ne 0 ]; then
+    echo "[setup] FATAL: image rc=$RC_I weights rc=$RC_W"; exit 1
   fi
-  if [ -n "$HIT" ]; then
-    echo "[setup] S3 cache HIT ($REGION) — syncing weights from $S3 (in-region backbone)"
-    AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
-      aws s3 sync "$S3" ~/model --region "$REGION" --only-show-errors
-  else
-    echo "[setup] S3 cache MISS ($REGION) — downloading weights from HF (lazy-populate the bucket separately)"
-    pip3 install -q --user "huggingface_hub[cli]" hf_transfer
-    python3 -c "from huggingface_hub import snapshot_download; snapshot_download('deepseek-ai/DeepSeek-V4-Flash', local_dir='/home/ubuntu/model', max_workers=8)"
+
+  if [ -n "$NEED_BUILD" ]; then
+    echo "[setup] no local/cache kernel hit → building 0xSero kernel (~30 min, inside the image) ..."
+    sudo bash scripts/build_in_sglang_docker.sh
   fi
 
   # 5. Sanity checks
@@ -265,3 +296,7 @@ envs:
   # Empty default ⇒ setup falls back to HF (so the yaml still works before the key exists).
   CAIRN_S3_CACHE_ACCESS_KEY_ID: ""
   CAIRN_S3_CACHE_SECRET_ACCESS_KEY: ""
+  # cairn-s3-populate scoped cache key (in secrets.env as CAIRN_S3_WRITE_*) → setup step 2 pulls the
+  # Blackwell image from the in-region ECR mirror (cairn-sglang). Empty ⇒ falls back to Docker Hub.
+  CAIRN_S3_WRITE_ACCESS_KEY_ID: ""
+  CAIRN_S3_WRITE_SECRET_ACCESS_KEY: ""
