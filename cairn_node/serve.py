@@ -141,6 +141,14 @@ def main() -> None:
     def _on_spot_notice(notice):
         print(f"[serve] *** spot-interruption notice — DRAINING (still alive): {notice}", flush=True)
         _draining[0] = True
+        try:                                                  # signal the HUMAN — the earliest warning we get
+            import socket as _sock
+            from cairn_node import notify as _notify
+            _notify.alert(f"spot reclaim incoming on {_sock.gethostname()} "
+                          f"(pp_rank={os.environ.get('CAIRN_PP_RANK', '?')}) — node draining onto the spare; "
+                          f"the run may end. notice={notice.get('action', notice)}")
+        except Exception:
+            pass
 
     # Real path: a background thread polls THIS box's IMDS for its own ~2-min spot notice (opt-in, so
     # tests/CI never poll the live 169.254.169.254). Test path: CAIRN_SPOT_TEST_FILE points at a sentinel

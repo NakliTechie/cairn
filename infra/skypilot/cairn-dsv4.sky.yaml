@@ -257,6 +257,10 @@ run: |
     -e SGLANG_OPT_USE_TILELANG_SWA_PREPARE=1 \
     -e SGLANG_OPT_USE_TILELANG_MHC_PRE=1 \
     -e SGLANG_OPT_USE_TILELANG_MHC_POST=1 \
+    -e CAIRN_SPOT_WATCH=1 \
+    -e CAIRN_ALERT_WEBHOOK=$CAIRN_ALERT_WEBHOOK \
+    -e CALLMEBOT_PHONE=$CALLMEBOT_PHONE \
+    -e CALLMEBOT_APIKEY=$CALLMEBOT_APIKEY \
     lmsysorg/sglang:deepseek-v4-blackwell"
   # CAIRN_PP_LAYER_PARTITION = per-stage layer COUNTS; MUST match the case split above
   # (rank0 [0,15)=15, rank1 [15,29)=14, rank2 [29,43)=14). The loader pins sglang's
@@ -323,3 +327,11 @@ envs:
   # Blackwell image from the in-region ECR mirror (cairn-sglang). Empty ⇒ falls back to Docker Hub.
   CAIRN_S3_WRITE_ACCESS_KEY_ID: ""
   CAIRN_S3_WRITE_SECRET_ACCESS_KEY: ""
+  # Signal-back-to-us on a spot reclaim (cairn_node.notify). CAIRN_SPOT_WATCH=1 is set in DOCKER_RUN_COMMON
+  # so each box polls IMDS for its own ~2-min interruption notice; on a notice it drains AND fires this
+  # alert. Set ONE channel in secrets.env (empty ⇒ box-side drain still works, just no remote ping):
+  #   CAIRN_ALERT_WEBHOOK=https://ntfy.sh/<unguessable-topic>   (zero-setup; or a Slack/Discord webhook)
+  #   or CALLMEBOT_PHONE + CALLMEBOT_APIKEY                     (WhatsApp)
+  CAIRN_ALERT_WEBHOOK: ""
+  CALLMEBOT_PHONE: ""
+  CALLMEBOT_APIKEY: ""
