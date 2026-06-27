@@ -140,7 +140,7 @@ setup: |
     local _TOK REGION S3
     _TOK=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
     REGION=$(curl -s -H "X-aws-ec2-metadata-token: $_TOK" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
-    S3="s3://skypilot-cairn-weights-${REGION}/deepseek-v4-flash/main"
+    S3="s3://skypilot-cairn-weights-${REGION}/deepseek-v4-flash-fp8/main"
     if [ -n "${CAIRN_S3_CACHE_ACCESS_KEY_ID:-}" ] && command -v aws >/dev/null 2>&1 \
        && AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
             aws s3 ls "$S3/config.json" --region "$REGION" >/dev/null 2>&1; then
@@ -150,7 +150,7 @@ setup: |
     else
       echo "[setup] S3 cache MISS ($REGION) — downloading weights from HF (lazy-populate the bucket separately)"
       pip3 install -q --user "huggingface_hub[cli]" hf_transfer
-      python3 -c "from huggingface_hub import snapshot_download; snapshot_download('deepseek-ai/DeepSeek-V4-Flash', local_dir='/home/ubuntu/model', max_workers=8)"
+      python3 -c "from huggingface_hub import snapshot_download; snapshot_download('sgl-project/DeepSeek-V4-Flash-FP8', local_dir='/home/ubuntu/model', max_workers=8)"
     fi
   }
 
@@ -198,7 +198,7 @@ run: |
   IPS=($SKYPILOT_NODE_IPS); IP0=${IPS[0]}; IP1=${IPS[1]}; IP2=${IPS[2]}; IP3=${IPS[3]}
   export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
   export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.85}
-  MODEL=${MODEL:-deepseek-ai/DeepSeek-V4-Flash}
+  MODEL=${MODEL:-sgl-project/DeepSeek-V4-Flash-FP8}
   API_KEY=${CAIRN_API_KEY:-sk-cairn-demo}
   NLAYERS=43
 
@@ -258,7 +258,6 @@ run: |
     -e SGLANG_OPT_USE_TILELANG_MHC_PRE=1 \
     -e SGLANG_OPT_USE_TILELANG_MHC_POST=1 \
     -e SGLANG_OPT_CACHE_SWA_TRANSLATION=0 \
-    -e SGLANG_DSV4_MODE=2604 \
     -e CAIRN_DEBUG_MOE=1 \
     -e CAIRN_SPOT_WATCH=1 \
     -e CAIRN_ALERT_WEBHOOK=$CAIRN_ALERT_WEBHOOK \
