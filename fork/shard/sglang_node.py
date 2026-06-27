@@ -597,7 +597,28 @@ class SglangNodeRuntime(NodeRuntime):
         unloaded. The compiled kernels persist in flashinfer's on-disk cache for this box."""
         if self._runner is None:
             return
-        import torch
+        import torch, os
+        # CAIRN_DEBUG_MOE: one-shot shape probe for the wall-#11 MoE "Hidden size mismatch". Patches
+        # fused_experts_impl (resolved from module globals at call time, so the patch is live) to print
+        # hidden/w1/w2 shapes right before sglang's `hidden_states.shape[1] == w1.shape[2]` assert. Free
+        # to leave in (no-op unless the env is set); remove once wall #11 is understood.
+        if os.environ.get("CAIRN_DEBUG_MOE") and not globals().get("_CAIRN_MOE_HOOKED"):
+            try:
+                from sglang.srt.layers.moe.fused_moe_triton import fused_moe as _fm
+                _orig_fei = _fm.fused_experts_impl
+                def _cairn_moe_dbg(hidden_states, w1, w2, *a, **k):
+                    try:
+                        print(f"[CAIRN_DEBUG_MOE] fused_experts_impl "
+                              f"hidden={tuple(hidden_states.shape)} w1={tuple(w1.shape)} "
+                              f"w2={tuple(w2.shape)} hidden.dtype={hidden_states.dtype}", flush=True)
+                    except Exception:
+                        pass
+                    return _orig_fei(hidden_states, w1, w2, *a, **k)
+                _fm.fused_experts_impl = _cairn_moe_dbg
+                globals()["_CAIRN_MOE_HOOKED"] = True
+                print("[CAIRN_DEBUG_MOE] hook installed on fused_experts_impl", flush=True)
+            except Exception as _e:
+                print(f"[CAIRN_DEBUG_MOE] hook install failed: {_e}", flush=True)
         w = self._inner.embed_tokens.weight                  # [vocab, H] — gives H, dtype, device
         H, dtype, device = w.shape[1], w.dtype, w.device
         seq = "__cairn_warmup__"
