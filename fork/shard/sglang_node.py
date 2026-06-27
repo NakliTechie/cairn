@@ -606,8 +606,19 @@ class SglangNodeRuntime(NodeRuntime):
                 self.forward(torch.arange(n_tokens, device=device).reshape(1, n_tokens), {"seq": seq, "pos": 0})
                 self.forward(torch.tensor([[0]], device=device), {"seq": seq, "pos": n_tokens})
             else:                                            # mid/tail: hidden state in
-                self.forward(torch.zeros(1, n_tokens, H, dtype=dtype, device=device), {"seq": seq, "pos": 0})
-                self.forward(torch.zeros(1, 1, H, dtype=dtype, device=device), {"seq": seq, "pos": n_tokens})
+                # V4 stages receive the 4D WIRE shape [1, S, hc_mult, H] (an upstream stage emits
+                # `hidden.reshape(1, s_len, hc, -1)`, line ~574) and _forward_layers does
+                # `x.reshape(-1, hc, H)`. Feeding the residual-stream 3D [1,S,H] here collapses S into
+                # the hc dim → q ends up with num_tokens=1 while positions has n_tokens, tripping V4's
+                # fused_rope batch_size match (rope.cuh: q is [B=tokens, heads, dim], positions is [B];
+                # B bound to 1 from q, positions=4 → "expected 1 but got 4"). GPU-confirmed 2026-06-27.
+                if self._is_v4:
+                    hc = self._inner.hc_mult
+                    self.forward(torch.zeros(1, n_tokens, hc, H, dtype=dtype, device=device), {"seq": seq, "pos": 0})
+                    self.forward(torch.zeros(1, 1, hc, H, dtype=dtype, device=device), {"seq": seq, "pos": n_tokens})
+                else:
+                    self.forward(torch.zeros(1, n_tokens, H, dtype=dtype, device=device), {"seq": seq, "pos": 0})
+                    self.forward(torch.zeros(1, 1, H, dtype=dtype, device=device), {"seq": seq, "pos": n_tokens})
         finally:
             self.free_seq(seq)                               # drop the throwaway KV — leaves real state untouched
 
