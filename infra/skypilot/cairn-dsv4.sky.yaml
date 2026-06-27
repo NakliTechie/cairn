@@ -47,7 +47,8 @@ resources:
   region: eu-south-2                  # SPAIN — $1.25/hr spot vs Seoul $1.43 (2026-06-23 live), <5% interruption
   instance_type: g7e.2xlarge          # 1× RTX PRO 6000 Blackwell (sm_120), 96 GiB VRAM
   use_spot: true
-  disk_size: 400                      # 150 GiB V4-Flash FP8 + ~5 GiB 0xSero build + system + headroom
+  disk_size: 600                      # FP8 weights ~294 GiB + ~82 GiB extracted docker image + system + headroom
+                                      # (400 overflowed mid-sync: 294+82 > 400 — GPU-confirmed 2026-06-27 FAILED_SETUP)
   # Blackwell DLAMI (R580 driver) — REQUIRED. SkyPilot's default Ubuntu AMI ships nvidia 535 which
   # cannot probe sm_120 ("probe of 0000:2b:00.0 failed with error -1"). Confirmed live 2026-06-23.
   # AMI IDs are PER-REGION (same build "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)
