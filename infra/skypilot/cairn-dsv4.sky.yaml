@@ -149,7 +149,12 @@ setup: |
   #    key (CAIRN_S3_WRITE_*, via --env) — ECR read on the cairn-sglang repo.
   acquire_image() {
     local IMG="lmsysorg/sglang:deepseek-v4-blackwell"
-    local ECR_REGION="eu-south-2"
+    # Derive the ECR region from IMDS (same as acquire_weights) so the in-region mirror matches the
+    # LAUNCH region — a hardcoded eu-south-2 forces a slow cross-region pull on every out-of-region box.
+    local _TOK REGION
+    _TOK=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
+    REGION=$(curl -s -H "X-aws-ec2-metadata-token: $_TOK" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+    local ECR_REGION="${REGION:-eu-south-2}"
     local ECR_REPO="AWS_ACCOUNT_ID.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
     local ECR_IMG="${ECR_REPO}:deepseek-v4-blackwell"
     if sudo docker image inspect "$IMG" >/dev/null 2>&1; then

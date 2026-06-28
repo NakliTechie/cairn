@@ -61,7 +61,7 @@ so the least-priv key can read/write it; `s3:CreateBucket` on that pattern is al
 |---|---|---|---|---|
 | **0xSero kernel build** | 15 MB | ~30-min CUDA compile on g7e | ✅ **CACHE** (done) | base-image **digest** + arch (sm_120) |
 | **V4-Flash weights** | 150 GB | HF download (public) | ✅ **CACHE in-region** (planned) | model id + revision |
-| **sglang base image** | 82 GB | `docker pull` (digest-pinned) | ❌ **don't S3** — ECR mirror if pulls hurt | image digest |
+| **sglang base image** | 82 GB | `docker pull` (digest-pinned) | ✅ **in-region ECR mirror** (lazy, per region) | image digest |
 
 ### 1. Kernel build — DONE (2026-06-24)
 - Stored: `s3://skypilot-cairn-artifacts/dsv4-kernel/<image-digest>/build-docker.tar.gz`
@@ -109,11 +109,30 @@ This is where "download once, fan out" pays off most. See the core principle abo
   - This is the concrete infra under the "self-replenishing spare" + "resumable driver" items in
     `plan/pending.md` (Parked / Path 2).
 
-### 3. Base image — leave on Docker Hub
+### 3. Base image — in-region ECR mirror (lazy, per region)
 It's a *pull*, not a build, and it's digest-pinned (`lmsysorg/sglang:deepseek-v4-blackwell@sha256:
-408846…`). S3 wouldn't pull faster. **If** Docker Hub pulls become slow or rate-limited across many
-boxes, the right fix is an **ECR mirror in the launch region** (`docker tag` + push once, pull from
-ECR after) — not S3. Low priority until pulls are a measured bottleneck.
+408846…`). S3 wouldn't pull faster, so it stays on Docker Hub as the **fallback**; the **in-region ECR
+mirror** is the fast path (compressed registry content ~25.6 GB, AWS-backbone, layer-cached).
+
+**Region-derived, NOT hardcoded (fixed 2026-06-28).** The dsv4 setup (`acquire_image()` in both
+`cairn-dsv4.sky.yaml` and `cairn-dsv4-spare.sky.yaml`) now derives `ECR_REGION` from IMDS
+(`placement/region`) — exactly like `acquire_weights()` — so the mirror pull is always in-region.
+Previously `ECR_REGION` was hardcoded to `eu-south-2`, so a fleet (or a replenished spare) launched in
+e.g. us-east-2/Ohio pulled the image **cross-region** from eu-south-2 — slow, every box, every spare
+(observed live 2026-06-28). If the in-region pull misses (repo not yet populated there), it falls back
+to the ~82 GB Docker Hub pull.
+
+**Lazy-per-region, like the weights cache.** ECR repos are region-scoped, so the `cairn-sglang` mirror
+must be populated **once per actively-used region**. Mirror from a live box that already pulled the
+image, overriding `ECR_REGION` to the cluster's region (the helper ensure-creates the repo):
+```sh
+set -a; source infra/secrets.env; set +a
+CLUSTER=cairn-dsv4 ECR_REGION=us-east-2 bash infra/skypilot/cache-image.sh   # Ohio; repeat per region used
+```
+Creating a *new* region's repo needs `ecr:CreateRepository` (the `cairn-s3-populate` key has R/W on the
+existing repo only); the script tries the `admin-cli` profile, else prints the one-line create command.
+First launch in an un-mirrored region is a Docker Hub fallback (correct, just slower) — populate after so
+the next launch / spare there is an in-region hit.
 
 ## Next steps (priority order — weights fan-out is the headline)
 - [x] Kernel build → S3, wired into the dsv4 yaml (2026-06-24).
@@ -130,7 +149,9 @@ ECR after) — not S3. Low priority until pulls are a measured bottleneck.
       keying/populate/restore convention (and the same instance-profile read path).
 - [ ] Tie weight-cache into the recovery path: spare/replacement boxes pull from in-region S3 →
       measure the MTTR improvement vs HF (feeds the Path 2 / headline recovery numbers).
-- [ ] ECR image mirror — only if Docker Hub pull time is measured as a problem (lowest priority).
+- [x] ECR image mirror — region-derived (IMDS) in `acquire_image()`, lazy-per-region populate via
+      `cache-image.sh` (fixed the eu-south-2 cross-region hardcode, 2026-06-28). Follow-up: a standing
+      `ecr:CreateRepository` perm so new-region repos auto-create without the admin-cli profile.
 
 > **Scale note (the reason this is the default, not an optimization):** at 10-20 boxes, per-box HF
 > pulls = multi-TB egress per launch + rate-limit throttling + slow bring-up. Download-once-to-S3 +

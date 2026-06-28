@@ -55,16 +55,22 @@ setup: |
   fi
   sudo systemctl restart docker || true
   # 2. Image — in-region ECR mirror else Docker Hub.
-  IMG="lmsysorg/sglang:deepseek-v4-blackwell"; ECR_REGION="eu-south-2"
-  ECR_REPO="AWS_ACCOUNT_ID.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
+  IMG="lmsysorg/sglang:deepseek-v4-blackwell"
   acquire_image() {
     sudo docker image inspect "$IMG" >/dev/null 2>&1 && { echo "[setup] image present"; return; }
+    # Derive the ECR region from IMDS (same as the weights step) so the in-region mirror matches the
+    # LAUNCH region — a hardcoded eu-south-2 forces a slow cross-region pull on every out-of-region box.
+    local _T R ECR_REGION ECR_REPO
+    _T=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
+    R=$(curl -s -H "X-aws-ec2-metadata-token: $_T" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+    ECR_REGION="${R:-eu-south-2}"
+    ECR_REPO="AWS_ACCOUNT_ID.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
     if [ -n "${CAIRN_S3_WRITE_ACCESS_KEY_ID:-}" ] \
        && AWS_ACCESS_KEY_ID="$CAIRN_S3_WRITE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_WRITE_SECRET_ACCESS_KEY" \
             aws ecr get-login-password --region "$ECR_REGION" 2>/dev/null \
             | sudo docker login --username AWS --password-stdin "$ECR_REPO" >/dev/null 2>&1 \
        && sudo docker pull "$ECR_REPO:deepseek-v4-blackwell"; then
-      sudo docker tag "$ECR_REPO:deepseek-v4-blackwell" "$IMG"; echo "[setup] image from ECR mirror"
+      sudo docker tag "$ECR_REPO:deepseek-v4-blackwell" "$IMG"; echo "[setup] image from ECR mirror ($ECR_REGION)"
     else sudo docker pull "$IMG"; fi
   }
   # 3. Weights — in-region S3 sync (else HF).
