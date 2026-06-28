@@ -88,6 +88,11 @@ def main() -> None:
     # defaults to 0 so set_next reaches the entry just like before).
     ap.add_argument("--stage-rank", type=int, default=0,
                     help="position in the pipeline (0=entry; used by N-stage recovery to address set_next)")
+    ap.add_argument("--announce", action="store_true",
+                    help="standby spare: send a hello{host,port} on edge_out so the driver learns this "
+                         "node's listen addr for promotion (needed for replenished spares with new IPs)")
+    ap.add_argument("--advertise-host", default="",
+                    help="host to advertise in the --announce hello (the box's routable IP; default bind-host)")
     a = ap.parse_args()
 
     from shard.node import LayerRange
@@ -108,6 +113,17 @@ def main() -> None:
 
     edge_out = LanEdge(a.next_host, a.next_port)
     _connect_retry(edge_out)              # dial next (it listens early too), then wait for our prev to dial in
+    # A standby SPARE announces its own listen addr to the driver (its edge_out → the driver's spare-sink)
+    # so the driver learns where to dial to PROMOTE it — essential for REPLENISHED spares (a freshly
+    # provisioned box has a new IP the driver didn't know at launch). One-shot; the driver reads it as the
+    # spare's hello, then the spare waits idle until promoted. Off the data path (no effect once serving).
+    if a.announce:
+        adv = a.advertise_host or a.bind_host
+        try:
+            edge_out.send({"op": "hello", "host": adv, "port": a.listen_port})
+            print(f"[serve] announced standby addr {adv}:{a.listen_port} to the driver", flush=True)
+        except Exception:
+            pass
     # Wait for our prev — but ALSO watch edge_out. If the DOWNSTREAM closes first, the run is being torn
     # down and no prev is ever coming: the canonical case is a pre-warmed standby SPARE in a no-death run
     # — never promoted, so a bare accept() blocks FOREVER and hangs teardown (the first live rec run +

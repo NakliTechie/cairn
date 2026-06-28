@@ -165,11 +165,12 @@ def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
             except Exception:
                 pass
 
-    st = {"head": head, "read": tail, "seq": seq}
+    st = {"head": head, "read": tail, "seq": seq, "k": None}
 
     def _recover(k: int):
         """Re-stitch for a loss at rank k, replay the committed history, return (pending_tok, hist_len, mttr)."""
         t0 = time.time()
+        st["k"] = k
         if k == 0:                                                  # ENTRY — the driver is the predecessor
             try:
                 st["head"].close()
@@ -218,11 +219,10 @@ def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
         tok = int(msg["h"][:, -1].argmax(-1))
         out.append(tok); pos += cur.shape[1]; cur = torch.tensor([[tok]])
         _emit("tok", len(out), tok)
-    try:
-        st["head"].send({"op": "stop"})
-    except Exception:
-        pass
-    return out[:n_new], mttr
+    # Do NOT send {op:stop} here — serve_http keeps the fleet up across requests. The caller stops it.
+    # Returns the (possibly re-pointed) head/read edges + which rank was replaced, so a PERSISTENT driver
+    # can update its topology: stage_addrs[k_dead] becomes the promoted spare's address (it now serves k).
+    return out[:n_new], mttr, st["head"], st["read"], st["k"]
 
 
 def _spawn_stage(runtime, model, ls, le, lp, nh, np_, rank, device="cpu",
@@ -305,9 +305,13 @@ def prove_recovery_nstage(runtime: str, model: str, num_layers: int, cuts: List[
             elif kind == "recovered":
                 log(f"[prove-N] *** RECOVERED in {p[0]:.3f}s — resumed at tok {p[2]} = {p[1]}")
 
-        rec, mttr = decode_with_recovery_nstage(head, tail_e, spare_e, stage_addrs=stage_addrs,
-                                                spare_addr=("127.0.0.1", spare_port), prompt=prompt,
-                                                n_new=n_new, on_event=_on)
+        rec, mttr, new_head, _read, _k = decode_with_recovery_nstage(
+            head, tail_e, spare_e, stage_addrs=stage_addrs, spare_addr=("127.0.0.1", spare_port),
+            prompt=prompt, n_new=n_new, on_event=_on)
+        try:
+            new_head.send({"op": "stop"})                          # tear the (healed) pipeline down
+        except Exception:
+            pass
         ok = (rec == ref)
         log(f"[prove-N] rec (drain k={k_dead}) = {rec}  MATCH={ok}  "
             f"MTTR={('%.3fs' % mttr) if mttr is not None else 'none'}")

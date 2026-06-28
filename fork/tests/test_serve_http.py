@@ -58,7 +58,7 @@ def test_serve_http_mock_roundtrip():
     procs = [entry, tail]
     head = srv = None
     try:
-        head, tail_e, _spare = connect_fleet("127.0.0.1", base, base + 2, bind_host="127.0.0.1")
+        head, tail_e, _spares, _sink = connect_fleet("127.0.0.1", base, base + 2, bind_host="127.0.0.1")
         eng = FleetEngine("mock:8", head, tail_e, api_key="sk-test")
         srv = make_server(eng, "127.0.0.1", base + 5)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -109,9 +109,10 @@ def test_serve_http_recovers_on_abrupt_tail_kill():
     procs = [entry, tail, spare]
     head = None
     try:
-        head, tail_e, spare_e = connect_fleet("127.0.0.1", base, base + 3, bind_host="127.0.0.1",
-                                              spare_sink=base + 4)
-        assert spare_e is not None
+        head, tail_e, _spares, _sink = connect_fleet("127.0.0.1", base, base + 3, bind_host="127.0.0.1",
+                                                     spare_sink=base + 4, n_spares=1)
+        assert _spares
+        spare_e = _spares[0][0]
         eng = FleetEngine("mock:8", head, tail_e, spare=spare_e, spare_host="127.0.0.1", spare_port=base + 2)
         req = ChatRequest(model="mock:8", messages=[{"role": "user", "content": "hello"}], max_tokens=6)
 
