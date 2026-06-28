@@ -47,8 +47,8 @@ These are measured on a live fleet, not simulated or computed:
 | Capability | Evidence |
 |---|---|
 | **Distributed frontier-model decode** | DeepSeek-V4-Flash FP8 (600B, 43 layers) split 4 ways across 4× g7e spot in Ohio; coherent, correct answers ("A cairn is a human-made pile of stones…", "17×24 = 408", a full ~990-word essay on Rome). |
-| **Hot-swap recovery — single stream** | Tail stage drained mid-generation → warm spare re-stitched → resumed bit-identical, **zero dropped tokens**. Measured MTTR: **0.023s** (pre-warmed L4), **0.93s** and **3.26s** (V4 on Blackwell, mid-essay). |
-| **Recovery is position-aware** | Proactive drain (the ~2-min spot pre-warning) carries the dying stage's identity → graceful migration before death. Reactive (abrupt SIGKILL) half-open-timeout fallback proven on the tail. |
+| **Hot-swap recovery (tail) — single stream** | Tail stage drained mid-generation → warm spare re-stitched → resumed bit-identical, **zero dropped tokens**. Measured MTTR: **0.023s** (pre-warmed L4), **0.93s** (abrupt kill) and **3.26s** (proactive drain mid-essay), V4 on Blackwell. Tail tested live 4×, both proactive and reactive. |
+| **Recovery is position-independent** | The recovery code handles **any** position (entry / middle / tail) and is **CPU-proven bit-identical 7/7** (N=3 k=0/1/2 + N=4 k=0/1/2/3) vs the no-death oracle. On GPU, the **tail** path is live-confirmed; entry/middle live-confirmation is pending (see below). Proactive drain carries the dying stage's identity for graceful pre-death migration; reactive (abrupt SIGKILL) half-open-timeout is the fallback. |
 | **Multi-stream throughput** | 6 concurrent streams served live; throughput scales near-linearly to the fleet ceiling: **6.1 → 12.4 → 24.5 → 24.9 tok/s** at 1/2/4/8 streams (≈4× occupancy gain before saturation). |
 | **Self-replenishing pool** | Consuming the spare auto-fired a real `sky launch` of a replacement spot box (host-side replenish watcher). Verified live. |
 | **Warm re-slicing** | A 3-way fit that OOM'd by a hair was re-cut to 4-way **on the same running boxes** from on-disk weights (~8 min) instead of a cold relaunch (~40 min). |

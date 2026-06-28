@@ -20,8 +20,11 @@ consulting upside**, not a SaaS. That changes the bar. Two different finish line
 
 ### Target A — open-source artifact + benchmarks + paper (the stated goal)
 **Gap: small-to-medium.** What's needed:
-1. **Live-confirm the remaining recovery matrix** (multi-stream swap, entry/mid drains,
-   multi-death) — the claims need live evidence, not CPU proofs. _~1–2 GPU sessions._
+1. **GPU-confirm the non-tail recovery positions.** Recovery is already proven
+   position-independent on CPU (bit-identical 7/7: entry/middle/tail), and the **tail** is
+   live-confirmed on GPU (4×, proactive + reactive). What's pending is converting
+   entry/middle from CPU-proven → live-on-GPU, plus live multi-stream swap and multi-death.
+   _~1–2 GPU sessions._
 2. **Head-to-head benchmarks** vs the prior art (SpotServe / Petals / KevlarFlow) on their
    exact models — the "on-demand-grade reliability at ~spot cost" number, with MTTR and
    tokens-dropped distributions. _The measurement harness exists; needs runs._
