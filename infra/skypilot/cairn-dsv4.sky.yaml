@@ -47,8 +47,11 @@ resources:
   region: eu-south-2                  # SPAIN — $1.25/hr spot vs Seoul $1.43 (2026-06-23 live), <5% interruption
   instance_type: g7e.2xlarge          # 1× RTX PRO 6000 Blackwell (sm_120), 96 GiB VRAM
   use_spot: true
-  disk_size: 600                      # FP8 weights ~294 GiB + ~82 GiB extracted docker image + system + headroom
-                                      # (400 overflowed mid-sync: 294+82 > 400 — GPU-confirmed 2026-06-27 FAILED_SETUP)
+  disk_size: 150                      # OS + small file_mounts + ~/dsv4 kernel build only. The ~294 GiB FP8
+                                      # weights AND the ~82 GiB docker image now stage on the 1.7 TB NVMe
+                                      # instance store (/opt/dlami/nvme) — see setup step 0 (2026-06-28).
+                                      # (History: 400 overflowed the EBS root mid-sync 2026-06-27; bumped to
+                                      # 600; then moved the big artifacts off EBS entirely → back to 150.)
   # Blackwell DLAMI (R580 driver) — REQUIRED. SkyPilot's default Ubuntu AMI ships nvidia 535 which
   # cannot probe sm_120 ("probe of 0000:2b:00.0 failed with error -1"). Confirmed live 2026-06-23.
   # AMI IDs are PER-REGION (same build "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)
@@ -93,11 +96,41 @@ setup: |
   # So setup = pull the image + build the patch + pre-fetch weights. No host-side venv needed for
   # serving — cairn_node.serve runs INSIDE the container at run time.
 
-  # 1. Docker (DLAMI already ships it but be defensive)
+  # 0. NVMe instance-store staging (2026-06-28): the Blackwell DLAMI auto-mounts the 1.7 TB local NVMe
+  #    at /opt/dlami/nvme. Stage the ~294 GB FP8 weights AND the ~82 GB docker image there instead of the
+  #    EBS root — it's free (included in the instance price) and multi-GB/s, so (a) disk_size drops
+  #    600→150, and (b) the weight load + the N-stage recovery slice-reload ride NVMe bandwidth, not gp3
+  #    EBS (the recovery design's fast-reload path; open throughput question in pending.md). Ephemeral
+  #    (wiped on stop/terminate) — fine, we re-sync weights from S3 every launch. Falls back to the EBS
+  #    root ($HOME) if the mount is absent (non-DLAMI AMI / instance with no local store) — in that case
+  #    bump disk_size back up, since 150 GiB can't hold the weights.
+  NVME=/opt/dlami/nvme
+  if mountpoint -q "$NVME" 2>/dev/null; then
+    sudo mkdir -p "$NVME/model" "$NVME/docker"
+    sudo chown "$USER":"$USER" "$NVME/model"
+    MODEL_DIR="$NVME/model"
+    DOCKER_DATA_ROOT="$NVME/docker"
+    echo "[setup] NVMe staging on $NVME ($(df -h "$NVME" | awk 'NR==2{print $4}') free) — weights + docker image land here"
+  else
+    mkdir -p "$HOME/model"
+    MODEL_DIR="$HOME/model"
+    DOCKER_DATA_ROOT=""
+    echo "[setup] WARNING: NVMe instance store not mounted at $NVME — staging weights on EBS root ($MODEL_DIR); disk_size=150 will NOT fit 294 GiB, bump it"
+  fi
+
+  # 1. Docker (DLAMI already ships it but be defensive). Point its data-root at the NVMe instance store
+  #    (when present) so the ~82 GB image extracts onto NVMe, not the EBS root — must precede any pull.
   if ! command -v docker >/dev/null; then
     curl -fsSL https://get.docker.com | sudo sh
     sudo systemctl enable --now docker
     sudo usermod -aG docker $USER
+  fi
+  if [ -n "$DOCKER_DATA_ROOT" ]; then
+    sudo mkdir -p "$DOCKER_DATA_ROOT"
+    # MERGE data-root into the existing daemon.json — do NOT clobber the nvidia-container-runtime block
+    # the DLAMI registered there (overwriting it breaks `--gpus all` → "could not select device driver").
+    sudo python3 -c "import json,os; p='/etc/docker/daemon.json'; d=(json.load(open(p)) if os.path.exists(p) and os.path.getsize(p)>0 else {}); d['data-root']='$DOCKER_DATA_ROOT'; json.dump(d, open(p,'w'), indent=2); print('[setup] daemon.json now:', d)"
+    echo "[setup] docker data-root -> $DOCKER_DATA_ROOT (image on NVMe; nvidia runtime preserved)"
   fi
   # nvidia-container-toolkit (the DLAMI ships it but the runtime config sometimes needs a kick)
   sudo systemctl restart docker || true
@@ -136,7 +169,7 @@ setup: |
   # 4. Acquire FP8 weights — IN-REGION S3 sync (cache hit, AWS backbone, no HF egress) else HF snapshot
   #    (lazy-populate: the controller stages this region's bucket once so the NEXT launch is a hit).
   acquire_weights() {
-    mkdir -p ~/model
+    mkdir -p "$MODEL_DIR"
     export HF_HUB_ENABLE_HF_TRANSFER=1
     local _TOK REGION S3
     _TOK=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
@@ -145,13 +178,13 @@ setup: |
     if [ -n "${CAIRN_S3_CACHE_ACCESS_KEY_ID:-}" ] && command -v aws >/dev/null 2>&1 \
        && AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
             aws s3 ls "$S3/config.json" --region "$REGION" >/dev/null 2>&1; then
-      echo "[setup] S3 cache HIT ($REGION) — syncing weights from $S3 (in-region backbone)"
+      echo "[setup] S3 cache HIT ($REGION) — syncing weights from $S3 to $MODEL_DIR (in-region backbone)"
       AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
-        aws s3 sync "$S3" ~/model --region "$REGION" --only-show-errors
+        aws s3 sync "$S3" "$MODEL_DIR" --region "$REGION" --only-show-errors
     else
-      echo "[setup] S3 cache MISS ($REGION) — downloading weights from HF (lazy-populate the bucket separately)"
+      echo "[setup] S3 cache MISS ($REGION) — downloading weights from HF to $MODEL_DIR (lazy-populate the bucket separately)"
       pip3 install -q --user "huggingface_hub[cli]" hf_transfer
-      python3 -c "from huggingface_hub import snapshot_download; snapshot_download('sgl-project/DeepSeek-V4-Flash-FP8', local_dir='/home/ubuntu/model', max_workers=8)"
+      python3 -c "from huggingface_hub import snapshot_download; snapshot_download('sgl-project/DeepSeek-V4-Flash-FP8', local_dir='$MODEL_DIR', max_workers=8)"
     fi
   }
 
@@ -191,7 +224,8 @@ setup: |
   # 5. Sanity checks
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
   ls -la ~/dsv4/build-docker/ || true
-  du -sh ~/model || true
+  du -sh "$MODEL_DIR" || true
+  df -h "$MODEL_DIR" / | sed 's/^/[setup][disk] /' || true
 
 run: |
   set -uo pipefail
@@ -202,6 +236,11 @@ run: |
   MODEL=${MODEL:-sgl-project/DeepSeek-V4-Flash-FP8}
   API_KEY=${CAIRN_API_KEY:-sk-cairn-demo}
   NLAYERS=43
+
+  # Weights live on the NVMe instance store when setup staged them there (2026-06-28), else the EBS root.
+  MODEL_DIR=/home/ubuntu/model
+  [ -d /opt/dlami/nvme/model ] && MODEL_DIR=/opt/dlami/nvme/model
+  echo "[dsv4] weights mounted from $MODEL_DIR"
 
   # Path-β layer split (43 layers, N=3 → balanced front-loaded):
   #   rank 0: [0,15)   — entry, embeds tokens
@@ -238,7 +277,7 @@ run: |
   #   create_weights). Left at the checkpoint default -> the proven ~58 GiB/box load.
   DOCKER_RUN_COMMON="sudo docker run --rm --gpus all --shm-size=64g --ipc=host --network host \
     -v /home/ubuntu/dsv4/build-docker:/dsv4:ro \
-    -v /home/ubuntu/model:/workspace/model:ro \
+    -v $MODEL_DIR:/workspace/model:ro \
     -v /home/ubuntu/.sky/file_mounts/cairn:/cairn:ro \
     -w /cairn \
     -e PYTHONPATH=/dsv4:/cairn:/cairn/fork:/cairn/scheduler/src \
