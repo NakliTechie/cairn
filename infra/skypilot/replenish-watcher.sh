@@ -23,6 +23,10 @@ SKY=${SKY_BIN:-sky}
 SPARE_YAML=${CAIRN_SPARE_YAML:-infra/skypilot/cairn-dsv4-spare.sky.yaml}
 MAX=${CAIRN_REPLENISH_MAX:-10}                 # safety cap on total replacements this watcher will launch
 
+# `sky launch` resolves the spare yaml's relative file_mounts (./fork, ./cairn_node, …) + the SPARE_YAML
+# path from the CWD — so run from the synced project dir (the box's ~/.sky/file_mounts/cairn).
+cd "${CAIRN_PROJECT_DIR:-.}" || { echo "[replenish-watcher] cannot cd to ${CAIRN_PROJECT_DIR:-.}"; exit 1; }
+
 mkdir -p "$(dirname "$REQ_FILE")"; : > "$REQ_FILE"
 echo "[replenish-watcher] watching $REQ_FILE -> launches $SPARE_YAML; driver=$DRIVER_HOST:$SPARE_SINK rank=${SPARE_RANK:-tail}"
 

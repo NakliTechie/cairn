@@ -229,6 +229,24 @@ setup: |
   du -sh "$MODEL_DIR" || true
   df -h "$MODEL_DIR" / | sed 's/^/[setup][disk] /' || true
 
+  # 6. SELF-REPLENISH prep (opt-in via CAIRN_SELF_REPLENISH; rank0 only). The host-side replenish-watcher
+  #    provisions replacement spares with `sky launch`, so rank0 needs `sky` + a launch key. Install a
+  #    dedicated sky venv (off the DLAMI python); the launch key arrives via --env CAIRN_LAUNCH_AWS_* (the
+  #    scoped cairn-skypilot key for the test, or the narrower cairn-spare-launcher in prod). If
+  #    SKYPILOT_NODE_RANK is unset in setup, all nodes install (harmless; only rank0 runs the watcher).
+  if [ -n "${CAIRN_SELF_REPLENISH:-}" ] && [ "${SKYPILOT_NODE_RANK:-0}" = "0" ]; then
+    echo "[setup] self-replenish: installing a sky venv on the box for provisioning replacement spares ..."
+    python3 -m venv ~/.cairn-box-sky 2>/dev/null || true
+    ~/.cairn-box-sky/bin/pip install -q --upgrade pip 2>/dev/null || true
+    if ~/.cairn-box-sky/bin/pip install -q "skypilot[aws]" 2>/tmp/sky-install.log; then
+      AWS_ACCESS_KEY_ID="${CAIRN_LAUNCH_AWS_ACCESS_KEY_ID:-}" AWS_SECRET_ACCESS_KEY="${CAIRN_LAUNCH_AWS_SECRET_ACCESS_KEY:-}" \
+        ~/.cairn-box-sky/bin/sky check aws 2>&1 | tail -2 || true
+      echo "[setup] sky installed for self-replenish (~/.cairn-box-sky/bin/sky)"
+    else
+      echo "[setup] WARN: sky install failed (see /tmp/sky-install.log) — self-replenish provisioning disabled"
+    fi
+  fi
+
 run: |
   set -uo pipefail
   RANK=${SKYPILOT_NODE_RANK}
@@ -374,9 +392,20 @@ run: |
     # (infra/aws/cairn-spare-launch-policy.json) — admin step, hence opt-in.
     if [ -n "${CAIRN_SELF_REPLENISH:-}" ]; then
       : > /tmp/cairn-shared/cairn-replenish-req
+      _TOK=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
+      _REGION=$(curl -s -H "X-aws-ec2-metadata-token: $_TOK" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+      _AMI=$(curl -s -H "X-aws-ec2-metadata-token: $_TOK" http://169.254.169.254/latest/meta-data/ami-id 2>/dev/null)
+      # The watcher launches replacement spares with `sky` (box venv) using the launch key (CAIRN_LAUNCH_AWS_*),
+      # matching THIS box's region + AMI, and passing the weight/image creds through to the spare's setup.
       DRIVER_PRIVATE_IP="$IP0" CAIRN_SPARE_RANK="${CAIRN_SPARE_RANK:-}" \
-      CAIRN_REPLENISH_REQ=/tmp/cairn-shared/cairn-replenish-req SKY_BIN="${SKY_BIN:-sky}" \
-      CAIRN_REGION="${CAIRN_REGION:-}" CAIRN_IMAGE_ID="${CAIRN_IMAGE_ID:-}" \
+      CAIRN_REPLENISH_REQ=/tmp/cairn-shared/cairn-replenish-req \
+      CAIRN_PROJECT_DIR=/home/ubuntu/.sky/file_mounts/cairn \
+      SKY_BIN="${SKY_BIN:-$HOME/.cairn-box-sky/bin/sky}" \
+      CAIRN_REGION="${CAIRN_REGION:-$_REGION}" CAIRN_IMAGE_ID="${CAIRN_IMAGE_ID:-$_AMI}" \
+      AWS_ACCESS_KEY_ID="${CAIRN_LAUNCH_AWS_ACCESS_KEY_ID:-}" AWS_SECRET_ACCESS_KEY="${CAIRN_LAUNCH_AWS_SECRET_ACCESS_KEY:-}" \
+      HF_TOKEN="${HF_TOKEN:-}" SHARD_PSK="${SHARD_PSK:-}" \
+      CAIRN_S3_CACHE_ACCESS_KEY_ID="${CAIRN_S3_CACHE_ACCESS_KEY_ID:-}" CAIRN_S3_CACHE_SECRET_ACCESS_KEY="${CAIRN_S3_CACHE_SECRET_ACCESS_KEY:-}" \
+      CAIRN_S3_WRITE_ACCESS_KEY_ID="${CAIRN_S3_WRITE_ACCESS_KEY_ID:-}" CAIRN_S3_WRITE_SECRET_ACCESS_KEY="${CAIRN_S3_WRITE_SECRET_ACCESS_KEY:-}" \
         nohup bash /home/ubuntu/.sky/file_mounts/cairn/infra/skypilot/replenish-watcher.sh \
         > /tmp/cairn-replenish-watcher.log 2>&1 &
       echo "[dsv4] self-replenish watcher started (host-side) — /tmp/cairn-replenish-watcher.log"
@@ -412,6 +441,10 @@ envs:
   CAIRN_SPARE_RANK: ""                  # which rank the spare is shaped for (default: tail = NWAY-1)
   CAIRN_SELF_REPLENISH: ""             # non-empty → serve_http launches a replacement spare on consumption
   CAIRN_REPLENISH_CMD: ""             # shell cmd that provisions one replacement spare (host-side sky + creds)
+  # Launch key for the host-side replenish-watcher's `sky launch` (the scoped cairn-skypilot key for the
+  # test, or the narrower cairn-spare-launcher in prod). Pass via --env from your shell; empty → no provisioning.
+  CAIRN_LAUNCH_AWS_ACCESS_KEY_ID: ""
+  CAIRN_LAUNCH_AWS_SECRET_ACCESS_KEY: ""
   # cairn-s3-cache READ-ONLY key (in secrets.env) → setup step 4 syncs weights from in-region S3.
   # Empty default ⇒ setup falls back to HF (so the yaml still works before the key exists).
   CAIRN_S3_CACHE_ACCESS_KEY_ID: ""
