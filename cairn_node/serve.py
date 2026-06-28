@@ -176,6 +176,7 @@ def main() -> None:
             print(f"[serve] spot_watch armed (interval={interval}s) — will drain on the ~2-min notice", flush=True)
 
     die_after = int(os.environ.get("CAIRN_DIE_AFTER", "0"))   # induced-death test hook: hard-exit after N forwards
+    drain_after = int(os.environ.get("CAIRN_DRAIN_AFTER", "0"))  # induced-DRAIN hook (proactive): drain after N forwards
     drained_sent = False                                      # emit the draining op AT MOST once
     nfwd = 0
     while True:
@@ -194,6 +195,31 @@ def main() -> None:
                 print("[serve] drained tail: entry re-stitched to the spare, edge_in closed — "
                       "exiting cleanly", flush=True)
                 break
+            # N-STAGE RECOVERY (2026-06-28): a SURVIVING stage whose PREDECESSOR was just replaced (i.e. the
+            # dead/drained node's successor) sees its edge_in break. Instead of dying, RE-ACCEPT a new
+            # predecessor on lsock — the promoted spare (or a re-stitched k-1) dials in. Bounded by
+            # CAIRN_REACCEPT_TIMEOUT; a timeout = no replacement is coming (genuine catastrophic failure,
+            # Path 2's job) → re-raise fail-loud. rank 0 (entry) NEVER re-accepts: its predecessor is the
+            # driver, which re-points its own outbound to the spare directly (recovery.py entry-replace).
+            if a.stage_rank > 0:
+                ra = float(os.environ.get("CAIRN_REACCEPT_TIMEOUT", "150"))
+                print(f"[serve] rank {a.stage_rank}: edge_in closed (predecessor replaced?) — re-accepting "
+                      f"a new predecessor on :{a.listen_port} (timeout {ra}s)", flush=True)
+                lsock.settimeout(ra)
+                try:
+                    conn2, _ = lsock.accept()
+                except (OSError, socket.timeout):
+                    print(f"[serve] rank {a.stage_rank}: re-accept timed out — no replacement; re-raising",
+                          flush=True)
+                    raise
+                lsock.settimeout(None)
+                try:
+                    edge_in.close()
+                except Exception:
+                    pass
+                edge_in = LanEdge.from_socket(conn2)
+                print(f"[serve] rank {a.stage_rank}: re-accepted new predecessor — resuming", flush=True)
+                continue
             raise
         if isinstance(msg, dict) and "op" in msg:
             if msg["op"] == "stop":
@@ -252,6 +278,8 @@ def main() -> None:
                     pass
                 continue
             continue                              # unknown op — ignore
+        if drain_after and nfwd >= drain_after:   # induced-drain test hook (deterministic proactive drain)
+            _draining[0] = True
         # Draining? Tell the driver ONCE (it pre-emptively re-stitches the entry to the warm spare), then
         # loop back to recv. We send the notice in PLACE of this forward's result: the driver reads it as the
         # response to its in-flight send, re-stitches + replays through the spare for the pending token, and

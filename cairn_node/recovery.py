@@ -131,6 +131,206 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
     return out[:n_new], mttr
 
 
+def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
+                                prompt: List[int], n_new: int, seq: str = "s0", on_event=None):
+    """N-stage generic-spare recovery: greedy-decode `n_new` tokens through entry(rank0) -> … -> tail,
+    surviving the loss of ANY stage (entry / middle / tail) onto ONE generic warm `spare`.
+
+      head        — edge → entry (rank 0); the driver sends here (re-pointed to the spare on ENTRY-replace).
+      tail        — edge ← tail (rank N-1); the driver reads here (swapped to `spare` on TAIL-replace).
+      spare       — edge ← the warm spare (spare → driver spare-sink); becomes the read edge iff the spare
+                    replaces the TAIL (its launch edge_out already points at the driver's spare-sink).
+      stage_addrs — [(host, listen_port)] per rank 0..N-1 (each stage's lsock) — used to fill the spare's
+                    new downstream (k+1) on middle/entry replace.
+      spare_addr  — (host, listen_port) of the spare's lsock (a predecessor / the driver dials it to promote).
+
+    Trigger: PROACTIVE drain ({op:draining, stage:k} propagates downstream to the driver) covers ANY
+    position. REACTIVE (the read edge raises) covers the TAIL (k=N-1); a reactive MIDDLE death needs
+    per-stage heartbeats to identify k (Path 2) — out of scope here. ONE mechanism, three re-stitch cases:
+      • tail   (k=N-1): set_next(target k-1 → spare); spare keeps edge_out→driver spare-sink → read `spare`.
+      • middle (0<k<N-1): set_next(target k-1 → spare, spare_next=addr[k+1]); spare set_my_next→k+1; read tail.
+      • entry  (k=0): driver re-points its OWN head → spare; spare set_my_next→addr[1]; read tail.
+    Then REPLAY the committed history under a FRESH seq (every stage re-prefills → KV rebuilt; the replay's
+    last logit IS the pending token), resume. The surviving SUCCESSOR of the dead stage re-accepts the spare
+    on its lsock (serve.py rank>0 re-accept). Returns (tokens, mttr_s | None)."""
+    import torch
+    from shard.transport import LanEdge, EDGE_ERRORS
+    N = len(stage_addrs)
+    sp_host, sp_port = spare_addr
+
+    def _emit(kind, *p):
+        if on_event is not None:
+            try:
+                on_event(kind, *p)
+            except Exception:
+                pass
+
+    st = {"head": head, "read": tail, "seq": seq}
+
+    def _recover(k: int):
+        """Re-stitch for a loss at rank k, replay the committed history, return (pending_tok, hist_len, mttr)."""
+        t0 = time.time()
+        if k == 0:                                                  # ENTRY — the driver is the predecessor
+            try:
+                st["head"].close()
+            except Exception:
+                pass
+            nh = LanEdge(sp_host, sp_port)
+            _connect_retry(nh)                                      # driver → spare (promotes it: lsock accepts)
+            nh.send({"op": "set_my_next", "host": stage_addrs[1][0], "port": stage_addrs[1][1]})
+            st["head"] = nh                                         # send prompts to the spare now
+        elif k == N - 1:                                            # TAIL — spare keeps edge_out→driver sink
+            st["head"].send({"op": "set_next", "target_stage": k - 1, "host": sp_host, "port": sp_port})
+            st["read"] = spare                                      # results now arrive on the spare edge
+        else:                                                       # MIDDLE — k-1 → spare → k+1
+            st["head"].send({"op": "set_next", "target_stage": k - 1, "host": sp_host, "port": sp_port,
+                             "spare_next_host": stage_addrs[k + 1][0], "spare_next_port": stage_addrs[k + 1][1]})
+        st["seq"] = st["seq"] + "~r"                                # fresh seq → full re-prefill rebuilds KV
+        hist = list(prompt) + out
+        st["head"].send({"h": torch.tensor([hist]), "seq": st["seq"], "pos": 0})
+        ptok = int(st["read"].recv()["h"][:, -1].argmax(-1))       # last logit = the pending token
+        return ptok, len(hist), time.time() - t0
+
+    cur = torch.tensor([list(prompt)])
+    out: List[int] = []
+    pos = 0
+    mttr = None
+    recovered = False
+    while len(out) < n_new:
+        st["head"].send({"h": cur, "seq": st["seq"], "pos": pos})
+        try:
+            msg = st["read"].recv()
+        except EDGE_ERRORS:                                         # REACTIVE: read edge broke → tail death
+            if recovered:
+                raise RuntimeError("second node loss — out of warm spares (Path-1 single-spare scope)")
+            _emit("death", N - 1, len(out))
+            tok, hist_len, mttr = _recover(N - 1)
+            out.append(tok); pos = hist_len; cur = torch.tensor([[tok]]); recovered = True
+            _emit("recovered", mttr, tok, len(out)); continue
+        if isinstance(msg, dict) and msg.get("op") == "draining":  # PROACTIVE: a stage signalled (carries k)
+            if recovered:
+                continue                                           # already migrated; ignore a late notice
+            k = int(msg.get("stage", N - 1))
+            _emit("draining", k, len(out))
+            tok, hist_len, mttr = _recover(k)
+            out.append(tok); pos = hist_len; cur = torch.tensor([[tok]]); recovered = True
+            _emit("recovered", mttr, tok, len(out)); continue
+        tok = int(msg["h"][:, -1].argmax(-1))
+        out.append(tok); pos += cur.shape[1]; cur = torch.tensor([[tok]])
+        _emit("tok", len(out), tok)
+    try:
+        st["head"].send({"op": "stop"})
+    except Exception:
+        pass
+    return out[:n_new], mttr
+
+
+def _spawn_stage(runtime, model, ls, le, lp, nh, np_, rank, device="cpu",
+                 drain_after=None, die_after=None, mem_fraction=None):
+    """Spawn one cairn_node.serve with an explicit --stage-rank (N-stage), optionally inducing a
+    proactive DRAIN (CAIRN_DRAIN_AFTER) or an abrupt DEATH (CAIRN_DIE_AFTER) after N forwards."""
+    env = {**os.environ, "PYTHONPATH": str(_ROOT)}
+    env.pop("CAIRN_DIE_AFTER", None)
+    env.pop("CAIRN_DRAIN_AFTER", None)
+    if drain_after:
+        env["CAIRN_DRAIN_AFTER"] = str(drain_after)
+    if die_after:
+        env["CAIRN_DIE_AFTER"] = str(die_after)
+    if mem_fraction:
+        env["CAIRN_SGLANG_MEM_FRACTION"] = str(mem_fraction)
+    return subprocess.Popen(
+        [sys.executable, "-m", "cairn_node.serve", "--runtime", runtime, "--model", model,
+         "--layer-start", str(ls), "--layer-end", str(le), "--device", device,
+         "--listen-port", str(lp), "--bind-host", "127.0.0.1",
+         "--next-host", nh, "--next-port", str(np_), "--stage-rank", str(rank)],
+        cwd=str(_ROOT), env=env)
+
+
+def prove_recovery_nstage(runtime: str, model: str, num_layers: int, cuts: List[int], prompt: List[int],
+                          n_new: int, *, k_dead: int, drain_after: int, device: str = "cpu",
+                          mem_fraction=None, base_port: int = 7600, log_path: str | None = None):
+    """N-stage generic-spare recovery proof (all on localhost). Build the no-death reference, stand up N
+    stages + 1 spare (shaped for position k_dead — generic load-on-promotion is a GPU/NVMe concern, not
+    mockable), DRAIN stage k_dead after `drain_after` forwards, recover via decode_with_recovery_nstage,
+    and assert recovered == reference. The CPU-mock proof of the re-stitch+replay WIRING for any position."""
+    from shard.transport import LanEdge
+    from shard import wire
+    os.environ.setdefault("SHARD_PSK", "cairn-dev-psk")
+    wire.key_from_env("SHARD_PSK")
+    from cairn_node.pipeline import run_pipeline
+
+    _fh = open(log_path, "a", buffering=1) if log_path else None
+
+    def log(m: str) -> None:
+        print(m, flush=True)
+        if _fh is not None:
+            _fh.write(m + "\n"); _fh.flush(); os.fsync(_fh.fileno())
+
+    bnd = [0, *cuts, num_layers]
+    N = len(bnd) - 1
+    assert 0 <= k_dead < N, f"k_dead {k_dead} out of range for N={N}"
+    log(f"[prove-N] runtime={runtime} N={N} cuts={cuts} k_dead={k_dead} drain_after={drain_after} "
+        f"prompt={prompt} n_new={n_new}")
+
+    ref = run_pipeline(runtime, model, num_layers, list(cuts), prompt, n_new, device=device, base_port=base_port)
+    log(f"[prove-N] ref (no death) = {ref}")
+
+    b = base_port + 20
+    ports = [b + i for i in range(N)]
+    spare_port, sink_t, sink_s = b + N, b + N + 1, b + N + 2
+    procs = []
+    for i in range(N):
+        np_ = ports[i + 1] if i < N - 1 else sink_t
+        procs.append(_spawn_stage(runtime, model, bnd[i], bnd[i + 1], ports[i], "127.0.0.1", np_, i,
+                                  device=device, drain_after=(drain_after if i == k_dead else None),
+                                  mem_fraction=mem_fraction))
+    procs.append(_spawn_stage(runtime, model, bnd[k_dead], bnd[k_dead + 1], spare_port, "127.0.0.1", sink_s,
+                              k_dead, device=device, mem_fraction=mem_fraction))   # generic spare (shaped for k_dead)
+
+    st = _listen("127.0.0.1", sink_t)
+    ss = _listen("127.0.0.1", sink_s)
+    try:
+        head = LanEdge("127.0.0.1", ports[0], supervised_recv_timeout=True); _connect_retry(head)
+        ct, _ = st.accept(); tail_e = LanEdge.from_socket(ct, supervised_recv_timeout=True)
+        cs, _ = ss.accept(); spare_e = LanEdge.from_socket(cs, supervised_recv_timeout=True)
+        stage_addrs = [("127.0.0.1", p) for p in ports]
+
+        def _on(kind, *p):
+            if kind == "tok":
+                log(f"[prove-N] tok {p[0]}/{n_new} = {p[1]}")
+            elif kind == "draining":
+                log(f"[prove-N] *** DRAIN at stage {p[0]} after {p[1]} committed — re-stitch + replay")
+            elif kind == "death":
+                log(f"[prove-N] *** DEATH at stage {p[0]} after {p[1]} committed — re-stitch + replay")
+            elif kind == "recovered":
+                log(f"[prove-N] *** RECOVERED in {p[0]:.3f}s — resumed at tok {p[2]} = {p[1]}")
+
+        rec, mttr = decode_with_recovery_nstage(head, tail_e, spare_e, stage_addrs=stage_addrs,
+                                                spare_addr=("127.0.0.1", spare_port), prompt=prompt,
+                                                n_new=n_new, on_event=_on)
+        ok = (rec == ref)
+        log(f"[prove-N] rec (drain k={k_dead}) = {rec}  MATCH={ok}  "
+            f"MTTR={('%.3fs' % mttr) if mttr is not None else 'none'}")
+        if not ok:
+            log(">>> N-STAGE RECOVERY FAIL — recovered != reference")
+            raise AssertionError(f"recovered {rec} != reference {ref}")
+        log(f">>> N-STAGE RECOVERY OK (k={k_dead}: drain → re-stitch → replay → resume == no-death)")
+        return ref, rec, mttr
+    finally:
+        for s in (st, ss):
+            try:
+                s.close()
+            except Exception:
+                pass
+        for p in procs:
+            try:
+                p.wait(timeout=10)
+            except Exception:
+                p.kill()
+        if _fh is not None:
+            _fh.close()
+
+
 def _spawn(runtime, model, ls, le, lp, nh, np_, device="cpu", die_after=None, mem_fraction=None):
     env = {**os.environ, "PYTHONPATH": str(_ROOT)}
     env.pop("CAIRN_DIE_AFTER", None)                      # NEVER inherit an ambient death (the yaml exports it
