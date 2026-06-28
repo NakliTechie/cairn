@@ -40,7 +40,9 @@
 
 name: cairn-dsv4
 
-num_nodes: 4                          # 3 active stages (rank 0/1/2) + 1 spare (rank 3)
+num_nodes: 5                          # 4 active FP8 stages (rank 0-3) + 1 generic warm SPARE (rank 4).
+                                      # General rule: ranks 0..CAIRN_NWAY-1 are active; ranks >= NWAY are
+                                      # warm spares. NWAY=4 (FP8) → 1 spare; NWAY=3 → 2 spares (warm_target=2).
 
 resources:
   cloud: aws
@@ -242,44 +244,32 @@ run: |
   [ -d /opt/dlami/nvme/model ] && MODEL_DIR=/opt/dlami/nvme/model
   echo "[dsv4] weights mounted from $MODEL_DIR"
 
-  # Topology selectable via CAIRN_NWAY (default 3). Path-β layer split over 43 layers:
-  #   NWAY=3  → 3 active stages + 1 tail-shaped SPARE (recovery-test topology): 15,14,14
-  #             rank0 [0,15) entry · rank1 [15,29) middle · rank2 [29,43) tail · rank3 [29,43) spare
-  #   NWAY=4  → 4 active stages, NO spare (the OOM-reslice topology — FP8 does NOT fit 3-way,
-  #             GPU-confirmed 2026-06-28: rank0 OOM'd at 94.36/95 GiB in FP8 MoE create_weights): 11,11,11,10
-  #             rank0 [0,11) entry · rank1 [11,22) · rank2 [22,33) · rank3 [33,43) tail
-  # WARM RE-SLICE: `sky exec cairn-dsv4 <this yaml> --env CAIRN_NWAY=4` re-runs ONLY this block on the
-  # live cluster — each box reloads its NEW slice from the on-disk weights (no S3 re-sync, ~5-8 min) vs a
-  # ~40-min cold relaunch (user directive 2026-06-27 / memory reslice-warm-not-reprovision).
-  NWAY=${CAIRN_NWAY:-3}
-  if [ "$NWAY" = "4" ]; then
-    PP_SIZE=4; PART=11,11,11,10; LAST_ACTIVE=3
-    case "$RANK" in
-      0) LS=0;  LE=11; PP_RANK=0; STAGE_NAME="entry"   ;;
-      1) LS=11; LE=22; PP_RANK=1; STAGE_NAME="middle1" ;;
-      2) LS=22; LE=33; PP_RANK=2; STAGE_NAME="middle2" ;;
-      3) LS=33; LE=43; PP_RANK=3; STAGE_NAME="tail"    ;;
-    esac
+  # Topology via CAIRN_NWAY (default 4 — FP8 needs 4-way; 3-way OOMs, GPU-confirmed 2026-06-28). Path-β
+  # layer split over 43 layers. Ranks 0..NWAY-1 are ACTIVE; ranks >= NWAY are generic warm SPARES.
+  #   NWAY=4 (5 boxes) → 11,11,11,10 active + 1 spare (rank4)   [the resilience topology]
+  #   NWAY=3 (5 boxes) → 15,14,14 active + 2 spares (rank3,4)   [warm_target=2]
+  # WARM RE-SLICE: `sky exec cairn-dsv4 <this yaml> --env CAIRN_NWAY=N` re-runs ONLY this block on the live
+  # cluster — each box reloads its NEW slice from on-disk weights (~5-8 min, no S3 re-sync) vs ~40-min cold.
+  NWAY=${CAIRN_NWAY:-4}
+  NTOTAL=${#IPS[@]}
+  NSPARES=$(( NTOTAL - NWAY ))               # generic warm spares: any-position recovery + self-replenish
+  if [ "$NWAY" = "3" ]; then PART=15,14,14;   STARTS=(0 15 29);    ENDS=(15 29 43)
+  else NWAY=4;               PART=11,11,11,10; STARTS=(0 11 22 33); ENDS=(11 22 33 43); fi
+  PP_SIZE=$NWAY; LAST_ACTIVE=$(( NWAY - 1 ))
+
+  if [ "$RANK" -ge "$NWAY" ]; then
+    # GENERIC WARM SPARE — shaped for CAIRN_SPARE_RANK (default = tail). NOTE: one spare covering ANY
+    # position needs load-on-promotion (reload slice k from NVMe on promotion — GPU-only follow-up); a
+    # SHAPED spare covers its position now, which is enough to test the warm/hot swap + metrics per position.
+    SR=${CAIRN_SPARE_RANK:-$LAST_ACTIVE}
+    LS=${STARTS[$SR]}; LE=${ENDS[$SR]}; PP_RANK=$SR; STAGE_NAME="spare(for-rank-$SR)"
+    NEXT_HOST=$IP0; NEXT_PORT=7780           # spare → serve_http spare-sink
   else
-    PP_SIZE=3; PART=15,14,14; LAST_ACTIVE=2
-    case "$RANK" in
-      0) LS=0;  LE=15; PP_RANK=0; STAGE_NAME="entry"  ;;
-      1) LS=15; LE=29; PP_RANK=1; STAGE_NAME="middle" ;;
-      2) LS=29; LE=43; PP_RANK=2; STAGE_NAME="tail"   ;;
-      3) LS=29; LE=43; PP_RANK=2; STAGE_NAME="spare"  ;;
-    esac
+    LS=${STARTS[$RANK]}; LE=${ENDS[$RANK]}; PP_RANK=$RANK; STAGE_NAME="stage$RANK"
+    if [ "$RANK" = "$LAST_ACTIVE" ]; then NEXT_HOST=$IP0; NEXT_PORT=7779    # tail → serve_http tail-sink
+    else NIDX=$((RANK+1)); NEXT_HOST=${IPS[$NIDX]}; NEXT_PORT=7777; fi        # middle → next stage
   fi
-  # This rank's downstream: tail → serve_http tail-sink (IP0:7779); 3-way spare → spare-sink (IP0:7780);
-  # any active middle → the next rank's :7777.
-  if [ "$RANK" = "$LAST_ACTIVE" ]; then
-    NEXT_HOST=$IP0; NEXT_PORT=7779
-  elif [ "$RANK" = "3" ]; then
-    NEXT_HOST=$IP0; NEXT_PORT=7780          # 3-way spare only
-  else
-    NIDX=$((RANK+1)); NEXT_HOST=${IPS[$NIDX]}; NEXT_PORT=7777
-  fi
-  echo "[dsv4] NWAY=$NWAY rank=$RANK stage=$STAGE_NAME layers=[$LS,$LE) pp_rank=$PP_RANK part=$PART -> next $NEXT_HOST:$NEXT_PORT"
-  echo "[dsv4] ips: rank0=$IP0 rank1=$IP1 rank2=$IP2 rank3=$IP3"
+  echo "[dsv4] NWAY=$NWAY ntotal=$NTOTAL nspares=$NSPARES rank=$RANK ($STAGE_NAME) layers=[$LS,$LE) pp=$PP_RANK part=$PART -> $NEXT_HOST:$NEXT_PORT"
 
   pkill -9 -f "[c]airn_node" 2>/dev/null || true
   # Warm re-slice / re-exec hygiene: a cancelled `sky` job can leave --rm docker containers running
@@ -329,6 +319,7 @@ run: |
     -e SGLANG_OPT_CACHE_SWA_TRANSLATION=0 \
     -e CAIRN_DEBUG_MOE=1 \
     -e CAIRN_SPOT_WATCH=1 \
+    -e CAIRN_REPLENISH_CMD=\"${CAIRN_REPLENISH_CMD:-}\" \
     -e CAIRN_ALERT_WEBHOOK=$CAIRN_ALERT_WEBHOOK \
     -e CALLMEBOT_PHONE=$CALLMEBOT_PHONE \
     -e CALLMEBOT_APIKEY=$CALLMEBOT_APIKEY \
@@ -343,17 +334,31 @@ run: |
   STAGE_ARGS="--runtime sglang --model /workspace/model --layer-start $LS --layer-end $LE --device cuda:0 \
     --listen-port 7777 --bind-host 0.0.0.0 --next-host $NEXT_HOST --next-port $NEXT_PORT --stage-rank $PP_RANK"
 
-  if [ "$RANK" = "0" ]; then
-    # ENTRY + co-located serve_http (OpenAI /v1 on :8000). Warm-spare recovery armed only in 3-way.
+  if [ "$RANK" -ge "$NWAY" ]; then
+    # GENERIC WARM SPARE: --announce my routable IP so the driver learns where to dial to PROMOTE me
+    # (essential for REPLENISHED spares — a fresh box has a new IP). Shaped for CAIRN_SPARE_RANK; loaded +
+    # flashinfer pre-warmed at launch so promotion is fast. Forwards to serve_http's spare-sink ($IP0:7780).
+    eval $DOCKER_RUN_COMMON \
+      python -u -m cairn_node.serve $STAGE_ARGS --announce --advertise-host "${IPS[$RANK]}" \
+      2>&1 | tee /tmp/cairn-dsv4-rank${RANK}-spare.log
+  elif [ "$RANK" = "0" ]; then
+    # ENTRY + co-located serve_http (OpenAI /v1 on :8000) with N-STAGE recovery + the warm-spare pool.
     eval $DOCKER_RUN_COMMON \
       python -u -m cairn_node.serve $STAGE_ARGS \
       > /tmp/cairn-dsv4-rank0-entry.log 2>&1 &
     sleep 5   # give the entry a head start to bind :7777 before serve_http dials
-    SPARE_ARGS=""
-    [ "$NWAY" = "3" ] && SPARE_ARGS="--spare-host $IP3 --spare-sink 7780 --spare-port 7777"
+    RECOVERY_ARGS=""
+    if [ "$NSPARES" -gt 0 ]; then
+      STAGE_HOSTS=$(IFS=,; echo "${IPS[*]:0:$NWAY}")     # IP0..IP_{NWAY-1} — for any-position re-stitch
+      RECOVERY_ARGS="--stage-hosts $STAGE_HOSTS --stage-port 7777 --spare-host ${IPS[$NWAY]} --spare-sink 7780 \
+        --spare-port 7777 --initial-spares $NSPARES --warm-target $NSPARES"
+      # self-replenish needs the replenisher to provision a NEW box (sky launch + scoped creds) — that runs
+      # on the HOST, not in this container, so it's opt-in via CAIRN_SELF_REPLENISH + CAIRN_REPLENISH_CMD.
+      [ -n "${CAIRN_SELF_REPLENISH:-}" ] && RECOVERY_ARGS="$RECOVERY_ARGS --self-replenish"
+    fi
     eval $DOCKER_RUN_COMMON \
       python -u -m cairn_node.serve_http --model "$MODEL" --port 8000 --bind 0.0.0.0 --api-key "$API_KEY" \
-        --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 $SPARE_ARGS \
+        --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 $RECOVERY_ARGS \
       2>&1 | tee /tmp/cairn-dsv4-serve.log
   elif [ "$RANK" = "$LAST_ACTIVE" ]; then
     # TAIL -> serve_http's tail-sink ($IP0:7779). CAIRN_SPOT_TEST_FILE arms the proactive-drain sentinel.
@@ -365,7 +370,7 @@ run: |
       > /tmp/cairn-dsv4-rank${RANK}-tail.log 2>&1
     rc=$?; echo "[dsv4] tail (rank $RANK) exited rc=$rc (kill/drain) -> reporting 0 so the gang scheduler keeps serve_http alive"; exit 0
   else
-    # MIDDLE (active rank 1..LAST_ACTIVE-1) or the 3-way SPARE (rank 3 -> spare-sink $IP0:7780).
+    # MIDDLE (active rank 1..LAST_ACTIVE-1) → forwards to the next stage's :7777.
     eval $DOCKER_RUN_COMMON \
       python -u -m cairn_node.serve $STAGE_ARGS \
       2>&1 | tee /tmp/cairn-dsv4-rank${RANK}-stage.log
@@ -375,6 +380,13 @@ envs:
   HF_TOKEN: ""
   SHARD_PSK: ""
   CAIRN_API_KEY: "sk-cairn-demo"
+  # Recovery topology knobs (read in the run block). NWAY active stages; the rest (num_nodes - NWAY) are
+  # generic warm spares. CAIRN_SPARE_RANK shapes the spare (which position it can replace; default = tail).
+  # Self-replenish provisions a replacement on consumption — opt-in (the replenish cmd runs host-side).
+  CAIRN_NWAY: "4"                       # FP8 needs 4-way (3-way OOMs)
+  CAIRN_SPARE_RANK: ""                  # which rank the spare is shaped for (default: tail = NWAY-1)
+  CAIRN_SELF_REPLENISH: ""             # non-empty → serve_http launches a replacement spare on consumption
+  CAIRN_REPLENISH_CMD: ""             # shell cmd that provisions one replacement spare (host-side sky + creds)
   # cairn-s3-cache READ-ONLY key (in secrets.env) → setup step 4 syncs weights from in-region S3.
   # Empty default ⇒ setup falls back to HF (so the yaml still works before the key exists).
   CAIRN_S3_CACHE_ACCESS_KEY_ID: ""
