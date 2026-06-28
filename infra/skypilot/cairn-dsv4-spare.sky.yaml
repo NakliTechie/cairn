@@ -16,6 +16,19 @@ name: cairn-dsv4-spare
 
 num_nodes: 1
 
+# SHARED FLEET SECURITY GROUP (self-replenish SG-isolation fix, 2026-06-28). MUST match the name pinned in
+# cairn-dsv4.sky.yaml. A replenished spare is a SEPARATE SkyPilot cluster, so by default SkyPilot gives it
+# its OWN per-cluster SG — isolated from the live fleet's SG. That breaks the BIDIRECTIONAL recovery wire:
+# the spare's announce dial to the driver's :7780 hangs in SYN-SENT, AND the predecessor stage's later data
+# connection to the spare's :7777 is blocked, so the driver's read times out at recovery.py:309 and the
+# fleet stays degraded (both observed live 2026-06-28). Pinning the spare to the SAME named SG as the fleet
+# makes all of 7777-7780 mutually reachable with no per-launch SG surgery. Pre-create per region with
+# `bash infra/aws/ensure-fleet-sg.sh`. (Fallback if you can't pin a shared SG: opt into the watcher's
+# CAIRN_AUTHORIZE_RECOVERY_PORTS path — see infra/skypilot/replenish-watcher.sh.)
+config:
+  aws:
+    security_group_name: cairn-fleet
+
 resources:
   cloud: aws
   region: eu-south-2                  # override with --region/--image-id to match the live fleet's region

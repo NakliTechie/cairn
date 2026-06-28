@@ -44,7 +44,36 @@ consulting upside**, not a SaaS. That changes the bar. Two different finish line
 | **Observability** | Logs + ad-hoc probes | Metrics, dashboards, alerting, SLOs (MTTR budgets, drop-rate). |
 | **Cost accounting** | Computed, deprioritized | Real per-request cost, the spot-vs-on-demand savings number as a first-class output. |
 | **Spare warm-up latency** | ~20–40 min (load 294 GB) | The biggest operational gap: a fresh spare takes too long to warm, so deep reclaim storms could outrun replenishment. Needs faster staging (snapshots / pre-baked AMIs / NVMe pre-stage) and/or a deeper standing pool. |
+| **Self-replenish networking** | Bug found + fixed (design) | A replenished spare launches as a *separate* SkyPilot cluster → its own isolated security group, so the recovery wire (7777-7780) couldn't reach it (see below). Fixed by pinning the fleet + spare to one shared named SG; not yet re-validated live. |
 | **Hardening at scale** | Single-fleet happy path | Sustained-load soak tests, chaos testing (random multi-reclaims), back-pressure, partial-failure modes. |
+
+### Discovered live (2026-06-28): self-replenish SG isolation broke recovery onto a replenished spare
+
+The first end-to-end test of the **self-replenish** path surfaced a real bug. An auto-provisioned
+warm spare warmed fully (model loaded, listening on `:7777`) but **could not participate in recovery**,
+because `replenish-watcher.sh` launches each replacement spare as its **own SkyPilot cluster** — which
+SkyPilot gives a **distinct, isolated security group**. The recovery wire is *bidirectional* across ports
+**7777-7780** (stage-in `:7777`, tail-sink `:7779`, spare-sink/announce `:7780`), so SG isolation broke
+**both** halves:
+
+1. The spare's announce dial to the driver's `:7780` hung in TCP `SYN-SENT` — the driver's SG had no
+   inbound rule for the spare's cluster SG. (Worked around live by hand-adding an ingress rule for
+   7777-7780 from the VPC CIDR to the driver SG.)
+2. Even after the spare registered, the actual multi-stream recovery then failed with `TimeoutError` at
+   `recovery.py:309` (`sstate["read"].recv()`): when the tail drained, the predecessor stage opened a
+   **new** data connection to the spare's `:7777`, which the **spare's own** (separate-cluster) SG blocked
+   inbound — so activations never reached the spare and the driver's read timed out, leaving the fleet
+   degraded.
+
+**Fix (designed, not yet re-validated live):** pin both `cairn-dsv4.sky.yaml` and `cairn-dsv4-spare.sky.yaml`
+to one **shared named security group** via SkyPilot's `config.aws.security_group_name: cairn-fleet`, so every
+box — live fleet and every replenished spare — joins the same SG and all of 7777-7780 are mutually reachable
+with no per-launch SG surgery. A one-time-per-region helper (`infra/aws/ensure-fleet-sg.sh`) creates that SG
+with the right rules (`:22` for provisioning + 7777-7780 across the VPC). A fragile per-launch fallback
+(authorize the ports on both SGs after launch) is available opt-in via `CAIRN_AUTHORIZE_RECOVERY_PORTS=1` in
+the watcher. **Lesson:** the recovery design implicitly assumed all boxes share one SG (true for a single
+multi-node cluster); the moment a spare is provisioned as a *separate* cluster, that assumption silently
+breaks — a reminder that the self-replenish path needs its own live network test, not just the in-fleet swap.
 
 ## The single most important caveat
 

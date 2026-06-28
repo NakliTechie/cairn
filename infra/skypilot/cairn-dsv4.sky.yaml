@@ -44,6 +44,18 @@ num_nodes: 5                          # 4 active FP8 stages (rank 0-3) + 1 gener
                                       # General rule: ranks 0..CAIRN_NWAY-1 are active; ranks >= NWAY are
                                       # warm spares. NWAY=4 (FP8) → 1 spare; NWAY=3 → 2 spares (warm_target=2).
 
+# SHARED FLEET SECURITY GROUP (self-replenish SG-isolation fix, 2026-06-28). Pin the whole fleet to ONE
+# named SG so that a REPLENISHED spare — which is launched as a SEPARATE SkyPilot cluster
+# (cairn-dsv4-spare.sky.yaml) and would otherwise get its own isolated per-cluster SG — joins the SAME SG
+# and is mutually reachable on the recovery wire (7777-7780). Without this, recovery to a replenished spare
+# fails twice: the spare's :7780 announce hangs in SYN-SENT, and the predecessor stage's data dial to the
+# spare's :7777 is blocked → driver read times out at recovery.py:309 (observed live). cairn-dsv4-spare.sky.yaml
+# pins the SAME name. Pre-create the SG once per region with `bash infra/aws/ensure-fleet-sg.sh` (it opens
+# :22 for provisioning + 7777-7780 across the VPC). Override globally via ~/.sky/config.yaml if you prefer.
+config:
+  aws:
+    security_group_name: cairn-fleet
+
 resources:
   cloud: aws
   region: eu-south-2                  # SPAIN — $1.25/hr spot vs Seoul $1.43 (2026-06-23 live), <5% interruption
