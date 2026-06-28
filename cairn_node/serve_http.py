@@ -36,7 +36,8 @@ from shard.transport import LanEdge  # noqa: E402
 from shard import wire  # noqa: E402
 from cairn_node.serve import _connect_retry, _listen  # noqa: E402
 from cairn_node.pipeline import _drive_multi  # noqa: E402
-from cairn_node.recovery import decode_with_recovery, decode_with_recovery_nstage  # noqa: E402
+from cairn_node.recovery import (decode_with_recovery, decode_with_recovery_nstage,  # noqa: E402
+                                 decode_multi_with_recovery)
 
 MAX_BODY_BYTES = 1_048_576
 
@@ -327,6 +328,42 @@ class FleetEngine:
                 mttr = None
             return self._trim_eos(out), mttr, seq
 
+    def bench_multi(self, prompts, n_new):
+        """Drive K prompts CONCURRENTLY over the held fleet connection (the occupancy/throughput signal) —
+        and survive a node drop mid-burst (multi-stream recovery). Returns (per-stream text, mttr, elapsed_s,
+        total_tokens). A drain on any rank during the burst re-stitches + replays ALL streams onto the spare."""
+        streams = [(f"bench-{self._n}-{i}", self.tok.encode([{"role": "user", "content": p}]))
+                   for i, p in enumerate(prompts)]
+        with self._lock:
+            self._n += 1
+            t0 = time.time()
+            if self.stage_addrs is None:                           # no N-stage topology → plain multi-stream
+                out = _drive_multi(self.head, self.tail, streams, n_new, stop=False)
+                mttr = None
+            else:
+                use_reshape = self.partition is not None
+                spare_edge = spare_addr = None
+                if not use_reshape:
+                    with self._spares_lock:
+                        if self.spares:
+                            spare_edge, spare_addr, _r = self.spares[0]
+                out, mttr, new_head, new_read, k, used_addr = decode_multi_with_recovery(
+                    self.head, self.tail, spare_edge, stage_addrs=self.stage_addrs, spare_addr=spare_addr,
+                    streams=streams, n_new=n_new, on_event=self._on_event,
+                    reshape_spare=(self._reshape_spare if use_reshape else None), partition=self.partition)
+                if mttr is not None:                               # consumed a spare; topology healed
+                    self.head, self.tail = new_head, new_read
+                    if not use_reshape:
+                        with self._spares_lock:
+                            if self.spares:
+                                self.spares.pop(0)
+                    if k is not None and used_addr is not None and 0 <= k < len(self.stage_addrs):
+                        self.stage_addrs[k] = used_addr
+                    self._maybe_replenish()
+            elapsed = time.time() - t0
+        total = sum(len(v) for v in out.values())
+        return {seq: self.tok.decode(toks) for seq, toks in out.items()}, mttr, elapsed, total
+
     def _trim_eos(self, out):
         """The decode loop runs a fixed max_tokens with no early-stop, so an instruct model emits EOS at
         its natural end and then DEGENERATES (greedy temp=0 → repetition). Truncate at the first stop id so
@@ -386,7 +423,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         eng = self.engine
-        if self.path != "/v1/chat/completions":
+        if self.path not in ("/v1/chat/completions", "/v1/bench"):
             self._send({"error": {"message": "not found", "type": "not_found", "code": "not_found"}}, 404)
             return
         try:
@@ -400,6 +437,18 @@ class _Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw or b"{}")
             except json.JSONDecodeError:
                 raise GatewayError(400, "invalid JSON body")
+            if self.path == "/v1/bench":                           # K concurrent streams (occupancy) + recovery
+                prompts = body.get("prompts")
+                if not prompts:
+                    n = int(body.get("n", 4))
+                    prompts = [body.get("prompt", "Write one sentence about mountains.")] * n
+                mx = int(body.get("max_tokens", 48))
+                results, mttr, elapsed, total = eng.bench_multi(prompts, mx)
+                self._send({"streams": len(prompts), "max_tokens": mx, "elapsed_s": round(elapsed, 3),
+                            "total_tokens": total, "tok_per_s": (round(total / elapsed, 2) if elapsed > 0 else None),
+                            "recovered": ({"mttr_s": round(mttr, 3)} if mttr is not None else None),
+                            "results": results})
+                return
             req = eng.gateway.parse_request(body)
             if req.stream:
                 out, mttr, seq = eng.run(req)

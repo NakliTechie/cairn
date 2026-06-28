@@ -245,7 +245,8 @@ def decode_multi_with_recovery(head, tail, spare, *, stage_addrs, spare_addr, st
     dead stage onto the spare ONCE and replays EVERY live stream's committed history onto the healed
     pipeline (each replay's last logit = that stream's pending token), then resumes all streams.
 
-    `streams` = [(seq, prompt), …]. Returns ({seq: [tokens]}, mttr_s | None). Each stream's output is
+    `streams` = [(seq, prompt), …]. Returns ({seq:[tokens]}, mttr_s|None, new_head, new_read, k_dead, spare_addr)
+    — the trailing topology lets a persistent driver stay consistent across calls. Each stream's output is
     bit-identical to a no-drop run (the recovery is transparent per stream). Survives ONE drop (single spare)."""
     import torch
     from shard.transport import LanEdge, EDGE_ERRORS
@@ -263,7 +264,7 @@ def decode_multi_with_recovery(head, tail, spare, *, stage_addrs, spare_addr, st
     gen = {seq: 0 for seq in st}                      # fresh-seq generation per stream (bumped on recovery)
     wire = {seq: seq for seq in st}                   # current on-wire seq per stream
     rev = {seq: seq for seq in st}                    # wire-seq -> base-seq (routing; stale seqs absent)
-    sstate = {"head": head, "read": tail, "spare": spare, "spare_addr": spare_addr}
+    sstate = {"head": head, "read": tail, "spare": spare, "spare_addr": spare_addr, "k": None}
     live = set(st)
 
     def _restitch(k):
@@ -295,6 +296,7 @@ def decode_multi_with_recovery(head, tail, spare, *, stage_addrs, spare_addr, st
 
     def _recover(k):
         t0 = time.time()
+        sstate["k"] = k
         _restitch(k)
         for base in list(live):                                    # fresh wire-seq per live stream
             rev.pop(wire[base], None)
@@ -352,7 +354,9 @@ def decode_multi_with_recovery(head, tail, spare, *, stage_addrs, spare_addr, st
             live.discard(base); continue
         st[base]["cur"] = torch.tensor([[st[base]["out"][-1]]])
         sstate["head"].send({"h": st[base]["cur"], "seq": wire[base], "pos": st[base]["pos"]})
-    return {seq: st[seq]["out"][:n_new] for seq in st}, mttr
+    # also return the post-recovery topology so a persistent driver stays consistent across calls
+    return ({seq: st[seq]["out"][:n_new] for seq in st}, mttr,
+            sstate["head"], sstate["read"], sstate["k"], sstate["spare_addr"])
 
 
 def _spawn_stage(runtime, model, ls, le, lp, nh, np_, rank, device="cpu",
