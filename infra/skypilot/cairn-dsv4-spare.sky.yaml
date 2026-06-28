@@ -1,0 +1,148 @@
+# Cairn DeepSeek-V4-Flash — a SINGLE replacement WARM SPARE box (self-replenish).
+#
+# Launched by the host-side replenish-watcher (infra/skypilot/replenish-watcher.sh) on rank0 of a live
+# cairn-dsv4 fleet when a spare is consumed by a recovery. It syncs the FP8 weights (in-region S3 → NVMe),
+# loads slice CAIRN_SPARE_RANK, flashinfer-pre-warms, and runs cairn_node.serve as a standby spare that
+# DIALS the live driver's spare-sink ($DRIVER_HOST:$DRIVER_SPARE_SINK) and --announces its addr — so the
+# driver's acceptor registers it and the warm pool refills toward warm_target. (Mirrors the main yaml's
+# setup; the run block is just the single spare instead of the full fleet.)
+#
+# Launch (by the watcher, with a scoped launch key on the rank0 box):
+#   sky launch -c cairn-dsv4-spare-<ts> infra/skypilot/cairn-dsv4-spare.sky.yaml -y -d --down \
+#     --env DRIVER_HOST=<rank0 private IP> --env DRIVER_SPARE_SINK=7780 --env CAIRN_SPARE_RANK=<k> \
+#     --env HF_TOKEN --env SHARD_PSK --env CAIRN_S3_CACHE_* --env CAIRN_S3_WRITE_*
+
+name: cairn-dsv4-spare
+
+num_nodes: 1
+
+resources:
+  cloud: aws
+  region: eu-south-2                  # override with --region/--image-id to match the live fleet's region
+  instance_type: g7e.2xlarge
+  use_spot: true
+  disk_size: 150                      # weights + image stage on the NVMe instance store (see setup step 0)
+  image_id: ami-03cc3ae6c38cc7b29     # eu-south-2 Blackwell DLAMI; us-east-2 = ami-02584dd48f685760d
+  labels:
+    cairn: "true"
+    cairn-purpose: "dsv4-flash-replacement-spare"
+
+file_mounts:
+  /cairn/fork: ./fork
+  /cairn/cairn_node: ./cairn_node
+  /cairn/configs: ./configs
+  /cairn/infra: ./infra
+  /cairn/scheduler/src: ./scheduler/src
+  /cairn-kernel-cache: s3://skypilot-cairn-artifacts/dsv4-kernel/408846afd1b0
+
+setup: |
+  set -uo pipefail
+  # 0. NVMe instance-store staging (matches the main yaml): weights + docker image on /opt/dlami/nvme.
+  NVME=/opt/dlami/nvme
+  if mountpoint -q "$NVME" 2>/dev/null; then
+    sudo mkdir -p "$NVME/model" "$NVME/docker"; sudo chown "$USER":"$USER" "$NVME/model"
+    MODEL_DIR="$NVME/model"; DOCKER_DATA_ROOT="$NVME/docker"
+    echo "[setup] NVMe staging on $NVME ($(df -h "$NVME" | awk 'NR==2{print $4}') free)"
+  else
+    mkdir -p "$HOME/model"; MODEL_DIR="$HOME/model"; DOCKER_DATA_ROOT=""
+    echo "[setup] WARNING: no NVMe at $NVME — staging on EBS root; disk_size=150 will NOT fit 294 GiB"
+  fi
+  # 1. Docker + data-root on NVMe (merge, don't clobber the DLAMI's nvidia runtime).
+  if ! command -v docker >/dev/null; then curl -fsSL https://get.docker.com | sudo sh; sudo systemctl enable --now docker; fi
+  if [ -n "$DOCKER_DATA_ROOT" ]; then
+    sudo mkdir -p "$DOCKER_DATA_ROOT"
+    sudo python3 -c "import json,os;p='/etc/docker/daemon.json';d=(json.load(open(p)) if os.path.exists(p) and os.path.getsize(p)>0 else {});d['data-root']='$DOCKER_DATA_ROOT';json.dump(d,open(p,'w'))"
+  fi
+  sudo systemctl restart docker || true
+  # 2. Image — in-region ECR mirror else Docker Hub.
+  IMG="lmsysorg/sglang:deepseek-v4-blackwell"; ECR_REGION="eu-south-2"
+  ECR_REPO="AWS_ACCOUNT_ID.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
+  acquire_image() {
+    sudo docker image inspect "$IMG" >/dev/null 2>&1 && { echo "[setup] image present"; return; }
+    if [ -n "${CAIRN_S3_WRITE_ACCESS_KEY_ID:-}" ] \
+       && AWS_ACCESS_KEY_ID="$CAIRN_S3_WRITE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_WRITE_SECRET_ACCESS_KEY" \
+            aws ecr get-login-password --region "$ECR_REGION" 2>/dev/null \
+            | sudo docker login --username AWS --password-stdin "$ECR_REPO" >/dev/null 2>&1 \
+       && sudo docker pull "$ECR_REPO:deepseek-v4-blackwell"; then
+      sudo docker tag "$ECR_REPO:deepseek-v4-blackwell" "$IMG"; echo "[setup] image from ECR mirror"
+    else sudo docker pull "$IMG"; fi
+  }
+  # 3. Weights — in-region S3 sync (else HF).
+  acquire_weights() {
+    mkdir -p "$MODEL_DIR"; export HF_HUB_ENABLE_HF_TRANSFER=1
+    local _T R S3; _T=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
+    R=$(curl -s -H "X-aws-ec2-metadata-token: $_T" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+    S3="s3://skypilot-cairn-weights-${R}/deepseek-v4-flash-fp8/main"
+    if [ -n "${CAIRN_S3_CACHE_ACCESS_KEY_ID:-}" ] \
+       && AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
+            aws s3 ls "$S3/config.json" --region "$R" >/dev/null 2>&1; then
+      echo "[setup] S3 cache HIT ($R) → $MODEL_DIR"
+      AWS_ACCESS_KEY_ID="$CAIRN_S3_CACHE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_CACHE_SECRET_ACCESS_KEY" \
+        aws s3 sync "$S3" "$MODEL_DIR" --region "$R" --only-show-errors
+    else
+      echo "[setup] S3 MISS → HF"; pip3 install -q --user "huggingface_hub[cli]" hf_transfer
+      python3 -c "from huggingface_hub import snapshot_download; snapshot_download('sgl-project/DeepSeek-V4-Flash-FP8', local_dir='$MODEL_DIR', max_workers=8)"
+    fi
+  }
+  acquire_image > /tmp/setup-image.log 2>&1 & PID_I=$!
+  acquire_weights > /tmp/setup-weights.log 2>&1 & PID_W=$!
+  # 4. kernel restore (independent of the image).
+  if [ ! -d ~/dsv4 ]; then git clone https://github.com/0xSero/deepseek-v4-flash-sm120 ~/dsv4; fi
+  cd ~/dsv4; NEED_BUILD=""
+  if ls ~/dsv4/build-docker/deepseek_v4_kernel/*.so >/dev/null 2>&1; then echo "[setup] kernel present"
+  elif [ -f /cairn-kernel-cache/build-docker.tar.gz ]; then tar xzf /cairn-kernel-cache/build-docker.tar.gz -C ~/dsv4 || NEED_BUILD=1
+  else NEED_BUILD=1; fi
+  wait "$PID_I"; RC_I=$?; cat /tmp/setup-image.log
+  wait "$PID_W"; RC_W=$?; cat /tmp/setup-weights.log
+  [ "$RC_I" -ne 0 ] || [ "$RC_W" -ne 0 ] && { echo "[setup] FATAL image=$RC_I weights=$RC_W"; exit 1; } || true
+  if [ -n "$NEED_BUILD" ]; then echo "[setup] building kernel"; sudo bash scripts/build_in_sglang_docker.sh; fi
+  du -sh "$MODEL_DIR" || true
+
+run: |
+  set -uo pipefail
+  : "${DRIVER_HOST:?set DRIVER_HOST (the live fleet rank0 private IP)}"
+  SPARE_SINK=${DRIVER_SPARE_SINK:-7780}
+  export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
+  export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.85}
+  NWAY=${CAIRN_NWAY:-4}
+  if [ "$NWAY" = "3" ]; then PART=15,14,14; STARTS=(0 15 29); ENDS=(15 29 43); else NWAY=4; PART=11,11,11,10; STARTS=(0 11 22 33); ENDS=(11 22 33 43); fi
+  SR=${CAIRN_SPARE_RANK:-$(( NWAY - 1 ))}      # which slice to pre-shape for (default tail; reshape covers the rest)
+  LS=${STARTS[$SR]}; LE=${ENDS[$SR]}
+  MY_IP=$(hostname -I | awk '{print $1}')
+  MODEL_DIR=/home/ubuntu/model; [ -d /opt/dlami/nvme/model ] && MODEL_DIR=/opt/dlami/nvme/model
+  echo "[spare] rank=$SR layers=[$LS,$LE) -> driver $DRIVER_HOST:$SPARE_SINK ; my_ip=$MY_IP"
+  pkill -9 -f "[c]airn_node" 2>/dev/null || true
+  sudo docker kill $(sudo docker ps -q) 2>/dev/null || true; sleep 2
+  # Same sm_120 env as the main fleet (the spare must run identical kernels).
+  sudo docker run --rm --gpus all --shm-size=64g --ipc=host --network host \
+    -v /home/ubuntu/dsv4/build-docker:/dsv4:ro \
+    -v $MODEL_DIR:/workspace/model:ro \
+    -v /home/ubuntu/.sky/file_mounts/cairn:/cairn:ro \
+    -w /cairn \
+    -e PYTHONPATH=/dsv4:/cairn:/cairn/fork:/cairn/scheduler/src \
+    -e HF_TOKEN=$HF_TOKEN -e SHARD_PSK=$SHARD_PSK \
+    -e CAIRN_SGLANG_MEM_FRACTION=$CAIRN_SGLANG_MEM_FRACTION \
+    -e CAIRN_PP_RANK=$SR -e CAIRN_PP_SIZE=$NWAY -e CAIRN_PP_LAYER_PARTITION=$PART \
+    -e TORCH_CUDA_ARCH_LIST=12.0 -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    -e SGLANG_ENABLE_JIT_DEEPGEMM=0 -e SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 \
+    -e SGLANG_OPT_USE_TILELANG_INDEXER=1 -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 \
+    -e SGLANG_OPT_USE_TILELANG_SWA_PREPARE=1 -e SGLANG_OPT_USE_TILELANG_MHC_PRE=1 -e SGLANG_OPT_USE_TILELANG_MHC_POST=1 \
+    -e SGLANG_OPT_CACHE_SWA_TRANSLATION=0 -e CAIRN_SPOT_WATCH=1 \
+    lmsysorg/sglang:deepseek-v4-blackwell \
+    python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
+      --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
+      --listen-port 7777 --bind-host 0.0.0.0 --next-host "$DRIVER_HOST" --next-port "$SPARE_SINK" \
+      --stage-rank "$SR" --announce --advertise-host "$MY_IP" \
+    2>&1 | tee /tmp/cairn-dsv4-replacement-spare.log
+
+envs:
+  HF_TOKEN: ""
+  SHARD_PSK: ""
+  DRIVER_HOST: ""
+  DRIVER_SPARE_SINK: "7780"
+  CAIRN_NWAY: "4"
+  CAIRN_SPARE_RANK: ""
+  CAIRN_S3_CACHE_ACCESS_KEY_ID: ""
+  CAIRN_S3_CACHE_SECRET_ACCESS_KEY: ""
+  CAIRN_S3_WRITE_ACCESS_KEY_ID: ""
+  CAIRN_S3_WRITE_SECRET_ACCESS_KEY: ""

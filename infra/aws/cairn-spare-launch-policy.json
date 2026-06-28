@@ -1,0 +1,63 @@
+{
+  "_comment": "Scoped LAUNCH key for the self-replenish watcher on the rank0 box (infra/skypilot/replenish-watcher.sh). It lets the driver box launch ONE-box replacement spot spares via `sky launch` and tear them down — but nothing else. Strictly narrower than cairn-skypilot. Attach to a dedicated user `cairn-spare-launcher`; put its access key on the rank0 box via --env (CAIRN_LAUNCH_AWS_*) or an instance profile. Region-lock the mutating actions to the fleet's region(s); gate all destructive actions on the cairn=true tag so this key can only ever touch boxes this project tagged. Read-only Describe* is allowed in any region (SkyPilot enumerates regions to find capacity; no cost, no creation).",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyDescribeAnyRegion",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*",
+        "ec2:GetConsoleOutput",
+        "ec2:GetSpotPlacementScores",
+        "pricing:GetProducts",
+        "servicequotas:GetServiceQuota",
+        "servicequotas:ListServiceQuotas"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "LaunchSpotSparesInRegion",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:CreateLaunchTemplate",
+        "ec2:CreateLaunchTemplateVersion",
+        "ec2:RequestSpotInstances",
+        "ec2:CreateFleet"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:RequestedRegion": ["us-east-2", "eu-south-2", "us-west-2", "ap-northeast-2"] }
+      }
+    },
+    {
+      "Sid": "TagOnCreateMustCarryCairnTag",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateTags"],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "ec2:CreateAction": ["RunInstances", "CreateLaunchTemplate", "RequestSpotInstances", "CreateFleet"] }
+      }
+    },
+    {
+      "Sid": "DestructiveOnlyOnCairnTaggedBoxes",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:TerminateInstances",
+        "ec2:StopInstances",
+        "ec2:CancelSpotInstanceRequests"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/cairn": "true", "aws:RequestedRegion": ["us-east-2", "eu-south-2", "us-west-2", "ap-northeast-2"] }
+      }
+    },
+    {
+      "Sid": "SpotServiceLinkedRole",
+      "Effect": "Allow",
+      "Action": ["iam:CreateServiceLinkedRole"],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } }
+    }
+  ]
+}

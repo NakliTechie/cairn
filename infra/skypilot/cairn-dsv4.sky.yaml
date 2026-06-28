@@ -277,6 +277,15 @@ run: |
   # new stage can bind + claim the device.
   sudo docker kill $(sudo docker ps -q) 2>/dev/null || true; sleep 3
 
+  # SELF-REPLENISH plumbing (rank0, opt-in via CAIRN_SELF_REPLENISH). serve_http writes to /shared/...req
+  # (mounted from the host /tmp/cairn-shared); a host-side watcher launches a replacement spare box. The
+  # watcher needs `sky` + a scoped launch key ON THIS BOX (infra/aws/cairn-spare-launch-policy.json) —
+  # an admin step, so this stays opt-in. The serving container only WRITES the request (no creds in it).
+  sudo mkdir -p /tmp/cairn-shared && sudo chmod 777 /tmp/cairn-shared
+  if [ "$RANK" = "0" ] && [ -n "${CAIRN_SELF_REPLENISH:-}" ]; then
+    export CAIRN_REPLENISH_CMD="echo provision >> /shared/cairn-replenish-req"
+  fi
+
   # The common docker invocation: mount cairn + patch + weights, host network so ports work without -p,
   # pass HF_TOKEN + path-β env vars, run cairn_node.serve INSIDE the patched container.
   # WORKING DIR = /cairn so `python -u -m cairn_node.serve` resolves.
@@ -298,6 +307,8 @@ run: |
     -v /home/ubuntu/dsv4/build-docker:/dsv4:ro \
     -v $MODEL_DIR:/workspace/model:ro \
     -v /home/ubuntu/.sky/file_mounts/cairn:/cairn:ro \
+    -v /tmp/cairn-shared:/shared \
+    -e CAIRN_SELF_REPLENISH=${CAIRN_SELF_REPLENISH:-} \
     -w /cairn \
     -e PYTHONPATH=/dsv4:/cairn:/cairn/fork:/cairn/scheduler/src \
     -e HF_TOKEN=$HF_TOKEN \
@@ -350,11 +361,25 @@ run: |
     RECOVERY_ARGS=""
     if [ "$NSPARES" -gt 0 ]; then
       STAGE_HOSTS=$(IFS=,; echo "${IPS[*]:0:$NWAY}")     # IP0..IP_{NWAY-1} — for any-position re-stitch
-      RECOVERY_ARGS="--stage-hosts $STAGE_HOSTS --stage-port 7777 --spare-host ${IPS[$NWAY]} --spare-sink 7780 \
-        --spare-port 7777 --initial-spares $NSPARES --warm-target $NSPARES"
-      # self-replenish needs the replenisher to provision a NEW box (sky launch + scoped creds) — that runs
-      # on the HOST, not in this container, so it's opt-in via CAIRN_SELF_REPLENISH + CAIRN_REPLENISH_CMD.
+      # --stage-partition enables LOAD-ON-PROMOTION: a generic spare re-execs to load slice k from NVMe so
+      # ONE spare covers any position. (Without it, a spare only covers the position it was shaped for.)
+      RECOVERY_ARGS="--stage-hosts $STAGE_HOSTS --stage-port 7777 --stage-partition $PART \
+        --spare-host ${IPS[$NWAY]} --spare-sink 7780 --spare-port 7777 \
+        --initial-spares $NSPARES --warm-target $NSPARES"
+      # self-replenish provisions a NEW box (sky launch + scoped creds) on the HOST, not in this container
+      # → opt-in via CAIRN_SELF_REPLENISH (+ a host-side watcher started below + a launch key on the box).
       [ -n "${CAIRN_SELF_REPLENISH:-}" ] && RECOVERY_ARGS="$RECOVERY_ARGS --self-replenish"
+    fi
+    # Host-side self-replenish watcher (opt-in). Needs `sky` + a scoped launch key on this box
+    # (infra/aws/cairn-spare-launch-policy.json) — admin step, hence opt-in.
+    if [ -n "${CAIRN_SELF_REPLENISH:-}" ]; then
+      : > /tmp/cairn-shared/cairn-replenish-req
+      DRIVER_PRIVATE_IP="$IP0" CAIRN_SPARE_RANK="${CAIRN_SPARE_RANK:-}" \
+      CAIRN_REPLENISH_REQ=/tmp/cairn-shared/cairn-replenish-req SKY_BIN="${SKY_BIN:-sky}" \
+      CAIRN_REGION="${CAIRN_REGION:-}" CAIRN_IMAGE_ID="${CAIRN_IMAGE_ID:-}" \
+        nohup bash /home/ubuntu/.sky/file_mounts/cairn/infra/skypilot/replenish-watcher.sh \
+        > /tmp/cairn-replenish-watcher.log 2>&1 &
+      echo "[dsv4] self-replenish watcher started (host-side) — /tmp/cairn-replenish-watcher.log"
     fi
     eval $DOCKER_RUN_COMMON \
       python -u -m cairn_node.serve_http --model "$MODEL" --port 8000 --bind 0.0.0.0 --api-key "$API_KEY" \
