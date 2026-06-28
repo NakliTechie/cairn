@@ -4,116 +4,80 @@
 > single-GPU spot instances — and keep the token stream alive, bit-identical, through
 > spot reclaims.
 
-Cairn pipeline-splits one large open model **by layers** across N cheap single-GPU AWS
-spot instances, keeps the fleet busy by **multi-streaming**, and keeps it alive through
-spot interruptions with a **reassign-first recovery layer**: when a stage's box is
-reclaimed mid-generation, its slice is re-stitched onto a pre-staged **warm spare** and
-the committed **token history is replayed** under a fresh sequence — so generation
-resumes exactly where it left off, with no dropped or duplicated tokens. The pool then
-**re-provisions itself** back to full strength.
+Cairn pipeline-splits one large open model **by layers** across N cheap single-GPU AWS spot
+instances, keeps the fleet busy by **multi-streaming**, and survives spot interruptions with
+a **reassign-first recovery layer**: when a box is reclaimed mid-generation, its slice is
+re-stitched onto a pre-staged **warm spare** and the committed **token history is replayed** —
+so generation resumes exactly where it left off, no dropped tokens. The pool then
+**re-provisions itself**. The honest contribution is the failover layer, not the model: it's
+what makes the 3–4× spot discount usable for serving.
 
-Frontier-class models on commodity spot — scoped to the VRAM-and-availability gap where
-no affordable single instance fits the model. The honest contribution is the
-**failover/recovery layer**, not the model: the failover is what makes the 3–4× spot
-discount usable for serving.
+## Headline numbers (proven live, 2026-06-28)
 
-## Proven live (2026-06-28)
+On a real `g7e` (Blackwell, sm_120) spot fleet running **DeepSeek-V4-Flash FP8** (~600B, 43
+layers), 4-way split:
 
-On a real 4× `g7e` (Blackwell, sm_120) spot fleet in AWS, serving **DeepSeek-V4-Flash
-FP8** (~600B, 43 layers) split 4 ways:
+| Metric | Result |
+|---|---|
+| **Hot-swap recovery (MTTR)** | **0.93 s** abrupt kill · **3.26 s** proactive drain — **bit-identical, zero dropped tokens** (0.023 s pre-warmed on L4) |
+| **Multi-stream throughput** | **6.1 → 24.5 tok/s** at 1 → 4 concurrent streams (~4× occupancy, then fleet ceiling) |
+| **Distributed decode** | coherent, correct long-form output across the 4-stage pipeline |
+| **Self-replenish** | a consumed spare auto-launches + warms a replacement spot box |
 
-- **Coherent distributed decode** — correct, long-form answers across the pipeline.
-- **Hot-swap recovery** — a stage drained mid-generation, a warm spare re-stitched its
-  slice, and the stream resumed **bit-identical, zero dropped tokens** (tail MTTR 0.93s
-  abrupt / 3.26s proactive on V4; 0.023s pre-warmed on L4). Recovery is
-  position-independent (entry/middle/tail proven bit-identical; tail live-confirmed,
-  entry/middle GPU-confirmation pending).
-- **Multi-stream throughput** — scales ~linearly to the fleet ceiling (6.1 → 24.5 tok/s,
-  1 → 4 concurrent streams).
-- **Self-replenishing pool** — consuming a spare auto-launches a replacement spot box.
-
-Full evidence table: [`report/achievements.md`](report/achievements.md).
+Recovery is position-independent (entry/middle/tail bit-identical; tail live-confirmed,
+entry/middle CPU-proven). Full evidence: [`report/achievements.md`](report/achievements.md).
 
 ## Quickstart
 
-You need an AWS account (scoped key), [SkyPilot](https://skypilot.readthedocs.io/), and a
-Hugging Face token. Then:
+Needs an AWS account (scoped key), [SkyPilot](https://skypilot.readthedocs.io/), and a Hugging
+Face token.
 
 ```sh
 cp infra/secrets.env.example infra/secrets.env   # fill in HF_TOKEN + AWS creds
 bash infra/skypilot/bringup.sh                    # launch fleet + serve + tunnel
-# defaults: DeepSeek-V4-Flash FP8, 4-way, 6 nodes (4 active + 2 spares), us-east-2
 ```
 
-Then open `http://localhost:8000/` (built-in chat page) or call the OpenAI-compatible API
-at `http://localhost:8000/v1`. Teardown: `infra/skypilot/nuke.sh --force`.
+Then open `http://localhost:8000/` (built-in chat page) or call the OpenAI-compatible API at
+`http://localhost:8000/v1`. Teardown: `infra/skypilot/nuke.sh --force`. Full guide (knobs,
+model-as-config, teardown verification): [`docs/operator-README.md`](docs/operator-README.md).
 
-The full guide — every topology/recovery knob, model-as-config, the drain-sentinel test
-hook, teardown with EC2-API verification — is in
-[`docs/operator-README.md`](docs/operator-README.md).
+## How it works
 
-## Architecture (three planes)
+Three planes — an OpenAI-compatible **client** API, a **control** plane (auth, fleet state,
+the drain/retry/reassign loop) that's never in the per-token hot path, and a **data** plane of
+single-GPU spot boxes each serving one contiguous block of layers. The decode loop runs wholly
+in-VPC over LAN with **no cross-node NCCL** (which would hang when a spot node vanishes) — Cairn
+wraps SGLang per-block with its own encrypted wire and recovery, blast radius 1/N. Details:
+[`docs/cairn-spec.md`](docs/cairn-spec.md) · [`docs/paper-draft.md`](docs/paper-draft.md).
 
-- **Plane 1 — Client.** OpenAI-compatible inference API; the agent face *is* the product.
-- **Plane 2 — Control.** Gateway (auth, admission, route setup, token streaming) +
-  durable fleet state (registry, topology, health, durable token-history, the
-  drain/retry/reassign loop). **Never in the per-token hot path.**
-- **Plane 3 — Data (AWS spot, one VPC).** A pipeline of cheap single-GPU spot instances,
-  each serving one contiguous block of layers. The decode loop runs wholly in-VPC over
-  LAN — **no cross-node NCCL** (which would hang when a spot node vanishes); Cairn wraps
-  SGLang per-block with its own encrypted wire and recovery (blast radius 1/N).
+It neither migrates KV state (SpotServe, KevlarFlow) nor replaces whole replicas (SkyServe) —
+it keeps **no** recovery state and **replays the token log** onto a warm spare. Positioning +
+benchmark plan: [`report/benchmark-plan.md`](report/benchmark-plan.md).
 
-## How it compares
+## Roadmap & open directions
 
-Cairn is a distinct, simpler recovery primitive at frontier scale — it neither migrates
-KV state (SpotServe, KevlarFlow) nor replaces whole replicas (SkyServe): it keeps **no**
-recovery state and **replays the token log** onto a warm spare. Detailed positioning and
-the head-to-head benchmark plan vs SpotServe / Petals / KevlarFlow / Helix:
-[`report/benchmark-plan.md`](report/benchmark-plan.md).
+- **Faster pool re-arm after a swap (warm-AMI + FSR).** The swap is already sub-second; the
+  remaining latency is *refilling* the pool. Baking weights+image into a per-region AMI cuts a
+  replacement spare's warm-up from ~30 min to ~5–10 min, and **Fast Snapshot Restore** to
+  ~3–5 min — so the **next spare comes up fast right after a hotswap**, keeping the fleet
+  continuously protected under sustained churn instead of leaving a ~30 min gap.
+- **Further experiments:** push past the ~25 tok/s ceiling (speculative decoding, fatter
+  slices), multi-AZ spot hunting, heartbeat-based interior death detection, catastrophic
+  durability (Cloudflare DO + resumable driver), model-as-config breadth, autoscaling.
 
-## Documentation
-
-- [`docs/operator-README.md`](docs/operator-README.md) — run it yourself (bring-up, knobs, teardown).
-- [`docs/cairn-vision-roadmap.md`](docs/cairn-vision-roadmap.md) — thesis, scope, economics, roadmap.
-- [`docs/cairn-spec.md`](docs/cairn-spec.md) — invariants, fit algorithm, scheduler, recovery model.
-- [`docs/paper-draft.md`](docs/paper-draft.md) — the systems write-up (design, evaluation, related work).
-- [`report/achievements.md`](report/achievements.md) — what's proven, with evidence.
-- [`report/productization.md`](report/productization.md) — the gap from "works" to "product."
-
-## Status & honesty
-
-**The mechanism is proven live** (distributed decode + hot-swap recovery + multi-stream +
-self-replenish, on real spot GPUs). It is **not production-ready**: remaining work is
-largely productionization, not research — GPU-confirm the non-tail recovery positions and
-multi-death, run the head-to-head benchmarks, deploy the control plane for catastrophic
-durability, and shorten spare warm-up. See
+Full detail: [`docs/roadmap.md`](docs/roadmap.md). Gap-to-product analysis:
 [`report/productization.md`](report/productization.md).
 
-Claims in this repo are tagged by evidence tier (live-proven / CPU-proven / designed);
-we don't publish numbers we haven't measured live.
+## Status
 
-## Planned optimizations
-
-- **Warm-AMI spares (the warm-up ceiling fix).** Today, replenishing a consumed warm spare
-  network-copies the ~294 GB checkpoint from S3 to the box's NVMe — **~20–40 min**, which is
-  the main thing that could let a reclaim *storm* outrun the pool. The swap itself is already
-  sub-second (we stitch onto an already-warm standing spare); this is purely about how fast
-  the pool *refills*. Planned fix: bake the weights + the container image into a per-region
-  AMI (on an EBS volume — the NVMe instance store can't be baked, it's ephemeral) so a fresh
-  spare boots with everything already attached:
-  - Warm AMI (lazy EBS hydration): **~5–10 min** to ready.
-  - Warm AMI **+ Fast Snapshot Restore (FSR)**: FSR pre-initializes the restored volume so
-    there's no first-read hydration from S3 — warm-up collapses to just *instance boot +
-    load the slice into VRAM + kernel warm*, **theoretically ~3–5 min** (and bounded only by
-    spot-provision + model-load time). FSR is a one-time enable (up to ~60 min per snapshot
-    per AZ); every restore after that is instant. _Not needed yet — noted for when replenish
-    latency becomes the binding constraint._
+**Mechanism proven live; not production-ready.** Remaining work is largely productionization,
+not research (GPU-confirm the non-tail recovery positions, head-to-head benchmarks, control
+plane, faster replenish). Claims are tagged by evidence tier (live-proven / CPU-proven /
+designed) — we don't publish numbers we haven't measured live.
 
 ## License
 
-Apache-2.0 — see [`LICENSE`](LICENSE). Cairn is a hard fork of
-[`leyten/shard`](https://github.com/leyten/shard) (Apache-2.0; provenance and the
-keep/strip ledger in [`fork/UPSTREAM.md`](fork/UPSTREAM.md)). Models are served as
-configuration and carry their own licenses (the headline models are Apache-2.0 / MIT).
-
-> "Cairn" is a working name.
+Apache-2.0 ([`LICENSE`](LICENSE)). Cairn is a hard fork of
+[`leyten/shard`](https://github.com/leyten/shard) (Apache-2.0; ledger in
+[`fork/UPSTREAM.md`](fork/UPSTREAM.md)). Models are served as configuration and carry their own
+licenses. "Cairn" is a working name.
