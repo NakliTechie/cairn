@@ -348,6 +348,8 @@ run: |
     -e SGLANG_OPT_CACHE_SWA_TRANSLATION=0 \
     -e CAIRN_DEBUG_MOE=1 \
     -e CAIRN_SPOT_WATCH=1 \
+    -e CAIRN_SPOT_TEST_FILE=/shared/drain \
+    -e CAIRN_SPOT_WATCH_INTERVAL=0.5 \
     -e CAIRN_REPLENISH_CMD=\"${CAIRN_REPLENISH_CMD:-}\" \
     -e CAIRN_ALERT_WEBHOOK=$CAIRN_ALERT_WEBHOOK \
     -e CALLMEBOT_PHONE=$CALLMEBOT_PHONE \
@@ -415,11 +417,12 @@ run: |
         --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 $RECOVERY_ARGS \
       2>&1 | tee /tmp/cairn-dsv4-serve.log
   elif [ "$RANK" = "$LAST_ACTIVE" ]; then
-    # TAIL -> serve_http's tail-sink ($IP0:7779). CAIRN_SPOT_TEST_FILE arms the proactive-drain sentinel.
-    # The `exit 0` shim is REQUIRED (gang-scheduler trap, 2026-06-23): a tail rc=137 would reap serve_http
-    # mid-recovery, so report 0 and let serve_http's own death-detect drive the re-stitch (3-way spare).
-    eval CAIRN_SPOT_TEST_FILE=/tmp/cairn-drain CAIRN_SPOT_WATCH_INTERVAL=0.5 \
-      $DOCKER_RUN_COMMON \
+    # TAIL -> serve_http's tail-sink ($IP0:7779). The proactive-drain sentinel (CAIRN_SPOT_TEST_FILE=/shared/drain)
+    # is now armed on ALL ranks via DOCKER_RUN_COMMON — touch /tmp/cairn-shared/drain on a box to drain THAT rank
+    # (the host dir is bind-mounted to the container's /shared). The `exit 0` shim is REQUIRED (gang-scheduler
+    # trap, 2026-06-23): a tail rc=137 would reap serve_http mid-recovery, so report 0 and let serve_http
+    # drive the re-stitch.
+    eval $DOCKER_RUN_COMMON \
       python -u -m cairn_node.serve $STAGE_ARGS \
       > /tmp/cairn-dsv4-rank${RANK}-tail.log 2>&1
     rc=$?; echo "[dsv4] tail (rank $RANK) exited rc=$rc (kill/drain) -> reporting 0 so the gang scheduler keeps serve_http alive"; exit 0
