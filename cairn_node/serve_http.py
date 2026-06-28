@@ -60,12 +60,26 @@ class _Tok:
 
     def __init__(self, model: str) -> None:
         self.mock = model.startswith("mock:")
+        self.eos: set[int] = set()
         if self.mock:
             self.vocab = int(model.split(":")[-1]) if ":" in model else 256
             self.t = None
         else:
             from transformers import AutoTokenizer
             self.t = AutoTokenizer.from_pretrained(model)
+            if self.t.eos_token_id is not None:
+                self.eos.add(int(self.t.eos_token_id))
+            # generation_config may list extra stop ids (DeepSeek ships <｜end▁of▁sentence｜> + variants)
+            try:
+                from transformers import GenerationConfig
+                gc = GenerationConfig.from_pretrained(model)
+                ge = getattr(gc, "eos_token_id", None)
+                if isinstance(ge, int):
+                    self.eos.add(ge)
+                elif isinstance(ge, (list, tuple)):
+                    self.eos.update(int(x) for x in ge)
+            except Exception:
+                pass
 
     def encode(self, messages) -> list:
         if self.mock:
@@ -174,7 +188,19 @@ class FleetEngine:
             else:
                 out = _drive_multi(self.head, self.tail, [(seq, ids)], req.max_tokens, stop=False)[seq]
                 mttr = None
-            return out, mttr, seq
+            return self._trim_eos(out), mttr, seq
+
+    def _trim_eos(self, out):
+        """The decode loop runs a fixed max_tokens with no early-stop, so an instruct model emits EOS at
+        its natural end and then DEGENERATES (greedy temp=0 → repetition). Truncate at the first stop id so
+        the response ends where the model meant to. (GPU-confirmed 2026-06-28: clean first sentence then
+        'PL PL...' to the cap.)"""
+        eos = getattr(self.tok, "eos", set())
+        if eos:
+            for i, t in enumerate(out):
+                if t in eos:
+                    return out[:i]
+        return out
 
     def complete(self, req) -> dict:
         out, mttr, seq = self.run(req)
@@ -185,7 +211,7 @@ class FleetEngine:
         resp = {
             "id": seq, "object": "chat.completion", "model": req.model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": self.tok.decode(out)},
-                         "finish_reason": "length"}],
+                         "finish_reason": ("length" if len(out) >= req.max_tokens else "stop")}],
             "usage": {"prompt_tokens": n_prompt, "completion_tokens": len(out),
                       "total_tokens": n_prompt + len(out)},
         }
@@ -198,7 +224,7 @@ class FleetEngine:
             yield {"id": seq, "object": "chat.completion.chunk", "model": req.model,
                    "choices": [{"index": 0, "delta": {"content": self.tok.decode([tok])}, "finish_reason": None}]}
         yield {"id": seq, "object": "chat.completion.chunk", "model": req.model,
-               "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+               "choices": [{"index": 0, "delta": {}, "finish_reason": ("length" if len(out) >= req.max_tokens else "stop")}]}
 
 
 class _Handler(BaseHTTPRequestHandler):
