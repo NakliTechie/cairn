@@ -2,7 +2,7 @@
 
 How to bring up, use, recover, and tear down a live Cairn endpoint.
 
-Cairn serves a large open model (default **DeepSeek-V4-Flash FP8**, ~600B) by **pipeline-splitting it
+Cairn serves a large open model (default **DeepSeek-V4-Flash FP8**, 671B MoE) by **pipeline-splitting it
 by layers** across N cheap single-GPU AWS spot boxes (g7e / RTX PRO 6000 Blackwell, sm_120), and keeps
 the endpoint alive through spot reclaims with a **warm-spare recovery layer** that can self-replenish.
 The OpenAI-compatible BYOK endpoint (with a built-in chat page) is served by `cairn_node/serve_http.py`
@@ -76,8 +76,14 @@ From the repo root:
 
 ```sh
 cp infra/secrets.env.example infra/secrets.env   # first time only — then fill it in
+bash infra/aws/ensure-fleet-sg.sh                # one-time per region: creates the shared `cairn-fleet` SG
 bash infra/skypilot/bringup.sh
 ```
+
+> **One-time per region:** the fleet and its spares all join a shared security group (`cairn-fleet`)
+> so a replenished spare — which launches as a *separate* SkyPilot cluster — can still reach the
+> recovery wire (ports 7777–7780). `ensure-fleet-sg.sh` creates that SG with the right rules; skip it
+> and recovery onto a replenished spare will silently fail. (See `report/productization.md`.)
 
 That's it. `bringup.sh`:
 

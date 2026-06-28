@@ -152,7 +152,7 @@ snapshots real resources and uses admin-tier EC2 perms). Shape:
 The script keeps build-time EC2 mutations (`run-instances`, `create-image`, `copy-image`, FSR
 enable/disable) behind `AWS_PROFILE=${AWS_PROFILE:-admin-cli}` — the least-priv `cairn-skypilot`
 key intentionally **cannot** do these (consistent with the
-[credential posture](../aws/README.md)). It prints the resulting AMI id and never tears anything
+credential posture (scoped least-privilege key; see `infra/aws/`)). It prints the resulting AMI id and never tears anything
 down on its own.
 
 ## Integrating with the replenish path

@@ -109,7 +109,7 @@ accounting above, reliability reported alongside cost. See `plan/prior-art.md` +
 > ⚠ Placeholder arithmetic to show the *shape* of the honest calc. NOT a claim. Prices are illustrative;
 > the actual figures come from the tagged bill of a real fleet run.
 
-- Proof: gpt-oss-120b, **N=4 active + 1 warm spare**, g6.xlarge, eu-south-2.
+- Proof: DeepSeek-V4-Flash FP8, **4 active + 2 warm spares**, g7e.2xlarge, us-east-2.
 - Run: 4h wall-clock; served W output tokens; **3 interruptions** (~8% re-work, in the node-hours).
 - Spot price paid ≈ \$0.16/hr; on-demand g6.xlarge ≈ \$0.80/hr (CONFIRM both from the bill / pricing).
 - **Spot** = (4 active + 1 spare) × 4h × \$0.16 + control-plane/storage ≈ \$3.20 + \$0.30 = **\$3.50**

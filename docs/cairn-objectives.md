@@ -1,18 +1,18 @@
 # Cairn — objectives
 
-_What we're building, the end state, and the one honest claim. (2026-06-20.)_
+_What Cairn is, the end state, and the one honest claim._
 
 ## In one line
 Serve a **frontier open LLM that no single affordable GPU can hold** on a fleet of **cheap, individually-reclaimable single-GPU spot instances**, and keep it serving **through spot preemption** via a minimal hot-swap recovery loop — **on-demand-grade reliability at roughly spot cost.**
 
 ## Targets
-- **Proof:** gpt-oss-120b (Apache-2.0) on g6/L4 (Spain) — the mechanism on a current open model.
-- **Headlines (DSA → Blackwell g7e, 4-bit NVFP4, Seoul):** **GLM-5.2** (753B, the big flex, N≈6) and **DeepSeek-V4-Flash** (158B, MLA so tiny KV, the light/cheap one, N≈2) — both MIT.
+- **Headline model:** **DeepSeek-V4-Flash** — 671B-param MoE (256 experts, 6 active + 1 shared), 43 layers (41 MoE + 2 dense), MLA (compressed KV) + DSA, MIT license. The quantization actually run is **FP8** (the `sgl-project/DeepSeek-V4-Flash-FP8` repack, served via the `0xSero` sm_120 community sglang patch); checkpoint ~294 GB on disk.
+- **Hardware:** **g7e.2xlarge — RTX PRO 6000 Blackwell, sm_120** (workstation Blackwell), 96 GiB VRAM, AWS spot in **us-east-2 (Ohio)**. FP8 needs a **4-way** layer split to fit.
 - **Comparability (head-to-head vs the papers):** GPT-NeoX-20B (SpotServe), Llama-3.1-8B (KevlarFlow).
-- Model-as-config (inv #3): each target is a YAML, never a code path.
+- **Model-as-config:** each target is a YAML, never a code path. A future model such as GLM-5.2 would land as a new config, not new code.
 
 ## The contribution (honest scope)
-Cairn adds **one thing**: a **hot-swap failover layer** for pipeline-parallel LLM serving on preemptible spot. It is a **systems/ops layer on top of existing serving** (SGLang, wrapped per-block) — **not** a new model, attention mechanism, or quantization. The specific primitive: **fixed blocks; lose one → swap it onto a pre-staged warm spare in seconds → rebuild only that block's KV by replaying the durable token history.** Blast radius 1/N.
+Cairn adds **one thing**: a **hot-swap failover layer** for pipeline-parallel LLM serving on preemptible spot. It is a **systems/ops layer on top of existing serving** (SGLang, wrapped per-block) — **not** a new model, attention mechanism, or quantization. The specific primitive: **fixed blocks; lose one → swap it onto a pre-staged warm spare in seconds → rebuild only that block's KV by replaying the durable token history.** No NCCL re-form, no full reparallelization. Blast radius 1/N.
 
 Why it's worth doing:
 - **It unlocks the spot discount; it doesn't add cost.** Spot is ~3–4× cheaper than on-demand but gets preempted; the failover is what lets you *use* that cheap capacity reliably. The headline is "≈ on-demand reliability at spot cost" (cf. SpotServe's **54% < on-demand**), not "a bit more than bare spot." The warm spare is the only standing overhead.
@@ -24,7 +24,7 @@ This is **not new territory — and that's the validation.** Fault-tolerant LLM 
 - **Petals** (NeurIPS '23) — Cairn's architecture (blocks across nodes, reroute on loss), at internet/volunteer scale.
 - **KevlarFlow** (2026) — recovers by **background KV replication**; 20× MTTR.
 
-Cairn's differentiator is the **combination**, not any single mechanism: a model **big enough that the split is mandatory** × **production multi-stream throughput** × a **minimal recovery primitive** (replay the dead block, no full reparallelization) × **commodity single-VPC spot**. The bet to prove: the minimal primitive stays competitive with reparallelization/replication at frontier scale.
+Cairn's differentiator is the **combination**, not any single mechanism: a model **big enough that the split is mandatory** × **production multi-stream throughput** × a **minimal recovery primitive** (replay the dead block, no full reparallelization) × **commodity single-VPC spot**. The bet being proven: the minimal primitive stays competitive with reparallelization/replication at frontier scale.
 
 ## End state — the deliverables
 1. **A working system**, proven up the cost-ladder (rungs 0→5: sim → 1-GPU → 2-GPU split + recovery → proof fleet → frontier headline fleet → resiliency).
@@ -33,10 +33,10 @@ Cairn's differentiator is the **combination**, not any single mechanism: a model
 4. **An open-source repo** people take away and run their own fault-tolerant spot serving in production.
 
 ## License & stance
-- **Open source.** Clean licenses throughout — Apache-2.0 (gpt-oss-120b, GPT-NeoX-20B), MIT (GLM-5.2, DeepSeek-V4-Flash); deliberately no OPT/LLaMA-1 (non-commercial/leaked). Model-as-config keeps it model-agnostic.
-- **Monetization = consulting, not a product.** The work is a credibility/portfolio piece that lands engagements — not a SaaS to sell. _(Supersedes the earlier "commercial edge-first, not in the public portfolio" framing: this is public and open.)_
+- **Open-source research artifact.** Clean licenses throughout — MIT (DeepSeek-V4-Flash), Apache-2.0 (GPT-NeoX-20B); deliberately no OPT/LLaMA-1 (non-commercial/leaked). Model-as-config keeps it model-agnostic.
+- **Not a product.** Cairn is published open-source research, not a SaaS. Any monetization is **consulting** — the work lands engagements, it is not a hosted service to sell.
 
 ## Non-goals
 - Not a new model / attention / quantization — a serving-reliability layer.
-- Not a closed product.
+- Not a closed or hosted product.
 - Not a claim to have invented distributed inference on spot (that's SpotServe / Petals) — Cairn is a distinct, simpler recovery primitive at frontier scale.

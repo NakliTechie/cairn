@@ -44,7 +44,7 @@ consulting upside**, not a SaaS. That changes the bar. Two different finish line
 | **Observability** | Logs + ad-hoc probes | Metrics, dashboards, alerting, SLOs (MTTR budgets, drop-rate). |
 | **Cost accounting** | Computed, deprioritized | Real per-request cost, the spot-vs-on-demand savings number as a first-class output. |
 | **Spare warm-up latency** | ~20–40 min (load 294 GB) | The biggest operational gap: a fresh spare takes too long to warm, so deep reclaim storms could outrun replenishment. Needs faster staging (snapshots / pre-baked AMIs / NVMe pre-stage) and/or a deeper standing pool. |
-| **Self-replenish networking** | Bug found + fixed (design) | A replenished spare launches as a *separate* SkyPilot cluster → its own isolated security group, so the recovery wire (7777-7780) couldn't reach it (see below). Fixed by pinning the fleet + spare to one shared named SG; not yet re-validated live. |
+| **Self-replenish networking** | Bug found + fixed (code), live re-validation owed | A replenished spare launches as a *separate* SkyPilot cluster → its own isolated security group, so the recovery wire (7777-7780) couldn't reach it (see below). Fixed by pinning the fleet + spare to one shared named SG; not yet re-validated live. |
 | **Hardening at scale** | Single-fleet happy path | Sustained-load soak tests, chaos testing (random multi-reclaims), back-pressure, partial-failure modes. |
 
 ### Discovered live (2026-06-28): self-replenish SG isolation broke recovery onto a replenished spare
@@ -65,7 +65,7 @@ SkyPilot gives a **distinct, isolated security group**. The recovery wire is *bi
    inbound — so activations never reached the spare and the driver's read timed out, leaving the fleet
    degraded.
 
-**Fix (designed, not yet re-validated live):** pin both `cairn-dsv4.sky.yaml` and `cairn-dsv4-spare.sky.yaml`
+**Fix (implemented in code `e83ecb2`, not yet re-validated live):** pin both `cairn-dsv4.sky.yaml` and `cairn-dsv4-spare.sky.yaml`
 to one **shared named security group** via SkyPilot's `config.aws.security_group_name: cairn-fleet`, so every
 box — live fleet and every replenished spare — joins the same SG and all of 7777-7780 are mutually reachable
 with no per-launch SG surgery. A one-time-per-region helper (`infra/aws/ensure-fleet-sg.sh`) creates that SG

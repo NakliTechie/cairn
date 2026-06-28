@@ -3,7 +3,7 @@
 # DIFFERENT FROM deepseek-v4-flash-nvfp4.yaml: that is the NVIDIA NVFP4 build for DATACENTER Blackwell
 # (sm_100, GB200/B100/B200) — blocked on workstation Blackwell (sm_120 / g7e) where DeepGEMM hard-refuses
 # (DeepSeek: "no plan to be compatible with sm120"). The path-C plan (plan/path-c-deepseek-v4-fork.md)
-# pivots to the official deepseek-ai FP8 build + the `0xSero/deepseek-v4-flash-sm120` community sglang
+# pivots to the sgl-project FP8 repack (sgl-project/DeepSeek-V4-Flash-FP8) + the `0xSero/deepseek-v4-flash-sm120` community sglang
 # patch — runtime-replaces broken SM120 FlashMLA sparse-decode kernels in
 # `lmsysorg/sglang:deepseek-v4-blackwell`. Benchmark-confirmed on 4× RTX PRO 6000.
 #
@@ -14,7 +14,7 @@
 
 name: deepseek-v4-flash-fp8
 source:
-  hf_repo: deepseek-ai/DeepSeek-V4-Flash       # OFFICIAL DeepSeek FP8 mixed-precision build (matches 0xSero recipe)
+  hf_repo: sgl-project/DeepSeek-V4-Flash-FP8   # FP8 repack run on sm_120 (the deepseek-ai int8 build has no sm_120 MoE kernel)
 license: MIT
 
 arch:
@@ -43,7 +43,7 @@ precision:
   kv_model: full               # MLA compresses KV + DSA caps attention compute; conservative full here
 
 footprint:
-  total_weight_bytes: 159609485896   # ~149 GiB FP8 mixed — verified via HF metadata (46 safetensors files). MEASURE on the box.
+  total_weight_bytes: 294000000000   # ~294 GB FP8 repack (sgl-project), staged on box 2026-06-28 (149 GiB was the abandoned int8 build)
 
 overheads:
   framework_overhead_bytes: 5368709120   # ~5 GiB CUDA + SGLang Blackwell. TODO measure on g7e w/ 0xSero patch.

@@ -55,7 +55,7 @@ pipeline, and a **single-VPC owned fleet** (not a permissionless mesh).
   spare, and **rebuilds just that block's KV by replay** (never migrates KV). Blast radius is 1/N,
   not the whole model; recovery is bit-identical, not a careful state copy. **Scale gap:** SpotServe
   evaluated ≤30B on 4× T4 (sharding for economics — the model *fits* a few GPUs); Cairn's regime is
-  a model that fits **no single commodity GPU** (V4-Flash ~600B), where the split is **mandatory**.
+  a model that fits **no single commodity GPU** (V4-Flash 671B), where the split is **mandatory**.
   *The open bet (stated, not assumed): does the minimal reassign+replay primitive stay competitive
   with SpotServe's full reparallelization on cost/token at tail latency?*
 
@@ -125,8 +125,8 @@ reproduced. We do **not** have SpotServe's / KevlarFlow's exact clusters; we the
    - OPT-6.7B (SpotServe's, research-only license) — internal benchmark only, never product/demo.
    - BLOOM-176B (Petals', RAIL) — optional, internal-only.
    - **Skip** LLaMA-30B (research-only/leaked license).
-2. **Proof:** gpt-oss-120b on g6/L4 — the mechanism on a current open model.
-3. **Headline:** **DeepSeek-V4-Flash FP8 (~600B)** on g7e/Blackwell — the frontier flex the 2024
+2. **Proof:** Llama-3.1-8B on commodity GPUs — the mechanism on a current open model.
+3. **Headline:** **DeepSeek-V4-Flash FP8 (671B)** on g7e/Blackwell — the frontier flex the 2024
    papers could not run (this is the model already live; see `report/achievements.md`).
 
 ### Hardware fairness caveats (state these in the paper)
@@ -201,8 +201,8 @@ reproduced. We do **not** have SpotServe's / KevlarFlow's exact clusters; we the
 | Metric | SpotServe | KevlarFlow | DéjàVu | Petals | SkyServe | **Cairn (live)** |
 |---|---|---|---|---|---|---|
 | Recovery model | reparallelize + KV migrate | KV replicate + reroute | KV stream + replicate | reroute activations | replace replica | reassign block + replay |
-| Eval model | OPT-6.7B / NeoX-20B / LLaMA-30B | Llama-3.1-8B | OPT-family | BLOOM-176B / Llama-2-70B | Llama-2-70B / OPT-6.7B | **DeepSeek-V4-Flash ~600B** |
-| Split mandatory? (model > 1 GPU) | no (≤30B) | no (8B) | no | yes (176B, WAN) | no (replica = whole model) | **yes (~600B)** |
+| Eval model | OPT-6.7B / NeoX-20B / LLaMA-30B | Llama-3.1-8B | OPT-family | BLOOM-176B / Llama-2-70B | Llama-2-70B / OPT-6.7B | **DeepSeek-V4-Flash 671B** |
+| Split mandatory? (model > 1 GPU) | no (≤30B) | no (8B) | no | yes (176B, WAN) | no (replica = whole model) | **yes (671B)** |
 | MTTR (median) | within ~30 s grace window | ~29–35 s | "fast" (qual.) | reroute latency (WAN) | ~183 s (replica reprovision) | _0.93 s / 3.26 s (V4); 0.023 s (L4)¹_ |
 | MTTR distribution (min/P95/max) | n/a (point) | ~29–35 s band | n/a | n/a | n/a | _to measure (≥20 events/cell)_ |
 | Dropped tokens | migrate (lossless intent) | migrate (lossless intent) | replicate | re-sent | request replaced | _0 (bit-identical)¹_ |

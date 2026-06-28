@@ -40,7 +40,7 @@ committed token history under a fresh sequence, resuming bit-identical; and (3) 
 cost/token defensible.
 
 We report preliminary results from a live deployment serving DeepSeek-V4-Flash
-(FP8, ~600 GB on disk, 43 layers) split four ways across single-GPU Blackwell spot
+(FP8, ~294 GB on disk, 43 layers) split four ways across single-GPU Blackwell spot
 instances. Single-stream hot-swap recovery completes in **0.93 s and 3.26 s**
 (mid-generation, bit-identical, zero dropped tokens) **[LIVE]**; multi-stream
 throughput scales **6.1 → 24.9 tok/s** from one to eight concurrent streams
@@ -471,7 +471,7 @@ cairn/
   scheduler/   # the multi-stream scheduler — the core build
   control/     # CF Workers gateway + Durable Objects fleet state
   infra/       # SkyPilot configs, instance bootstrap, weight-staging, caching
-  configs/     # model-as-config: gpt-oss-120b.yaml, deepseek-v4-flash.yaml, glm-5.2.yaml, …
+  configs/     # model-as-config: deepseek-v4-flash.yaml, glm-5.2.yaml, …
   bench/       # benchmark harness + gate-artifact tests (correctness, interruption, crypto)
   docs/        # vision, spec, handoff, this paper
 ```
@@ -493,7 +493,7 @@ recovery mechanisms of prior systems on *their* models. The plan has three tiers
    SpotServe's reparallelize+migrate on cost/token and tail latency (target: ≤
    SpotServe's published **54% of on-demand**); Llama-3.1-8B (KevlarFlow's exact) to
    compare **MTTR** under matched failure injection.
-2. **Proof.** gpt-oss-120b — the mechanism on a current open model.
+2. **Proof.** Llama-3.1-8B on commodity GPUs — the mechanism on a current open model.
 3. **Headline.** DeepSeek-V4-Flash and GLM-5.2 (NVFP4/FP8, g7e/Blackwell) — the
    frontier flex the 2024 papers could not run, where the split is *mandatory*. No
    published baseline exists at that size by choice; the small-model head-to-heads
@@ -507,7 +507,7 @@ induced-interruption timeline (warning → load → re-prefill → resume).
 
 All numbers below are **[LIVE]** on real GPUs unless tagged otherwise.
 
-**Setup (headline live run).** DeepSeek-V4-Flash FP8 (~600 GB on disk, 43 layers)
+**Setup (headline live run).** DeepSeek-V4-Flash FP8 (~294 GB on disk, 43 layers)
 split four ways across 4× g7e single-GPU Blackwell spot instances (Ohio), in one VPC.
 
 **Distributed frontier decode.** The 4-way split produced coherent, correct output:
@@ -526,7 +526,7 @@ The tail stage was drained mid-generation; the warm spare was re-stitched; gener
 resumed bit-identical (output sha matched the baseline across the token boundary) with
 **zero dropped or duplicated tokens**, and the endpoint never returned an error.
 
-**Recovery is position-aware.** Proactive drain (the ~2-min spot pre-warning) carries
+**Recovery is position-independent.** Proactive drain (the ~2-min spot pre-warning) carries
 the dying stage's identity → graceful migration *before* death. The reactive
 (abrupt-SIGKILL) half-open-timeout fallback is proven on the tail.
 
@@ -693,7 +693,7 @@ model** in which KV is derived and recovery is replay onto a pre-staged warm spa
 and a **multi-stream scheduler** that fills the pipeline bubble to keep the split
 economical.
 
-The preliminary live evidence is encouraging: a 600 GB frontier model served across
+The preliminary live evidence is encouraging: a 671B-param frontier model served across
 four single-GPU Blackwell spot instances, with mid-generation hot-swap recovery in
 **0.93 s and 3.26 s** — bit-identical, zero drops — multi-stream throughput scaling
 **6.1 → 24.9 tok/s**, and an automatically self-replenishing warm pool **[LIVE]**. The

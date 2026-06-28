@@ -14,18 +14,20 @@ what makes the 3–4× spot discount usable for serving.
 
 ## Headline numbers (proven live, 2026-06-28)
 
-On a real `g7e` (Blackwell, sm_120) spot fleet running **DeepSeek-V4-Flash FP8** (~600B, 43
-layers), 4-way split:
+On a real `g7e` (Blackwell, sm_120) spot fleet running **DeepSeek-V4-Flash FP8** (671B-param
+MoE, 43 layers, ~294 GB checkpoint), 4-way split:
 
 | Metric | Result |
 |---|---|
 | **Hot-swap recovery (MTTR)** | **0.93 s** abrupt kill · **3.26 s** proactive drain — **bit-identical, zero dropped tokens** (0.023 s pre-warmed on L4) |
-| **Multi-stream throughput** | **6.1 → 24.5 tok/s** at 1 → 4 concurrent streams (~4× occupancy, then fleet ceiling) |
+| **Multi-stream throughput** | **6.1 → 12.4 → 24.5 → 24.9 tok/s** at 1 / 2 / 4 / 8 streams (~4× by 4 streams, then fleet ceiling) |
 | **Distributed decode** | coherent, correct long-form output across the 4-stage pipeline |
 | **Self-replenish** | a consumed spare auto-launches + warms a replacement spot box |
 
-Recovery is position-independent (entry/middle/tail bit-identical; tail live-confirmed,
-entry/middle CPU-proven). Full evidence: [`report/achievements.md`](report/achievements.md).
+Recovery is position-independent (entry/middle/tail bit-identical; **tail live-confirmed**,
+entry/middle CPU-proven). Self-replenish provisioned + warmed a real spare live; recovery
+*onto* a replenished spare is fixed in code and pending a live re-validation. Full evidence:
+[`report/achievements.md`](report/achievements.md).
 
 ## Quickstart
 

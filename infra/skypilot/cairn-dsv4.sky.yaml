@@ -14,13 +14,13 @@
 #   • Entry-kill (rank 0): same + driver-side outbound re-stitch
 #   • Reactive non-tail death: needs heartbeats (Path 2)
 #
-# Topology (N=3 layer-split + 1 tail-shaped spare = 4 nodes total):
-#   rank0 = ENTRY  (layers 0..15)   + serve_http endpoint (OpenAI /v1 on :8000, co-located like cairn-serve.sky.yaml)
-#   rank1 = MIDDLE (layers 15..29)
-#   rank2 = TAIL   (layers 29..43)  — manual `pkill` / sentinel-drain demonstrates recovery
-#   rank3 = SPARE  (layers 29..43)  — pre-warmed standby, takes over on tail death
-# All four = g7e.2xlarge in eu-south-2 (Spain, $1.25/hr spot Linux/UNIX, <5% interruption — 2026-06-23 live).
-# Total fleet ≈ $5/hr. Session ceiling = $30 (≤6h, see plan/workplan.md Chunk 0 + memory box-spinup-cost-gate).
+# Topology (NWAY=4 layer-split + generic warm spares; default 6 nodes = 4 active + 2 spares):
+#   rank0 = ENTRY  (layers 0..10)   + serve_http endpoint (OpenAI /v1 on :8000)
+#   rank1 = MIDDLE (layers 11..21)
+#   rank2 = MIDDLE (layers 22..32)
+#   rank3 = TAIL   (layers 33..42)  — manual `pkill` / sentinel-drain demonstrates recovery
+#   rank4+ = SPARE — pre-warmed generic standbys; load-on-promotion reshapes to the dead rank's slice
+# All = g7e.2xlarge spot (us-east-2/Ohio for the 2026-06-28 live run; FP8 needs 4-way — 3-way OOMs).
 #
 # Launch (after `aws sso login --profile cairn-skypilot`):
 #   set -a; source infra/secrets.env; set +a
@@ -31,16 +31,16 @@
 #   ssh -L 8888:localhost:8000 cairn-dsv4 -N &
 #   curl localhost:8888/v1/chat/completions -H 'authorization: Bearer sk-cairn-demo' \
 #     -H 'content-type: application/json' \
-#     -d '{"model":"deepseek-ai/DeepSeek-V4-Flash","messages":[{"role":"user","content":"hi"}],"max_tokens":48}'
+#     -d '{"model":"sgl-project/DeepSeek-V4-Flash-FP8","messages":[{"role":"user","content":"hi"}],"max_tokens":48}'
 #   # Tail-kill recovery test:
-#   sky exec cairn-dsv4 "pkill -9 -f 'layer-start 29'"
+#   sky exec cairn-dsv4 "pkill -9 -f 'layer-start 33'"
 #   # Drain-based recovery test (proactive path):
 #   sky exec cairn-dsv4 "touch /tmp/cairn-drain"   # rank 2's sentinel watcher → graceful migrate
 #   sky down cairn-dsv4
 
 name: cairn-dsv4
 
-num_nodes: 5                          # 4 active FP8 stages (rank 0-3) + 1 generic warm SPARE (rank 4).
+num_nodes: 6                          # 4 active FP8 stages (rank 0-3) + 2 generic warm SPAREs (rank 4-5).
                                       # General rule: ranks 0..CAIRN_NWAY-1 are active; ranks >= NWAY are
                                       # warm spares. NWAY=4 (FP8) → 1 spare; NWAY=3 → 2 spares (warm_target=2).
 
