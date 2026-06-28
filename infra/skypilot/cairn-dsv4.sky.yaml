@@ -242,21 +242,50 @@ run: |
   [ -d /opt/dlami/nvme/model ] && MODEL_DIR=/opt/dlami/nvme/model
   echo "[dsv4] weights mounted from $MODEL_DIR"
 
-  # Path-β layer split (43 layers, N=3 → balanced front-loaded):
-  #   rank 0: [0,15)   — entry, embeds tokens
-  #   rank 1: [15,29)  — middle
-  #   rank 2: [29,43)  — tail, applies norm + lm_head
-  #   rank 3: [29,43)  — spare, tail-shaped for this run (first V4 test = tail-kill only)
-  case "$RANK" in
-    0) LS=0;  LE=15; PP_RANK=0; STAGE_NAME="entry"  ;;
-    1) LS=15; LE=29; PP_RANK=1; STAGE_NAME="middle" ;;
-    2) LS=29; LE=43; PP_RANK=2; STAGE_NAME="tail"   ;;
-    3) LS=29; LE=43; PP_RANK=2; STAGE_NAME="spare"  ;;
-  esac
-  echo "[dsv4] rank=$RANK stage=$STAGE_NAME layers=[$LS,$LE) pp_rank=$PP_RANK"
+  # Topology selectable via CAIRN_NWAY (default 3). Path-β layer split over 43 layers:
+  #   NWAY=3  → 3 active stages + 1 tail-shaped SPARE (recovery-test topology): 15,14,14
+  #             rank0 [0,15) entry · rank1 [15,29) middle · rank2 [29,43) tail · rank3 [29,43) spare
+  #   NWAY=4  → 4 active stages, NO spare (the OOM-reslice topology — FP8 does NOT fit 3-way,
+  #             GPU-confirmed 2026-06-28: rank0 OOM'd at 94.36/95 GiB in FP8 MoE create_weights): 11,11,11,10
+  #             rank0 [0,11) entry · rank1 [11,22) · rank2 [22,33) · rank3 [33,43) tail
+  # WARM RE-SLICE: `sky exec cairn-dsv4 <this yaml> --env CAIRN_NWAY=4` re-runs ONLY this block on the
+  # live cluster — each box reloads its NEW slice from the on-disk weights (no S3 re-sync, ~5-8 min) vs a
+  # ~40-min cold relaunch (user directive 2026-06-27 / memory reslice-warm-not-reprovision).
+  NWAY=${CAIRN_NWAY:-3}
+  if [ "$NWAY" = "4" ]; then
+    PP_SIZE=4; PART=11,11,11,10; LAST_ACTIVE=3
+    case "$RANK" in
+      0) LS=0;  LE=11; PP_RANK=0; STAGE_NAME="entry"   ;;
+      1) LS=11; LE=22; PP_RANK=1; STAGE_NAME="middle1" ;;
+      2) LS=22; LE=33; PP_RANK=2; STAGE_NAME="middle2" ;;
+      3) LS=33; LE=43; PP_RANK=3; STAGE_NAME="tail"    ;;
+    esac
+  else
+    PP_SIZE=3; PART=15,14,14; LAST_ACTIVE=2
+    case "$RANK" in
+      0) LS=0;  LE=15; PP_RANK=0; STAGE_NAME="entry"  ;;
+      1) LS=15; LE=29; PP_RANK=1; STAGE_NAME="middle" ;;
+      2) LS=29; LE=43; PP_RANK=2; STAGE_NAME="tail"   ;;
+      3) LS=29; LE=43; PP_RANK=2; STAGE_NAME="spare"  ;;
+    esac
+  fi
+  # This rank's downstream: tail → serve_http tail-sink (IP0:7779); 3-way spare → spare-sink (IP0:7780);
+  # any active middle → the next rank's :7777.
+  if [ "$RANK" = "$LAST_ACTIVE" ]; then
+    NEXT_HOST=$IP0; NEXT_PORT=7779
+  elif [ "$RANK" = "3" ]; then
+    NEXT_HOST=$IP0; NEXT_PORT=7780          # 3-way spare only
+  else
+    NIDX=$((RANK+1)); NEXT_HOST=${IPS[$NIDX]}; NEXT_PORT=7777
+  fi
+  echo "[dsv4] NWAY=$NWAY rank=$RANK stage=$STAGE_NAME layers=[$LS,$LE) pp_rank=$PP_RANK part=$PART -> next $NEXT_HOST:$NEXT_PORT"
   echo "[dsv4] ips: rank0=$IP0 rank1=$IP1 rank2=$IP2 rank3=$IP3"
 
-  pkill -9 -f "[c]airn_node" 2>/dev/null || true; sleep 2
+  pkill -9 -f "[c]airn_node" 2>/dev/null || true
+  # Warm re-slice / re-exec hygiene: a cancelled `sky` job can leave --rm docker containers running
+  # (the daemon owns them, not the killed run shell), holding :7777/:8000 + the GPU. Clear them so the
+  # new stage can bind + claim the device.
+  sudo docker kill $(sudo docker ps -q) 2>/dev/null || true; sleep 3
 
   # The common docker invocation: mount cairn + patch + weights, host network so ports work without -p,
   # pass HF_TOKEN + path-β env vars, run cairn_node.serve INSIDE the patched container.
@@ -285,8 +314,8 @@ run: |
     -e SHARD_PSK=$SHARD_PSK \
     -e CAIRN_SGLANG_MEM_FRACTION=$CAIRN_SGLANG_MEM_FRACTION \
     -e CAIRN_PP_RANK=$PP_RANK \
-    -e CAIRN_PP_SIZE=3 \
-    -e CAIRN_PP_LAYER_PARTITION=15,14,14 \
+    -e CAIRN_PP_SIZE=$PP_SIZE \
+    -e CAIRN_PP_LAYER_PARTITION=$PART \
     -e TORCH_CUDA_ARCH_LIST=12.0 \
     -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
     -e SGLANG_ENABLE_JIT_DEEPGEMM=0 \
@@ -304,57 +333,42 @@ run: |
     -e CALLMEBOT_PHONE=$CALLMEBOT_PHONE \
     -e CALLMEBOT_APIKEY=$CALLMEBOT_APIKEY \
     lmsysorg/sglang:deepseek-v4-blackwell"
-  # CAIRN_PP_LAYER_PARTITION = per-stage layer COUNTS; MUST match the case split above
-  # (rank0 [0,15)=15, rank1 [15,29)=14, rank2 [29,43)=14). The loader pins sglang's
-  # SGLANG_PP_LAYER_PARTITION to this so make_layers slices to exactly these boundaries (the
-  # 2026-06-24 path-β fix — sglang's even-split default is remainder-LAST = 14,14,15, which would
-  # NOT match this front-loaded split). Future: rebalance for MoE memory (experts ≫ dense layers).
+  # CAIRN_PP_LAYER_PARTITION ($PART) = per-stage layer COUNTS; MUST match the case split above
+  # (3-way 15,14,14 ; 4-way 11,11,11,10). The loader pins sglang's SGLANG_PP_LAYER_PARTITION to this so
+  # make_layers slices to exactly these boundaries (the 2026-06-24 path-β fix — sglang's even-split
+  # default is remainder-LAST, which would NOT match a front-loaded split). Future: rebalance for MoE
+  # memory (experts ≫ dense layers) once a topology fits.
+
+  # Common per-stage args (next-hop already resolved per topology above).
+  STAGE_ARGS="--runtime sglang --model /workspace/model --layer-start $LS --layer-end $LE --device cuda:0 \
+    --listen-port 7777 --bind-host 0.0.0.0 --next-host $NEXT_HOST --next-port $NEXT_PORT --stage-rank $PP_RANK"
 
   if [ "$RANK" = "0" ]; then
-    # ENTRY (0..15) -> middle on $IP1:7777
+    # ENTRY + co-located serve_http (OpenAI /v1 on :8000). Warm-spare recovery armed only in 3-way.
     eval $DOCKER_RUN_COMMON \
-      python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
-        --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
-        --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP1" --next-port 7777 \
-        --stage-rank 0 \
+      python -u -m cairn_node.serve $STAGE_ARGS \
       > /tmp/cairn-dsv4-rank0-entry.log 2>&1 &
     sleep 5   # give the entry a head start to bind :7777 before serve_http dials
-    # serve_http endpoint (co-located on rank 0): dial local entry; accept tail-sink (7779) and
-    # spare-sink (7780); serve OpenAI /v1 on :8000 with recovery armed for the tail-kill case.
+    SPARE_ARGS=""
+    [ "$NWAY" = "3" ] && SPARE_ARGS="--spare-host $IP3 --spare-sink 7780 --spare-port 7777"
     eval $DOCKER_RUN_COMMON \
       python -u -m cairn_node.serve_http --model "$MODEL" --port 8000 --bind 0.0.0.0 --api-key "$API_KEY" \
-        --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 \
-        --spare-host "$IP3" --spare-sink 7780 --spare-port 7777 \
+        --entry-host 127.0.0.1 --entry-port 7777 --tail-sink 7779 $SPARE_ARGS \
       2>&1 | tee /tmp/cairn-dsv4-serve.log
-  elif [ "$RANK" = "1" ]; then
-    # MIDDLE (15..29) -> tail on $IP2:7777
-    eval $DOCKER_RUN_COMMON \
-      python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
-        --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
-        --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP2" --next-port 7777 \
-        --stage-rank 1 \
-      2>&1 | tee /tmp/cairn-dsv4-rank1-middle.log
-  elif [ "$RANK" = "2" ]; then
-    # TAIL (29..43) -> serve_http's tail-sink $IP0:7779. CAIRN_SPOT_TEST_FILE arms the proactive-drain
-    # sentinel for the touch-based recovery test. The `exit 0` shim is REQUIRED (gang-scheduler trap
-    # from 2026-06-23): if the tail dies with rc=137 the gang reaps serve_http mid-recovery, so we
-    # report 0 and let serve_http's own death-detect kick off the re-stitch onto the spare.
+  elif [ "$RANK" = "$LAST_ACTIVE" ]; then
+    # TAIL -> serve_http's tail-sink ($IP0:7779). CAIRN_SPOT_TEST_FILE arms the proactive-drain sentinel.
+    # The `exit 0` shim is REQUIRED (gang-scheduler trap, 2026-06-23): a tail rc=137 would reap serve_http
+    # mid-recovery, so report 0 and let serve_http's own death-detect drive the re-stitch (3-way spare).
     eval CAIRN_SPOT_TEST_FILE=/tmp/cairn-drain CAIRN_SPOT_WATCH_INTERVAL=0.5 \
       $DOCKER_RUN_COMMON \
-      python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
-        --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
-        --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7779 \
-        --stage-rank 2 \
-      > /tmp/cairn-dsv4-rank2-tail.log 2>&1
-    rc=$?; echo "[dsv4] tail exited rc=$rc (kill/drain) -> reporting 0 so the gang scheduler keeps serve_http alive"; exit 0
+      python -u -m cairn_node.serve $STAGE_ARGS \
+      > /tmp/cairn-dsv4-rank${RANK}-tail.log 2>&1
+    rc=$?; echo "[dsv4] tail (rank $RANK) exited rc=$rc (kill/drain) -> reporting 0 so the gang scheduler keeps serve_http alive"; exit 0
   else
-    # SPARE (29..43, tail-shaped) -> serve_http's spare-sink $IP0:7780
+    # MIDDLE (active rank 1..LAST_ACTIVE-1) or the 3-way SPARE (rank 3 -> spare-sink $IP0:7780).
     eval $DOCKER_RUN_COMMON \
-      python -u -m cairn_node.serve --runtime sglang --model /workspace/model \
-        --layer-start "$LS" --layer-end "$LE" --device cuda:0 \
-        --listen-port 7777 --bind-host 0.0.0.0 --next-host "$IP0" --next-port 7780 \
-        --stage-rank 2 \
-      2>&1 | tee /tmp/cairn-dsv4-rank3-spare.log
+      python -u -m cairn_node.serve $STAGE_ARGS \
+      2>&1 | tee /tmp/cairn-dsv4-rank${RANK}-stage.log
   fi
 
 envs:
