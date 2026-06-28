@@ -92,6 +92,23 @@ durability, and shorten spare warm-up. See
 Claims in this repo are tagged by evidence tier (live-proven / CPU-proven / designed);
 we don't publish numbers we haven't measured live.
 
+## Planned optimizations
+
+- **Warm-AMI spares (the warm-up ceiling fix).** Today, replenishing a consumed warm spare
+  network-copies the ~294 GB checkpoint from S3 to the box's NVMe — **~20–40 min**, which is
+  the main thing that could let a reclaim *storm* outrun the pool. The swap itself is already
+  sub-second (we stitch onto an already-warm standing spare); this is purely about how fast
+  the pool *refills*. Planned fix: bake the weights + the container image into a per-region
+  AMI (on an EBS volume — the NVMe instance store can't be baked, it's ephemeral) so a fresh
+  spare boots with everything already attached:
+  - Warm AMI (lazy EBS hydration): **~5–10 min** to ready.
+  - Warm AMI **+ Fast Snapshot Restore (FSR)**: FSR pre-initializes the restored volume so
+    there's no first-read hydration from S3 — warm-up collapses to just *instance boot +
+    load the slice into VRAM + kernel warm*, **theoretically ~3–5 min** (and bounded only by
+    spot-provision + model-load time). FSR is a one-time enable (up to ~60 min per snapshot
+    per AZ); every restore after that is instant. _Not needed yet — noted for when replenish
+    latency becomes the binding constraint._
+
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE). Cairn is a hard fork of
