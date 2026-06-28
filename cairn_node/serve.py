@@ -120,8 +120,9 @@ def main() -> None:
     if a.announce:
         adv = a.advertise_host or a.bind_host
         try:
-            edge_out.send({"op": "hello", "host": adv, "port": a.listen_port})
-            print(f"[serve] announced standby addr {adv}:{a.listen_port} to the driver", flush=True)
+            edge_out.send({"op": "hello", "host": adv, "port": a.listen_port, "stage_rank": a.stage_rank})
+            print(f"[serve] announced standby addr {adv}:{a.listen_port} (shaped for rank {a.stage_rank}) "
+                  f"to the driver", flush=True)
         except Exception:
             pass
     # Wait for our prev — but ALSO watch edge_out. If the DOWNSTREAM closes first, the run is being torn
@@ -283,6 +284,31 @@ def main() -> None:
                     pass
                 edge_out = LanEdge(msg["host"], msg["port"])
                 _connect_retry(edge_out)
+                continue
+            if msg["op"] == "reshape":            # LOAD-ON-PROMOTION: become a different slice (rank k)
+                # A GENERIC spare is shaped for one rank at launch; to cover ANY position the driver tells it
+                # to re-shape before re-stitching. sglang can't reslice in-process (the TP group can't init
+                # twice — the 2026-06-21 process-per-node constraint), so RE-EXEC ourselves with rank k's
+                # layer range + CAIRN_PP_RANK, loading that slice from local NVMe. Same-shape → no-op.
+                nk = int(msg["stage_rank"]); nls = int(msg["layer_start"]); nle = int(msg["layer_end"])
+                if (nk, nls, nle) == (a.stage_rank, a.layer_start, a.layer_end):
+                    print(f"[serve] reshape → already shaped for rank {nk} [{nls},{nle}); no-op", flush=True)
+                    continue
+                print(f"[serve] reshape → rank {nk} layers [{nls},{nle}) — RE-EXEC (load slice from NVMe)", flush=True)
+                new_env = dict(os.environ); new_env["CAIRN_PP_RANK"] = str(nk)   # GPU loader reads this
+                argv = [sys.executable, "-m", "cairn_node.serve", "--runtime", a.runtime, "--model", a.model,
+                        "--layer-start", str(nls), "--layer-end", str(nle), "--device", a.device,
+                        "--listen-port", str(a.listen_port), "--bind-host", a.bind_host,
+                        "--next-host", a.next_host, "--next-port", str(a.next_port), "--stage-rank", str(nk)]
+                if a.announce:
+                    argv += ["--announce", "--advertise-host", a.advertise_host or a.bind_host]
+                sys.stdout.flush()
+                for _s in (edge_in, edge_out, lsock):   # free the port + fds before exec (new proc re-binds)
+                    try:
+                        _s.close()
+                    except Exception:
+                        pass
+                os.execve(sys.executable, argv, new_env)
                 continue
             if msg["op"] == "drain":              # test hook: inject a drain WITHOUT real IMDS (== a spot notice)
                 _draining[0] = True

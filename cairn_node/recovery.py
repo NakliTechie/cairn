@@ -132,7 +132,8 @@ def decode_with_recovery(head, active, spare, spare_host: str, spare_port: int,
 
 
 def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
-                                prompt: List[int], n_new: int, seq: str = "s0", on_event=None):
+                                prompt: List[int], n_new: int, seq: str = "s0", on_event=None,
+                                reshape_spare=None, partition=None):
     """N-stage generic-spare recovery: greedy-decode `n_new` tokens through entry(rank0) -> … -> tail,
     surviving the loss of ANY stage (entry / middle / tail) onto ONE generic warm `spare`.
 
@@ -156,7 +157,6 @@ def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
     import torch
     from shard.transport import LanEdge, EDGE_ERRORS
     N = len(stage_addrs)
-    sp_host, sp_port = spare_addr
 
     def _emit(kind, *p):
         if on_event is not None:
@@ -165,12 +165,24 @@ def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
             except Exception:
                 pass
 
-    st = {"head": head, "read": tail, "seq": seq, "k": None}
+    st = {"head": head, "read": tail, "seq": seq, "k": None, "spare": spare, "spare_addr": spare_addr}
 
     def _recover(k: int):
         """Re-stitch for a loss at rank k, replay the committed history, return (pending_tok, hist_len, mttr)."""
         t0 = time.time()
         st["k"] = k
+        # LOAD-ON-PROMOTION: if a reshape callback is given, ask it for a spare shaped for rank k (it re-execs
+        # an off-shape spare to load slice k from NVMe + returns its (edge, addr); same-shape returns instantly).
+        if reshape_spare is not None:
+            ls = le = None
+            if partition is not None:
+                ls = sum(partition[:k]); le = ls + int(partition[k])
+            shaped = reshape_spare(k, ls, le)
+            if shaped is not None:
+                st["spare"], st["spare_addr"] = shaped
+        if st["spare_addr"] is None or st["spare"] is None:
+            raise RuntimeError(f"no usable spare for rank {k} recovery (reshape failed?)")
+        sp_host, sp_port = st["spare_addr"]
         if k == 0:                                                  # ENTRY — the driver is the predecessor
             try:
                 st["head"].close()
@@ -182,7 +194,7 @@ def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
             st["head"] = nh                                         # send prompts to the spare now
         elif k == N - 1:                                            # TAIL — spare keeps edge_out→driver sink
             st["head"].send({"op": "set_next", "target_stage": k - 1, "host": sp_host, "port": sp_port})
-            st["read"] = spare                                      # results now arrive on the spare edge
+            st["read"] = st["spare"]                                # results now arrive on the spare edge
         else:                                                       # MIDDLE — k-1 → spare → k+1
             st["head"].send({"op": "set_next", "target_stage": k - 1, "host": sp_host, "port": sp_port,
                              "spare_next_host": stage_addrs[k + 1][0], "spare_next_port": stage_addrs[k + 1][1]})
@@ -220,9 +232,9 @@ def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
         out.append(tok); pos += cur.shape[1]; cur = torch.tensor([[tok]])
         _emit("tok", len(out), tok)
     # Do NOT send {op:stop} here — serve_http keeps the fleet up across requests. The caller stops it.
-    # Returns the (possibly re-pointed) head/read edges + which rank was replaced, so a PERSISTENT driver
-    # can update its topology: stage_addrs[k_dead] becomes the promoted spare's address (it now serves k).
-    return out[:n_new], mttr, st["head"], st["read"], st["k"]
+    # Returns the (possibly re-pointed) head/read edges + which rank was replaced + the promoted spare's addr,
+    # so a PERSISTENT driver can update its topology: stage_addrs[k_dead] = that addr (it now serves rank k).
+    return out[:n_new], mttr, st["head"], st["read"], st["k"], st["spare_addr"]
 
 
 def _spawn_stage(runtime, model, ls, le, lp, nh, np_, rank, device="cpu",
@@ -305,7 +317,7 @@ def prove_recovery_nstage(runtime: str, model: str, num_layers: int, cuts: List[
             elif kind == "recovered":
                 log(f"[prove-N] *** RECOVERED in {p[0]:.3f}s — resumed at tok {p[2]} = {p[1]}")
 
-        rec, mttr, new_head, _read, _k = decode_with_recovery_nstage(
+        rec, mttr, new_head, _read, _k, _sa = decode_with_recovery_nstage(
             head, tail_e, spare_e, stage_addrs=stage_addrs, spare_addr=("127.0.0.1", spare_port),
             prompt=prompt, n_new=n_new, on_event=_on)
         try:

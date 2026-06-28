@@ -111,12 +111,13 @@ class _Tok:
 
 
 def _accept_spare(sink_s):
-    """Accept ONE spare dialing the spare-sink + read its hello to learn its listen addr (for promotion).
-    Returns (edge, (host, port)). A spare with no hello (legacy) registers with addr=None — usable only
-    for tail-replace (where the driver never needs to dial it)."""
+    """Accept ONE spare dialing the spare-sink + read its hello → (edge, (host,port), stage_rank). The rank
+    is the slice the spare is shaped for (load-on-promotion reshapes it if a different rank is needed). A
+    spare with no hello (legacy) → (edge, None, None) — usable only for tail-replace (never dialed)."""
     cs, _ = sink_s.accept()
     edge = LanEdge.from_socket(cs, supervised_recv_timeout=True)
     addr = None
+    rank = None
     try:
         # Peek with select BEFORE recv: a real spare announces in <1ms (cs readable → recv the hello). A
         # legacy spare that never announces leaves cs idle → select times out → we DON'T call edge.recv()
@@ -126,9 +127,11 @@ def _accept_spare(sink_s):
             msg = edge.recv()
             if isinstance(msg, dict) and msg.get("op") == "hello":
                 addr = (msg["host"], int(msg["port"]))
+                if msg.get("stage_rank") is not None:
+                    rank = int(msg["stage_rank"])
     except Exception:
         pass
-    return edge, addr
+    return edge, addr, rank
 
 
 def connect_fleet(entry_host: str, entry_port: int, tail_sink: int, bind_host: str = "0.0.0.0",
@@ -158,7 +161,7 @@ class FleetEngine:
     position (entry/middle/tail) recovers onto a generic spare from the pool; then — if self_replenish — a
     replacement is provisioned in the background to refill the warm pool toward warm_target."""
 
-    def __init__(self, model, head, tail, *, stage_addrs=None, sink_s=None, spares=None,
+    def __init__(self, model, head, tail, *, stage_addrs=None, partition=None, sink_s=None, spares=None,
                  warm_target=1, max_spares=None, self_replenish=False, replenish_cmd=None,
                  api_key=None, log=None,
                  spare=None, spare_host=None, spare_port=None):         # legacy single-spare API (compat)
@@ -166,11 +169,12 @@ class FleetEngine:
         self.tok = _Tok(model)
         self.head, self.tail = head, tail
         self.stage_addrs = list(stage_addrs) if stage_addrs else None   # [(host,port)] per active rank 0..N-1
+        self.partition = list(partition) if partition else None         # per-rank layer COUNTS → load-on-promotion
         self._sink_s = sink_s
-        self.spares = list(spares or [])                                # warm pool: [(edge, addr|None)]
+        self.spares = list(spares or [])                                # warm pool: [(edge, addr|None, rank|None)]
         self._legacy_spare_host, self._legacy_spare_port = spare_host, spare_port
         if spare is not None:                                           # legacy: one edge + its addr → pool
-            self.spares.append((spare, (spare_host, spare_port) if spare_host else None))
+            self.spares.append((spare, (spare_host, spare_port) if spare_host else None, None))
         self.warm_target = warm_target
         self.max_spares = max_spares if max_spares is not None else max(warm_target, 1)
         self.self_replenish = self_replenish
@@ -192,13 +196,13 @@ class FleetEngine:
         announces its listen addr via a hello (serve.py --announce) so the driver can promote it later."""
         while True:
             try:
-                edge, addr = _accept_spare(self._sink_s)
+                edge, addr, rank = _accept_spare(self._sink_s)
             except OSError:
                 return
             with self._spares_lock:
-                self.spares.append((edge, addr))
+                self.spares.append((edge, addr, rank))
                 self._provisioning = max(0, self._provisioning - 1)
-            self._log(f"[serve_http] spare registered {addr} — warm pool now {len(self.spares)}")
+            self._log(f"[serve_http] spare registered {addr} (rank {rank}) — warm pool now {len(self.spares)}")
 
     def _maybe_replenish(self):
         """After a spare is consumed, launch replacements toward warm_target (capped at max_spares)."""
@@ -220,6 +224,40 @@ class FleetEngine:
             self._log(f"[serve_http] replenish FAILED: {e}")
             with self._spares_lock:
                 self._provisioning = max(0, self._provisioning - 1)
+
+    def _reshape_spare(self, k, ls, le):
+        """LOAD-ON-PROMOTION callback for decode_with_recovery_nstage. CONSUME a spare from the pool and
+        return (edge, addr) shaped for rank k. Same-shape → return it as-is. Off-shape → tell it to re-exec
+        with slice k (loads from NVMe), wait for it to re-announce, consume that re-registered entry. The
+        engine owns pool consumption here, so run() does NOT pop again on the reshape path."""
+        with self._spares_lock:
+            if not self.spares:
+                return None
+            edge, addr, rank = self.spares.pop(0)        # consume the spare we'll promote
+        if rank == k or rank is None:
+            return edge, addr                            # already shaped (or unknown → assume shaped)
+        self._log(f"[serve_http] reshaping spare {addr} rank {rank} -> {k} (re-exec, NVMe slice load)")
+        try:
+            ctrl = LanEdge(addr[0], addr[1]); _connect_retry(ctrl)
+            ctrl.send({"op": "reshape", "stage_rank": k, "layer_start": ls, "layer_end": le})
+            time.sleep(0.1)
+            try:
+                ctrl.close()
+            except Exception:
+                pass
+        except Exception as e:
+            self._log(f"[serve_http] reshape dial failed: {e}")
+            return None
+        deadline = time.time() + float(os.environ.get("CAIRN_PROMOTE_TIMEOUT", "150"))
+        while time.time() < deadline:                    # the acceptor re-registers the re-exec'd spare
+            with self._spares_lock:
+                for i, (e, a, r) in enumerate(self.spares):
+                    if a == addr and r == k:
+                        self.spares.pop(i)
+                        return e, a
+            time.sleep(0.2)
+        self._log(f"[serve_http] reshape timed out waiting for spare {addr} to re-announce as rank {k}")
+        return None
 
     def _on_event(self, kind, *p):
         """Progress hook for the recovery driver — a durable, flushed trace. Handles BOTH the N-stage
@@ -252,22 +290,28 @@ class FleetEngine:
             self._n += 1
             seq = f"http-{self._n}"
             with self._spares_lock:
+                have_spare = bool(self.spares)
                 spare_entry = self.spares[0] if self.spares else None
-            if spare_entry is not None and self.stage_addrs is not None:
-                spare_edge, spare_addr = spare_entry
-                out, mttr, new_head, new_read, k = decode_with_recovery_nstage(
+            if have_spare and self.stage_addrs is not None:
+                use_reshape = self.partition is not None     # generic spare → reshape-on-promotion (engine pops)
+                spare_edge = spare_addr = None
+                if not use_reshape:
+                    spare_edge, spare_addr, _r = spare_entry  # shaped spare → driver uses this edge directly
+                out, mttr, new_head, new_read, k, used_addr = decode_with_recovery_nstage(
                     self.head, self.tail, spare_edge, stage_addrs=self.stage_addrs, spare_addr=spare_addr,
-                    prompt=ids, n_new=req.max_tokens, seq=seq, on_event=self._on_event)
-                if mttr is not None:                                # consumed a spare; the fleet is healed
+                    prompt=ids, n_new=req.max_tokens, seq=seq, on_event=self._on_event,
+                    reshape_spare=(self._reshape_spare if use_reshape else None), partition=self.partition)
+                if mttr is not None:                             # consumed a spare; the fleet is healed
                     self.head, self.tail = new_head, new_read
-                    with self._spares_lock:
-                        if self.spares and self.spares[0] is spare_entry:
-                            self.spares.pop(0)
-                    if k is not None and spare_addr is not None and 0 <= k < len(self.stage_addrs):
-                        self.stage_addrs[k] = spare_addr            # the promoted spare now serves rank k
+                    if not use_reshape:                          # reshape path already popped in _reshape_spare
+                        with self._spares_lock:
+                            if self.spares and self.spares[0] is spare_entry:
+                                self.spares.pop(0)
+                    if k is not None and used_addr is not None and 0 <= k < len(self.stage_addrs):
+                        self.stage_addrs[k] = used_addr          # the promoted spare now serves rank k
                     self._maybe_replenish()
-            elif spare_entry is not None:                           # legacy tail-only path (no stage_addrs)
-                spare_edge, spare_addr = spare_entry
+            elif have_spare:                                     # legacy tail-only path (no stage_addrs)
+                spare_edge, spare_addr, _r = spare_entry
                 sh = spare_addr[0] if spare_addr else None
                 sp = spare_addr[1] if spare_addr else None
                 out, mttr = decode_with_recovery(self.head, self.tail, spare_edge, sh, sp,
@@ -399,6 +443,9 @@ def main() -> None:
     ap.add_argument("--stage-hosts", default="",
                     help="comma-separated host/IP of each active stage rank 0..N-1 (enables N-stage recovery)")
     ap.add_argument("--stage-port", type=int, default=7777, help="listen port shared by the active stages")
+    ap.add_argument("--stage-partition", default="",
+                    help="comma-separated layer COUNTS per active rank (e.g. 11,11,11,10) — enables "
+                         "load-on-promotion: a generic spare re-execs to load slice k from NVMe on promotion")
     ap.add_argument("--initial-spares", type=int, default=-1,
                     help="how many warm spares dial in at startup (default: 1 if recovery enabled, else 0)")
     ap.add_argument("--warm-target", type=int, default=1, help="warm spares to keep at all times")
@@ -417,14 +464,15 @@ def main() -> None:
                                                spare_sink=sink_port, n_spares=n_init)
     # legacy spare that didn't --announce → fall back to the CLI-provided addr
     if a.spare_host and not a.stage_hosts and spares and spares[0][1] is None:
-        spares[0] = (spares[0][0], (a.spare_host, a.spare_port))
+        spares[0] = (spares[0][0], (a.spare_host, a.spare_port), spares[0][2])
 
     stage_addrs = None
     if a.stage_hosts:
         stage_addrs = [(h.strip(), a.stage_port) for h in a.stage_hosts.split(",") if h.strip()]
+    partition = [int(x) for x in a.stage_partition.split(",") if x.strip()] or None
 
-    eng = FleetEngine(a.model, head, tail, stage_addrs=stage_addrs, sink_s=sink_s, spares=spares,
-                      warm_target=a.warm_target, max_spares=(a.max_spares or None),
+    eng = FleetEngine(a.model, head, tail, stage_addrs=stage_addrs, partition=partition, sink_s=sink_s,
+                      spares=spares, warm_target=a.warm_target, max_spares=(a.max_spares or None),
                       self_replenish=a.self_replenish, replenish_cmd=(a.replenish_cmd or None),
                       api_key=a.api_key or None)
     if stage_addrs is not None:
