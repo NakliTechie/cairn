@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""§12 box probe — measure the "resolve on real hardware" numbers and emit config-ready values.
+"""On-box probe — measure the "resolve on real hardware" numbers and emit config-ready values.
 
 The fit (`cairn_scheduler`) reads three hardware numbers from `configs/<model>.yaml` that are
-DOCUMENTED PLACEHOLDERS until measured on the real card (RUNBOOK-rung2 Step 3):
+DOCUMENTED PLACEHOLDERS until measured on the real card:
 
-    pool.gpu_vram_bytes                 usable VRAM the driver actually exposes (< the marketing 24 GiB)
+    pool.gpu_vram_bytes                 usable VRAM the driver actually exposes (< the marketing total)
     overheads.framework_overhead_bytes  CUDA context + cuBLAS/cuDNN + torch/SGLang fixed reserve (no model)
     overheads.activation_buffer_bytes   per-stage activation + scratch high-water above the weights
 
@@ -20,8 +20,8 @@ Caveats (read before trusting the activation number):
     number comes from instrumenting the real SglangNodeRuntime.forward (paged-KV + CUDA graphs differ
     from a dense transformers forward). Use this to replace the placeholder, then refine from a live
     run (e.g. heartbeat VRAM deltas during test_sglang_split.py).
-  * Point --model at a model that FITS on the card (a small rung-2 model, or one stage's weights) — the
-    63 GB proof model will not load whole on an L4; VRAM + framework floor don't need a model at all.
+  * Point --model at a model that FITS on the card (a small model, or one stage's weights) — a large
+    checkpoint will not load whole on a single card; VRAM + framework floor don't need a model at all.
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def _gib(n: int) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Measure §12 hardware numbers for the Cairn fit.")
+    ap = argparse.ArgumentParser(description="Measure the hardware numbers for the Cairn fit.")
     ap.add_argument("--device", default="cuda:0", help="CUDA device (default cuda:0)")
     ap.add_argument("--model", default=None, help="HF id to measure the activation buffer against (optional)")
     ap.add_argument("--dtype", default="float16",

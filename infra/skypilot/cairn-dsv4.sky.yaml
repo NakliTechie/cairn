@@ -1,18 +1,16 @@
-# Cairn DeepSeek-V4-Flash (Path C) — multi-box layer-split via the 0xSero SM_120 community sglang patch.
+# Cairn DeepSeek-V4-Flash FP8 — multi-box layer-split via the 0xSero SM_120 community sglang patch.
 #
-# THIS IS THE MAIDEN MULTI-BOX V4 RUN. Scope of "see what happens" (per 2026-06-23 path-c decision):
-#   (a) prove the 0xSero patch's SM_120 FlashMLA sparse-decode kernels survive Cairn's per-block sglang wrap
-#       (i.e. the patch's sitecustomize hook fires inside our SglangNodeRuntime — Task #1 verdict)
-#   (b) prove path-β loader (fork/shard/sglang_node.py + CAIRN_PP_{RANK,SIZE}) actually slices weights:
-#       only ~50 GiB resident per box (vs the 149 GiB full checkpoint that wouldn't fit)
-#   (c) drive ONE coherent decode through entry -> middle -> tail -> driver and confirm bit-shape
-#   (d) test TAIL-KILL recovery — the existing 2-stage code path handles k_dead=N-1 without the
-#       Task #3 N-stage driver refactor (deferred to a follow-on session per 2026-06-23 user call)
+# What this serves:
+#   (a) the 0xSero patch's SM_120 FlashMLA sparse-decode kernels run inside Cairn's per-block sglang wrap
+#       (the patch's sitecustomize hook fires inside SglangNodeRuntime)
+#   (b) the layer-split loader (fork/shard/sglang_node.py + CAIRN_PP_{RANK,SIZE}) slices the checkpoint so
+#       only ~58 GiB is resident per box (vs the full checkpoint that wouldn't fit one card)
+#   (c) one coherent decode through entry -> middle -> tail -> driver
+#   (d) TAIL-KILL recovery — the 2-stage code path handles k_dead=N-1 (the last stage) directly
 #
-# OUT OF SCOPE for this run (gaps documented in workplan.md / pending.md):
-#   • Middle-kill (rank 1): needs Task #3 driver refactor + serve.py lsock re-accept
-#   • Entry-kill (rank 0): same + driver-side outbound re-stitch
-#   • Reactive non-tail death: needs heartbeats (Path 2)
+# Recovery scope (active path = tail-kill):
+#   • Middle-kill (rank 1) and entry-kill (rank 0) need the N-stage driver refactor + serve.py re-accept
+#   • Reactive non-tail death needs heartbeats
 #
 # Topology (NWAY=4 layer-split + generic warm spares; default 6 nodes = 4 active + 2 spares):
 #   rank0 = ENTRY  (layers 0..10)   + serve_http endpoint (OpenAI /v1 on :8000)
@@ -20,7 +18,7 @@
 #   rank2 = MIDDLE (layers 22..32)
 #   rank3 = TAIL   (layers 33..42)  — manual `pkill` / sentinel-drain demonstrates recovery
 #   rank4+ = SPARE — pre-warmed generic standbys; load-on-promotion reshapes to the dead rank's slice
-# All = g7e.2xlarge spot (us-east-2/Ohio for the 2026-06-28 live run; FP8 needs 4-way — 3-way OOMs).
+# All = g7e.2xlarge spot (us-east-2/Ohio for the cheapest g7e; FP8 needs 4-way — 3-way OOMs).
 #
 # Launch (after `aws sso login --profile cairn-skypilot`):
 #   set -a; source infra/secrets.env; set +a
@@ -44,7 +42,7 @@ num_nodes: 6                          # 4 active FP8 stages (rank 0-3) + 2 gener
                                       # General rule: ranks 0..CAIRN_NWAY-1 are active; ranks >= NWAY are
                                       # warm spares. NWAY=4 (FP8) → 1 spare; NWAY=3 → 2 spares (warm_target=2).
 
-# SHARED FLEET SECURITY GROUP (self-replenish SG-isolation fix, 2026-06-28). Pin the whole fleet to ONE
+# SHARED FLEET SECURITY GROUP (self-replenish SG-isolation fix). Pin the whole fleet to ONE
 # named SG so that a REPLENISHED spare — which is launched as a SEPARATE SkyPilot cluster
 # (cairn-dsv4-spare.sky.yaml) and would otherwise get its own isolated per-cluster SG — joins the SAME SG
 # and is mutually reachable on the recovery wire (7777-7780). Without this, recovery to a replenished spare
@@ -58,35 +56,32 @@ config:
 
 resources:
   cloud: aws
-  region: eu-south-2                  # SPAIN — $1.25/hr spot vs Seoul $1.43 (2026-06-23 live), <5% interruption
+  region: eu-south-2                  # SPAIN — cheap g7e spot (~$1.25/hr), <5% interruption. Ohio (us-east-2)
+                                      # is typically cheapest; override region + image_id on the CLI to switch.
   instance_type: g7e.2xlarge          # 1× RTX PRO 6000 Blackwell (sm_120), 96 GiB VRAM
   use_spot: true
   disk_size: 150                      # OS + small file_mounts + ~/dsv4 kernel build only. The ~294 GiB FP8
-                                      # weights AND the ~82 GiB docker image now stage on the 1.7 TB NVMe
-                                      # instance store (/opt/dlami/nvme) — see setup step 0 (2026-06-28).
-                                      # (History: 400 overflowed the EBS root mid-sync 2026-06-27; bumped to
-                                      # 600; then moved the big artifacts off EBS entirely → back to 150.)
+                                      # weights AND the ~82 GiB docker image stage on the 1.7 TB NVMe instance
+                                      # store (/opt/dlami/nvme) — see setup step 0 — so the EBS root stays small.
   # Blackwell DLAMI (R580 driver) — REQUIRED. SkyPilot's default Ubuntu AMI ships nvidia 535 which
-  # cannot probe sm_120 ("probe of 0000:2b:00.0 failed with error -1"). Confirmed live 2026-06-23.
+  # cannot probe sm_120 ("probe of 0000:2b:00.0 failed with error -1").
   # AMI IDs are PER-REGION (same build "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)
   # 20260619"). This image_id matches the `region:` above (eu-south-2). To launch elsewhere, override
   # BOTH on the CLI: `sky launch --region <R> --image-id <ami>`. Known IDs (20260619 build):
   #   eu-south-2 (Spain) = ami-03cc3ae6c38cc7b29   ← matches this yaml
-  #   us-east-2  (Ohio)  = ami-02584dd48f685760d   ← cheapest g7e spot 2026-06-24 ($1.193/box)
+  #   us-east-2  (Ohio)  = ami-02584dd48f685760d   ← typically cheapest g7e spot
   #   ap-northeast-2 (Seoul) = ami-02f2234b443117395
   # Re-resolve per region: `aws ec2 describe-images --owners amazon --filters \
   #   "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20260619"`
   #
-  # us-east-2 (Ohio) + us-west-2 (Oregon) default-VPC FIXED 2026-06-24: their default VPCs had a
-  # DETACHED internet gateway (igw-7f99db17 / igw-930aa8ea) still referenced by the main route table's
-  # 0.0.0.0/0 → a blackhole route. Instances got public IPs but no internet path, so SkyPilot SSH setup
-  # timed out (600s) on every box. Re-attached the IGWs via admin console → routes flipped blackhole→active.
-  # Both NA regions are now usable for spot launches. (cairn-skypilot is least-priv & can't manage IGWs;
-  # this was a one-time admin fix, not a policy change.) Ohio g7e is cheapest-in-world (~$1.19/box).
+  # GOTCHA: a region's DEFAULT VPC can have a DETACHED internet gateway still referenced by the main
+  # route table's 0.0.0.0/0 → a blackhole route. Instances get public IPs but no internet path, so
+  # SkyPilot SSH setup times out (600s) on every box. Fix (admin, one-time): re-attach the IGW so the
+  # route flips blackhole→active. (cairn-skypilot is least-priv and can't manage IGWs by design.)
   image_id: ami-03cc3ae6c38cc7b29
   labels:
     cairn: "true"
-    cairn-purpose: "dsv4-flash-pathc-maiden"
+    cairn-purpose: "dsv4-flash-serve"
 
 file_mounts:
   /cairn/fork: ./fork
@@ -94,7 +89,7 @@ file_mounts:
   /cairn/configs: ./configs
   /cairn/infra: ./infra
   /cairn/scheduler/src: ./scheduler/src   # serve_http imports cairn_scheduler — only this dir (the parent's
-  #                                          stray scheduler/.venv would rsync-choke SSH, see 2026-06-23 history)
+  #                                          stray scheduler/.venv would rsync-choke SSH, historical note)
   # 0xSero KERNEL CACHE (skips the ~30-min CUDA build on a fresh box). SkyPilot syncs this S3 prefix
   # to the box using the CONTROLLER's creds (the box itself has no instance role). Keyed by the base-
   # image digest — UPDATE this digest if `lmsysorg/sglang:deepseek-v4-blackwell` is re-pushed (the .so
@@ -110,11 +105,11 @@ setup: |
   # So setup = pull the image + build the patch + pre-fetch weights. No host-side venv needed for
   # serving — cairn_node.serve runs INSIDE the container at run time.
 
-  # 0. NVMe instance-store staging (2026-06-28): the Blackwell DLAMI auto-mounts the 1.7 TB local NVMe
+  # 0. NVMe instance-store staging: the Blackwell DLAMI auto-mounts the 1.7 TB local NVMe
   #    at /opt/dlami/nvme. Stage the ~294 GB FP8 weights AND the ~82 GB docker image there instead of the
   #    EBS root — it's free (included in the instance price) and multi-GB/s, so (a) disk_size drops
   #    600→150, and (b) the weight load + the N-stage recovery slice-reload ride NVMe bandwidth, not gp3
-  #    EBS (the recovery design's fast-reload path; open throughput question in pending.md). Ephemeral
+  #    EBS (the recovery design's fast-reload path; open throughput question). Ephemeral
   #    (wiped on stop/terminate) — fine, we re-sync weights from S3 every launch. Falls back to the EBS
   #    root ($HOME) if the mount is absent (non-DLAMI AMI / instance with no local store) — in that case
   #    bump disk_size back up, since 150 GiB can't hold the weights.
@@ -149,7 +144,7 @@ setup: |
   # nvidia-container-toolkit (the DLAMI ships it but the runtime config sometimes needs a kick)
   sudo systemctl restart docker || true
 
-  # 2–4 PARALLELIZED (2026-06-26): the image acquire, kernel restore, and the 159 GB in-region weight
+  # 2–4 PARALLELIZED: the image acquire, kernel restore, and the 159 GB in-region weight
   #     sync are independent I/O on different sources — running them serially left all 4 GPU boxes
   #     idle-billing through the SUM. Run image + weights CONCURRENTLY (logs to temp files so output
   #     isn't interleaved); the kernel restore overlaps both. The ONE real dependency is the kernel
@@ -167,7 +162,9 @@ setup: |
     _TOK=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
     REGION=$(curl -s -H "X-aws-ec2-metadata-token: $_TOK" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
     local ECR_REGION="${REGION:-eu-south-2}"
-    local ECR_REPO="AWS_ACCOUNT_ID.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
+    # Set CAIRN_ECR_ACCT to your AWS account id to use an in-region ECR mirror; otherwise this falls
+    # through to Docker Hub (the ECR branch below is also gated on CAIRN_S3_WRITE_* creds being present).
+    local ECR_REPO="${CAIRN_ECR_ACCT:-<ACCOUNT_ID>}.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
     local ECR_IMG="${ECR_REPO}:deepseek-v4-blackwell"
     if sudo docker image inspect "$IMG" >/dev/null 2>&1; then
       echo "[setup] image $IMG already present locally — skipping pull (warm re-run)"; return
@@ -274,12 +271,12 @@ run: |
   API_KEY=${CAIRN_API_KEY:-sk-cairn-demo}
   NLAYERS=43
 
-  # Weights live on the NVMe instance store when setup staged them there (2026-06-28), else the EBS root.
+  # Weights live on the NVMe instance store when setup staged them there, else the EBS root.
   MODEL_DIR=/home/ubuntu/model
   [ -d /opt/dlami/nvme/model ] && MODEL_DIR=/opt/dlami/nvme/model
   echo "[dsv4] weights mounted from $MODEL_DIR"
 
-  # Topology via CAIRN_NWAY (default 4 — FP8 needs 4-way; 3-way OOMs, GPU-confirmed 2026-06-28). Path-β
+  # Topology via CAIRN_NWAY (default 4 — FP8 needs 4-way; 3-way OOMs, GPU-confirmed). Layer-split
   # layer split over 43 layers. Ranks 0..NWAY-1 are ACTIVE; ranks >= NWAY are generic warm SPARES.
   #   NWAY=4 (5 boxes) → 11,11,11,10 active + 1 spare (rank4)   [the resilience topology]
   #   NWAY=3 (5 boxes) → 15,14,14 active + 2 spares (rank3,4)   [warm_target=2]
@@ -322,9 +319,9 @@ run: |
   fi
 
   # The common docker invocation: mount cairn + patch + weights, host network so ports work without -p,
-  # pass HF_TOKEN + path-β env vars, run cairn_node.serve INSIDE the patched container.
+  # pass HF_TOKEN + layer-split env vars, run cairn_node.serve INSIDE the patched container.
   # WORKING DIR = /cairn so `python -u -m cairn_node.serve` resolves.
-  # MOUNT FIX (2026-06-24 maiden run): SkyPilot file_mounts land the cairn dirs at
+  # MOUNT FIX: SkyPilot file_mounts land the cairn dirs at
   # ~/.sky/file_mounts/cairn/ and put SYMLINKS at /cairn pointing there. Mounting `-v /cairn` into
   # docker carried in dangling symlinks (their target ~/.sky/... isn't mounted) → cairn_node
   # unimportable, serve crashed in 13s. Mount the REAL synced dir instead.
@@ -332,7 +329,7 @@ run: |
   # (DEEPSEEK-V4-FLASH.md "Required mounts and environment"). They route the indexer / SWA-prepare /
   # MHC / paged-MQA-logits kernels to TileLang/torch impls that support Blackwell sm_120. The .so patch
   # only covers sparse-DECODE; WITHOUT SGLANG_OPT_USE_TILELANG_INDEXER=1 the C4 indexer falls through to
-  # csrc/apis/attention.hpp -> "Unsupported architecture" (GPU-confirmed 2026-06-26). Cairn drives sglang
+  # csrc/apis/attention.hpp -> "Unsupported architecture" (GPU-confirmed). Cairn drives sglang
   # directly but these are read globally at kernel-dispatch time.
   #   NB: 0xSero's SGLANG_DSV4_FP4_EXPERTS=0 is deliberately OMITTED. They run TP=4 (experts sharded
   #   across 4 GPUs) so can afford full-precision experts; Cairn is TP=1 + LAYER-split (each box holds
@@ -374,7 +371,7 @@ run: |
     lmsysorg/sglang:deepseek-v4-blackwell"
   # CAIRN_PP_LAYER_PARTITION ($PART) = per-stage layer COUNTS; MUST match the case split above
   # (3-way 15,14,14 ; 4-way 11,11,11,10). The loader pins sglang's SGLANG_PP_LAYER_PARTITION to this so
-  # make_layers slices to exactly these boundaries (the 2026-06-24 path-β fix — sglang's even-split
+  # make_layers slices to exactly these boundaries (the layer-split loader fix — sglang's even-split
   # default is remainder-LAST, which would NOT match a front-loaded split). Future: rebalance for MoE
   # memory (experts ≫ dense layers) once a topology fits.
 
@@ -437,7 +434,7 @@ run: |
     # TAIL -> serve_http's tail-sink ($IP0:7779). The proactive-drain sentinel (CAIRN_SPOT_TEST_FILE=/shared/drain)
     # is now armed on ALL ranks via DOCKER_RUN_COMMON — touch /tmp/cairn-shared/drain on a box to drain THAT rank
     # (the host dir is bind-mounted to the container's /shared). The `exit 0` shim is REQUIRED (gang-scheduler
-    # trap, 2026-06-23): a tail rc=137 would reap serve_http mid-recovery, so report 0 and let serve_http
+    # trap): a tail rc=137 would reap serve_http mid-recovery, so report 0 and let serve_http
     # drive the re-stitch.
     eval $DOCKER_RUN_COMMON \
       python -u -m cairn_node.serve $STAGE_ARGS \
@@ -473,6 +470,8 @@ envs:
   # Blackwell image from the in-region ECR mirror (cairn-sglang). Empty ⇒ falls back to Docker Hub.
   CAIRN_S3_WRITE_ACCESS_KEY_ID: ""
   CAIRN_S3_WRITE_SECRET_ACCESS_KEY: ""
+  # Your AWS account id for the in-region ECR mirror (setup step 2). Empty ⇒ Docker Hub fallback.
+  CAIRN_ECR_ACCT: ""
   # Signal-back-to-us on a spot reclaim (cairn_node.notify). CAIRN_SPOT_WATCH=1 is set in DOCKER_RUN_COMMON
   # so each box polls IMDS for its own ~2-min interruption notice; on a notice it drains AND fires this
   # alert. Set ONE channel in secrets.env (empty ⇒ box-side drain still works, just no remote ping):

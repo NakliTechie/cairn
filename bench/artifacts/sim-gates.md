@@ -1,6 +1,6 @@
 # Cairn — rung-1 simulation gate artifacts
 
-**Model:** `gpt-oss-120b`  ·  **Fit:** N=4 stages, layers/stage=[9, 9, 9, 9], K_target=8
+**Model:** `llama-3.1-8b`  ·  **Fit:** N=4 stages, layers/stage=[8, 8, 8, 8], K_target=16
 
 > Rung-1 SIMULATION gates (no GPU). Real-fleet gates need the Shard fork + a g6 pool.
 

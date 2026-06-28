@@ -66,5 +66,5 @@ pool:
 #   On a 96 GiB card: weights + KV + framework < 70 GiB → ~26 GiB headroom for activations & paged KV
 #   1 warm spare = same shape as any stage (replaceable by `set_next`-style re-stitch in N-stage recovery)
 #   Total: 4× g7e.2xlarge in eu-south-2 = $5.00/hr Linux/UNIX (2026-06-23 live)
-#   REQUIRES path-β loader (sglang pp_size partial-layer load) — Cairn's pp_size=1 default loads the
-#   full 149 GiB checkpoint, which exceeds 96 GiB VRAM. See fork/shard/sglang_node.py + plan/workplan.md.
+#   REQUIRES path-β loader (sglang pp_size partial-layer load) — a pp_size=1 default would load the
+#   full ~294 GB checkpoint, which far exceeds a single 96 GiB card. See fork/shard/sglang_node.py.

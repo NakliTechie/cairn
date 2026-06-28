@@ -24,7 +24,7 @@ num_nodes: 3
 resources:
   cloud: aws
   region: eu-south-2
-  instance_type: g6.xlarge        # 1x L4 per box (entry / tail / spare). $0.16/box — under the per-box gate.
+  instance_type: g6.xlarge        # 1x L4 per box (entry / tail / spare). ~$0.16/box spot.
   use_spot: true
   disk_size: 128
   ports: 8000                     # expose the endpoint port (also reachable via `ssh -L`)

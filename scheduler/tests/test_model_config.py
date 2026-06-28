@@ -3,16 +3,16 @@ import pytest
 from cairn_scheduler.model_config import ConfigError, dtype_bytes, load_model_config
 
 
-def test_load_gpt_oss(gpt_oss_cfg):
-    c = gpt_oss_cfg
-    assert c.name == "gpt-oss-120b"
-    assert c.num_layers == 36
+def test_load_llama(model_cfg):
+    c = model_cfg
+    assert c.name == "llama-3.1-8b"
+    assert c.num_layers == 32
     assert c.num_key_value_heads == 8       # GQA — the KV-cache driver
-    assert c.head_dim == 64
-    assert c.vocab_size == 201088
-    assert c.is_moe and c.num_local_experts == 128
-    assert c.license == "Apache-2.0"
-    assert c.gpu_vram_bytes == 23583784960   # 21.96 GiB — MEASURED on the L4 (measure.py 2026-06-21), not nominal 24 GiB (driver/ECC reserve)
+    assert c.head_dim == 128
+    assert c.vocab_size == 128256
+    assert not c.is_moe and c.num_local_experts == 0   # dense
+    assert c.license == "Llama-3.1-community"
+    assert c.gpu_vram_bytes == 25769803776   # 24 GiB — L4 nominal
     assert c.tie_word_embeddings is False
 
 

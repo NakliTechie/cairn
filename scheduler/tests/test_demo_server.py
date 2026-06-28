@@ -56,7 +56,7 @@ def test_version_and_health(base_url):
 def test_chat_completion_roundtrip(base_url):
     status, body = _post(
         base_url + "/v1/chat/completions",
-        {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "hello cairn"}], "max_tokens": 10},
+        {"model": "llama-3.1-8b", "messages": [{"role": "user", "content": "hello cairn"}], "max_tokens": 10},
         auth=f"Bearer {API_KEY}",
     )
     assert status == 200
@@ -68,7 +68,7 @@ def test_chat_completion_roundtrip(base_url):
 def test_auth_required(base_url):
     status, body = _post(
         base_url + "/v1/chat/completions",
-        {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "x"}]},
+        {"model": "llama-3.1-8b", "messages": [{"role": "user", "content": "x"}]},
     )
     assert status == 401 and "error" in body
 
@@ -96,7 +96,7 @@ def test_streaming_sse(base_url):
     terminated by [DONE] (wires the gateway's stream_chunks)."""
     status, ctype, text = _post_raw(
         base_url + "/v1/chat/completions",
-        {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "hi"}],
+        {"model": "llama-3.1-8b", "messages": [{"role": "user", "content": "hi"}],
          "max_tokens": 5, "stream": True},
         auth=f"Bearer {API_KEY}",
     )
@@ -108,13 +108,13 @@ def test_streaming_sse(base_url):
 
 
 def test_rejects_oversized_body(base_url):
-    big = {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "a" * 1_100_000}]}
+    big = {"model": "llama-3.1-8b", "messages": [{"role": "user", "content": "a" * 1_100_000}]}
     status, _ = _post(base_url + "/v1/chat/completions", big, auth=f"Bearer {API_KEY}")
     assert status == 413  # body-size cap fires before parse (H2/M10)
 
 
 def test_rejects_excessive_max_tokens(base_url):
-    body = {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10_000_000}
+    body = {"model": "llama-3.1-8b", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10_000_000}
     status, _ = _post(base_url + "/v1/chat/completions", body, auth=f"Bearer {API_KEY}")
     assert status == 400  # H1 ceiling
 

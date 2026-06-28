@@ -3,53 +3,53 @@
 # Launched/torn-down entirely via the SkyPilot API (infra/skypilot/launch.py, down.py) —
 # never the AWS console.
 #
-# v1.0 proof model = gpt-oss-120b on g6.xlarge (1x L4, 24 GB); N ≈ 4 (see configs/).
-# SkyPilot's job: provision + per-instance spot recovery (the minutes-timescale backfill,
-# handoff §4). Cairn's controller owns block assignment, topology, and the seconds-
-# timescale warm-spare reassign (spec §5) — NOT SkyPilot.
+# Reference model = DeepSeek-V4-Flash FP8 on g7e.2xlarge (1x RTX PRO 6000 Blackwell, 96 GB);
+# N = 4 (see configs/). SkyPilot's job: provision + per-instance spot recovery (the
+# minutes-timescale backfill). Cairn's controller owns block assignment, topology, and the
+# seconds-timescale warm-spare reassign — NOT SkyPilot.
 
 name: cairn-block
 
 resources:
   cloud: aws
-  region: eu-south-2                 # default/proof region (Spain). launch.py OVERRIDES per model from configs/<model>.yaml —
-                                    # GLM-5.2 headline runs in ap-northeast-2 (Seoul): live g7e spot ~40% cheaper there.
-  instance_type: g6.xlarge          # default/proof pool (1x L4, 24 GB). launch.py OVERRIDES this per model from
-                                    # configs/<model>.yaml pool — GLM-5.2 headline = g7e.2xlarge (1x RTX PRO 6000 Blackwell, 96 GB).
-  use_spot: true                    # v1.0: spot-only, 0 on-demand floor (spec §5.2)
-  disk_size: 256                    # EBS: stage block weights here for fast re-stage (handoff §4)
+  region: us-east-2                  # default region (Ohio — cheapest g7e spot). launch.py OVERRIDES per model
+                                    # from configs/<model>.yaml.
+  instance_type: g7e.2xlarge        # default pool (1x RTX PRO 6000 Blackwell, sm_120, 96 GB). launch.py
+                                    # OVERRIDES this per model from configs/<model>.yaml pool.
+  use_spot: true                    # spot-only, 0 on-demand floor
+  disk_size: 256                    # EBS: stage block weights here for fast re-stage
   labels:
-    cairn: "true"                   # IAM destructive-action gate (M13/H5) + the cost-allocation tag (docs/cost-methodology.md)
-    cairn-purpose: "fleet"          # the v1.0/v1.1 cost-comparison runs OVERRIDE this per launch (launch.py):
+    cairn: "true"                   # IAM destructive-action gate + the cost-allocation tag
+    cairn-purpose: "fleet"          # cost-comparison runs OVERRIDE this per launch (launch.py):
                                     #   spot-proof | ondemand-baseline → Cost Explorer yields C_spot vs C_od directly
-    # cairn-model: <name>           # set per-launch (gpt-oss-120b | glm-5.2-nvfp4 | gpt-neox-20b | …) for cost-by-model
+    # cairn-model: <name>           # set per-launch (deepseek-v4-flash-fp8 | glm-5.2 | gpt-neox-20b | …) for cost-by-model
   # Low intra-pipeline latency: keep the pool in one cluster placement group. SkyPilot
-  # passes this through; confirm the exact field on the pinned SkyPilot version (handoff §3).
+  # passes this through; confirm the exact field on the pinned SkyPilot version.
   # (placement group wiring lives in launch.py via the AWS-specific config.)
-  # SECURITY (M13): the SG ingress for port 7777 (below) MUST be restricted to the fleet's
+  # SECURITY: the SG ingress for port 7777 (below) MUST be restricted to the fleet's
   # own SG/CIDR — never 0.0.0.0/0. SkyPilot manages the SG; pin this when the SG wiring lands
   # in launch.py. The block runtime binds the VPC-internal interface (run:), not all interfaces.
 
-# Pinned, no surprise downloads (handoff §6). The box image: CUDA torch + SGLang + the fork.
+# Pinned, no surprise downloads. The box image: CUDA torch + SGLang + the fork.
 setup: |
   set -euo pipefail
   pip install --no-input -r ~/sky_workdir/infra/requirements-gpu.txt
   # Pre-stage this block's weights to EBS so a reassign is VRAM-load only, never a
-  # download (spec §5.1). Uses HF_TOKEN; the controller tells the node which block.
+  # download. Uses HF_TOKEN; the controller tells the node which block.
   python -m cairn_node.stage --hf-token-env HF_TOKEN || true
 
-# Boot the block runtime and register with the CF control plane. The controller assigns
-# the layer range + pipeline position; the decode loop runs wholly in-VPC (invariant #4).
+# Boot the block runtime and register with the control plane. The controller assigns
+# the layer range + pipeline position; the decode loop runs wholly in-VPC.
 run: |
   set -euo pipefail
-  PRIVATE_IP="$(hostname -I | awk '{print $1}')"   # VPC-internal address (M13: not 0.0.0.0/all interfaces)
+  PRIVATE_IP="$(hostname -I | awk '{print $1}')"   # VPC-internal address (not 0.0.0.0/all interfaces)
   python -m cairn_node.serve \
     --control-url "$CAIRN_CONTROL_URL" \
     --psk-env SHARD_PSK \
     --bind "${PRIVATE_IP}:7777"
 
-# Secrets are injected at launch from the environment / secret store, never stored here
-# (spec §8). launch.py fills these from ~/.cairn/secrets or env.
+# Secrets are injected at launch from the environment / secret store, never stored here.
+# launch.py fills these from ~/.cairn/secrets or env.
 envs:
   SHARD_PSK: ""
   HF_TOKEN: ""

@@ -3,17 +3,17 @@
 #
 # Lists (default) or TERMINATES (--force) every cairn=true EC2 instance across Cairn's regions, talking
 # to the EC2 API DIRECTLY — the one teardown that works even when `sky down` wedges on an INIT cluster
-# (the 2026-06-22 cost crisis: a launch wedged in INIT left 3 L4s billing and `sky down` couldn't kill
-# them). EC2 is ground truth; `sky status` can lie.
+# (a launch wedged in INIT can leave GPUs billing while `sky down` can't kill them). EC2 is ground
+# truth; `sky status` can lie.
 #
 #   infra/skypilot/nuke.sh            # ground-truth check: what cairn instances are running? (no changes)
 #   infra/skypilot/nuke.sh --force    # TERMINATE them all (break glass)
 #
 # Safe: read-only by default; the scoped IAM key only permits terminating cairn=true-tagged instances.
 #
-# WHY tags (not `sky down`): this AWS account + SkyPilot install is SHARED across projects (Cairn,
-# PitchLab, …). Cairn isolates by the cairn=true tag for up/down/report and never touches SkyPilot's
-# shared control plane (API server, jobs controller). See infra/skypilot/README.md.
+# WHY tags (not `sky down`): if the AWS account + SkyPilot install is SHARED across workloads, Cairn
+# isolates by the cairn=true tag for up/down/report and never touches SkyPilot's shared control plane
+# (API server, jobs controller). See infra/skypilot/README.md.
 set -uo pipefail
 
 PROFILE=${AWS_PROFILE:-cairn-skypilot}

@@ -32,5 +32,5 @@ cat <<'EOF'
   export SHARD_PSK=$(openssl rand -hex 32)
   export HF_TOKEN=...            CAIRN_CONTROL_URL=https://<your-worker>/...
   pip install 'skypilot[aws]' && sky check aws
-  python infra/skypilot/launch.py --model gpt-oss-120b
+  python infra/skypilot/launch.py --model deepseek-v4-flash-fp8
 EOF

@@ -5,29 +5,29 @@
 #
 # serve_http only holds the ENTRY (head) + TAIL edges; the middles are invisible to it (the node
 # --next-host chain forwards through them). So ONE endpoint front serves any N-stage split — this is
-# how a 4-box gpt-oss-120b (CUTS=9,18,27) gets a queryable OpenAI API. All boxes are stages → NO spare
+# how a 4-box DeepSeek-V4-Flash (CUTS=11,22,33) gets a queryable OpenAI API. All boxes are stages → NO spare
 # → recovery=off (a queryable endpoint, not the recovery demo; +1 box would re-enable warm-spare recovery).
 #
 #   set -a; source infra/secrets.env; set +a   # set -a EXPORTS so `sky --env` sees them (plain source won't)
-#   # gpt-oss-120b, N=4 ([9,9,9,9] over 36 layers) — set num_nodes: 4 below:
+#   # DeepSeek-V4-Flash FP8, N=4 ([11,11,11,10] over 43 layers) — set num_nodes: 4 below:
 #   sky launch -c cairn-serve infra/skypilot/cairn-serve-nbox.sky.yaml --env HF_TOKEN --env SHARD_PSK \
-#     --env MODEL=openai/gpt-oss-120b --env CUTS=9,18,27 --env NLAYERS=36 --env CAIRN_API_KEY=sk-cairn-demo -d
+#     --env MODEL=sgl-project/DeepSeek-V4-Flash-FP8 --env CUTS=11,22,33 --env NLAYERS=43 --env CAIRN_API_KEY=sk-cairn-demo -d
 #   # or, on an ALREADY-UP fleet (reuse the boxes — no teardown): sky exec cairn-serve <same yaml + --env ...>
 #   ssh -L 8888:localhost:8000 cairn-serve -N &
 #   curl localhost:8888/v1/chat/completions -H 'authorization: Bearer sk-cairn-demo' \
 #     -H 'content-type: application/json' \
-#     -d '{"model":"openai/gpt-oss-120b","messages":[{"role":"user","content":"Say hi."}],"max_tokens":32}'
+#     -d '{"model":"sgl-project/DeepSeek-V4-Flash-FP8","messages":[{"role":"user","content":"Say hi."}],"max_tokens":32}'
 #   sky down cairn-serve
 name: cairn-serve
 
-num_nodes: 4                  # = len(CUTS)+1. EDIT per model (gpt-oss=4). All stages, no spare.
+num_nodes: 4                  # = len(CUTS)+1. EDIT per model (DeepSeek-V4-Flash=4). All stages, no spare.
 
 resources:
   cloud: aws
   region: eu-south-2
   instance_type: g6.xlarge
   use_spot: true
-  disk_size: 256              # headroom for big weights (gpt-oss-120b ~64 GB)
+  disk_size: 256              # headroom for big weights
   # NB: no `ports:` — access is via `ssh -L 8888:localhost:8000 <cluster>` (tunnel, key-gated, no public
   # exposure). Declaring ports here also lets this yaml `sky exec` onto a no-ports bench cluster (resources
   # must match). To expose 8000 publicly on a standalone launch, add `ports: 8000` back.
@@ -57,7 +57,7 @@ run: |
   export PATH=$HOME/cairn-env/bin:/usr/local/cuda/bin:$PATH
   export SHARD_PSK=${SHARD_PSK:-cairn-fleet-psk}
   export CAIRN_SGLANG_MEM_FRACTION=${CAIRN_SGLANG_MEM_FRACTION:-0.8}
-  MODEL=${MODEL:-openai/gpt-oss-120b}; NLAYERS=${NLAYERS:-36}; CUTS=${CUTS:-9,18,27}
+  MODEL=${MODEL:-sgl-project/DeepSeek-V4-Flash-FP8}; NLAYERS=${NLAYERS:-43}; CUTS=${CUTS:-11,22,33}
   API_KEY=${CAIRN_API_KEY:-sk-cairn-demo}
   BND=(0 ${CUTS//,/ } $NLAYERS)                                       # layer boundaries → this rank's [START,END)
   START=${BND[$RANK]}; END=${BND[$((RANK + 1))]}

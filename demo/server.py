@@ -9,11 +9,11 @@ data-plane logic* running together; only the SGLang block forward is mocked (run
     curl -s localhost:8400/demo/scenario | python -m json.tool         # K streams + induced recovery
     curl -s localhost:8400/v1/chat/completions \
       -H 'authorization: Bearer sk-cairn-demo' -H 'content-type: application/json' \
-      -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":12}'
+      -d '{"model":"llama-3.1-8b","messages":[{"role":"user","content":"hi"}],"max_tokens":12}'
     # streaming (SSE) — add "stream":true → a text/event-stream of chat.completion.chunk events + [DONE]
     curl -N -s localhost:8400/v1/chat/completions \
       -H 'authorization: Bearer sk-cairn-demo' -H 'content-type: application/json' \
-      -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":12,"stream":true}'
+      -d '{"model":"llama-3.1-8b","messages":[{"role":"user","content":"hi"}],"max_tokens":12,"stream":true}'
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from cairn_scheduler.scheduler import Scheduler, Stream  # noqa: E402
 from cairn_scheduler.sim import Sim  # noqa: E402
 
 API_KEY = os.environ.get("CAIRN_DEMO_API_KEY", "sk-cairn-demo")  # dev default; override via env (L7)
-CFG = ROOT / "configs" / "gpt-oss-120b.yaml"
+CFG = ROOT / "configs" / "llama-3.1-8b.yaml"
 MAX_BODY_BYTES = 1_048_576  # 1 MiB request-body ceiling (H2)
 
 

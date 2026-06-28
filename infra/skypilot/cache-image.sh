@@ -23,7 +23,7 @@
 set -euo pipefail
 CLUSTER="${CLUSTER:-cairn-dsv4}"
 REGION="${ECR_REGION:-eu-south-2}"
-ACCT="${ECR_ACCT:-AWS_ACCOUNT_ID}"
+ACCT="${ECR_ACCT:-<ACCOUNT_ID>}"   # set ECR_ACCT to your AWS account id
 REPO="${ECR_REPO_NAME:-cairn-sglang}"
 IMG="${SRC_IMAGE:-lmsysorg/sglang:deepseek-v4-blackwell}"
 TAG="${ECR_TAG:-deepseek-v4-blackwell}"

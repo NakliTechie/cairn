@@ -52,7 +52,7 @@ SUBNET_ID="${SUBNET_ID:-}"                               # a subnet IN $AZ; requ
 TAG="cairn=true,cairn-purpose=warm-ami-build"
 MODEL_S3="${MODEL_S3:-s3://skypilot-cairn-weights-${REGION}/deepseek-v4-flash-fp8/main}"
 IMG="${IMG:-lmsysorg/sglang:deepseek-v4-blackwell}"
-ECR_ACCT="${ECR_ACCT:-AWS_ACCOUNT_ID}"
+ECR_ACCT="${ECR_ACCT:-<ACCOUNT_ID>}"   # set ECR_ACCT to your AWS account id
 ECR_REPO="${ECR_REPO:-cairn-sglang}"
 ECR_URI="${ECR_ACCT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}"
 STATE_DIR="${STATE_DIR:-/tmp/cairn-warm-ami-${REGION}}"  # stashes instance/volume/ami ids between phases

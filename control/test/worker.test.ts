@@ -6,7 +6,7 @@ const envUpstream = { ...env, DATA_PLANE_URL: "https://data.internal/infer" } as
 
 afterEach(() => vi.unstubAllGlobals());
 
-const chat = { model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] };
+const chat = { model: "llama-3.1-8b", messages: [{ role: "user", content: "hi" }] };
 
 function post(bodyObj: unknown, auth?: string): Request {
   const headers: Record<string, string> = { "content-type": "application/json" };
@@ -32,7 +32,7 @@ describe("worker routes", () => {
   });
 
   it("rejects chat completion without auth (401)", async () => {
-    const r = await worker.fetch(post({ model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] }), env);
+    const r = await worker.fetch(post({ model: "llama-3.1-8b", messages: [{ role: "user", content: "hi" }] }), env);
     expect(r.status).toBe(401);
   });
 
@@ -45,14 +45,14 @@ describe("worker routes", () => {
     // 413 when Content-Length is present (real HTTP); 400 via the gateway char-cap when it
     // isn't (the in-process Request doesn't always set it). Either way the body is rejected,
     // never buffered into the fleet — that's the security property.
-    const big = { model: "gpt-oss-120b", messages: [{ role: "user", content: "a".repeat(1_100_000) }] };
+    const big = { model: "llama-3.1-8b", messages: [{ role: "user", content: "a".repeat(1_100_000) }] };
     const r = await worker.fetch(post(big, "Bearer sk-good"), env);
     expect([400, 413]).toContain(r.status);
   });
 
   it("returns 503 when the data plane is not attached (valid request)", async () => {
     const r = await worker.fetch(
-      post({ model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] }, "Bearer sk-good"),
+      post({ model: "llama-3.1-8b", messages: [{ role: "user", content: "hi" }] }, "Bearer sk-good"),
       env,
     );
     expect(r.status).toBe(503);

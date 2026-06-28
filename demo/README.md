@@ -14,7 +14,7 @@ curl -s localhost:8400/demo/scenario | python -m json.tool      # K streams + in
 
 curl -s localhost:8400/v1/chat/completions \
   -H 'authorization: Bearer sk-cairn-demo' -H 'content-type: application/json' \
-  -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":12}'
+  -d '{"model":"llama-3.1-8b","messages":[{"role":"user","content":"hi"}],"max_tokens":12}'
 ```
 
 - `/demo/scenario` decodes 6 streams through the N-stage split, kills a middle stage

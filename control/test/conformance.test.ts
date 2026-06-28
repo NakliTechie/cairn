@@ -14,7 +14,7 @@ describe("conformance (S8): single-sourced model registry + error shape", () => 
 
   it("the registry is non-empty and carries the v1.0 proof model", () => {
     expect(modelRegistry.models.length).toBeGreaterThan(0);
-    expect(MODELS.has("gpt-oss-120b")).toBe(true);
+    expect(MODELS.has("llama-3.1-8b")).toBe(true);
   });
 
   it("GatewayError.toError() emits the agreed OpenAI error shape {error:{message,type,code}}", () => {

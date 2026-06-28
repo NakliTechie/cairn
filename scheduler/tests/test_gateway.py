@@ -4,11 +4,11 @@ from cairn_scheduler.gateway import Gateway, GatewayError
 
 
 def _gw():
-    return Gateway(api_keys={"sk-good"}, model_names={"gpt-oss-120b"})
+    return Gateway(api_keys={"sk-good"}, model_names={"llama-3.1-8b"})
 
 
 def _body(**over):
-    b = {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 8}
+    b = {"model": "llama-3.1-8b", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 8}
     b.update(over)
     return b
 
@@ -24,7 +24,7 @@ def test_auth_valid_missing_invalid():
 
 def test_parse_valid_request():
     req = _gw().parse_request(_body())
-    assert req.model == "gpt-oss-120b"
+    assert req.model == "llama-3.1-8b"
     assert req.max_tokens == 8 and req.stream is False
 
 

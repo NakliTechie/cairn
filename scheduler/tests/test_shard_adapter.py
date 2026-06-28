@@ -20,7 +20,7 @@ from adapter import ShardBlockRuntime, build_shard_pipeline  # noqa: E402
 
 
 def test_adapter_conforms_to_blockruntime_seam():
-    rt = ShardBlockRuntime(0, 0, 8, "gpt-oss-120b", device="cpu")
+    rt = ShardBlockRuntime(0, 0, 8, "llama-3.1-8b", device="cpu")
     assert isinstance(rt, BlockRuntime)  # runtime_checkable Protocol — structural conformance
     assert (rt.stage, rt.layer_start, rt.layer_end) == (0, 0, 8)
     assert rt.kv_len("s") == 0
@@ -28,7 +28,7 @@ def test_adapter_conforms_to_blockruntime_seam():
 
 
 def test_forward_and_load_are_gpu_gated():
-    rt = ShardBlockRuntime(1, 9, 17, "gpt-oss-120b")
+    rt = ShardBlockRuntime(1, 9, 17, "llama-3.1-8b")
     with pytest.raises(NotImplementedError):
         rt.load()  # load_shard → VRAM (rung 2)
     with pytest.raises(NotImplementedError):
@@ -39,7 +39,7 @@ def test_sglang_runtime_structural_and_gpu_gated():
     from shard.node import LayerRange
     from shard.sglang_node import SglangNodeRuntime
 
-    rt = SglangNodeRuntime("gpt-oss-120b", LayerRange(0, 9), device="cuda:0")
+    rt = SglangNodeRuntime("llama-3.1-8b", LayerRange(0, 9), device="cuda:0")
     hb = rt.heartbeat()                      # heartbeat works without CUDA (reports not-alive)
     assert hb["alive"] is False and hb["layers"] == [0, 9]
     assert rt.kv_tokens("s") == 0
@@ -55,7 +55,7 @@ def test_adapter_free_stream_releases_node_kv():
     """S11: ShardBlockRuntime.free_stream delegates to the backing runtime's free_seq."""
     from shard.sglang_node import SglangNodeRuntime
 
-    rt = ShardBlockRuntime(0, 0, 8, "gpt-oss-120b", runtime_cls=SglangNodeRuntime)
+    rt = ShardBlockRuntime(0, 0, 8, "llama-3.1-8b", runtime_cls=SglangNodeRuntime)
     rt._node._steps["s"] = 3              # simulate a live stream: forward-count...
     rt._node._batches["s"] = object()     # ...+ a batch handle (KV cached) — the rung-2 internal model
     assert rt._node.kv_tokens("s") == 3   # cached before free
@@ -66,18 +66,18 @@ def test_adapter_free_stream_releases_node_kv():
 def test_adapter_accepts_sglang_runtime_cls():
     from shard.sglang_node import SglangNodeRuntime
 
-    rt = ShardBlockRuntime(0, 0, 8, "gpt-oss-120b", runtime_cls=SglangNodeRuntime)
+    rt = ShardBlockRuntime(0, 0, 8, "llama-3.1-8b", runtime_cls=SglangNodeRuntime)
     assert isinstance(rt, BlockRuntime)       # still conforms to the seam with the real backend
     with pytest.raises(Exception):
         rt.load()                              # GPU-gated
 
 
-def test_build_shard_pipeline_mirrors_fit(gpt_oss_cfg):
-    r = fit(gpt_oss_cfg, target_k=8, context_len=4096)
-    pipe = build_shard_pipeline(r, gpt_oss_cfg.hf_repo or "gpt-oss-120b")
+def test_build_shard_pipeline_mirrors_fit(model_cfg):
+    r = fit(model_cfg, target_k=8, context_len=4096)
+    pipe = build_shard_pipeline(r, model_cfg.hf_repo or "llama-3.1-8b")
     assert len(pipe) == r.n
     assert [s.stage for s in pipe] == list(range(r.n))
     assert all(isinstance(s, BlockRuntime) for s in pipe)
     # layer ranges line up with the fit, contiguous and inclusive
     assert pipe[0].layer_start == 0
-    assert pipe[-1].layer_end == gpt_oss_cfg.num_layers - 1
+    assert pipe[-1].layer_end == model_cfg.num_layers - 1

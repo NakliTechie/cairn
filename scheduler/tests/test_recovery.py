@@ -6,13 +6,15 @@ from cairn_scheduler.sim import Sim
 
 
 def _fit(cfg):
-    return fit(cfg, target_k=8, context_len=4096)
+    # Reserve enough KV headroom to force a multi-stage split (llama-3.1-8b fits in 1
+    # stage at small K/context; the recovery gates need a real >=3-stage pipeline).
+    return fit(cfg, target_k=16, context_len=32768)
 
 
-def test_replay_rebuild_block_resumes_identically(gpt_oss_cfg):
+def test_replay_rebuild_block_resumes_identically(model_cfg):
     """spec §5.3: rebuild ONLY the dead block by replaying the token-history; downstream
     untouched; subsequent forwards are bit-identical to a no-crash run."""
-    r = _fit(gpt_oss_cfg)
+    r = _fit(model_cfg)
     assert r.n >= 3
     sid = "s"
     seq = [(j * 2654435761) & 0xFFFF for j in range(1, 21)]  # 20 fixed inputs
@@ -42,10 +44,10 @@ def _tail_pipeline():
     return [MockBlockRuntime(0, 0, 8), MockBlockRuntime(1, 9, 17), MockBlockRuntime(2, 18, 17)]
 
 
-def test_c1_recovery_with_lmhead_tail_uncorrupted(gpt_oss_cfg):
+def test_c1_recovery_with_lmhead_tail_uncorrupted(model_cfg):
     """C1: a node whose downstream neighbour is a 0-layer lm_head tail must still rebuild
     its KV to the committed length (not 0) — output identical to a no-crash run."""
-    vocab = gpt_oss_cfg.vocab_size
+    vocab = model_cfg.vocab_size
     specs = [(f"s{i}", [i + 1, i + 2, i + 3], 12) for i in range(3)]
 
     sim = Sim()
@@ -83,12 +85,12 @@ def _specs():
     return [(f"s{i}", [i + 1, i + 2, i + 3], 15) for i in range(4)]
 
 
-def test_reassign_keeps_output_uncorrupted(gpt_oss_cfg):
+def test_reassign_keeps_output_uncorrupted(model_cfg):
     """v1.0 induced-interruption gate (in sim): kill a node mid-decode → reassign to the
     warm spare → resume; every stream completes with output identical to the no-crash run."""
-    n = _fit(gpt_oss_cfg).n
-    _, _, ref = _run(gpt_oss_cfg, _specs(), k_max=4)
-    sched, rm, got = _run(gpt_oss_cfg, _specs(), k_max=4, evict_stage=n // 2, after="s0", count=5)
+    n = _fit(model_cfg).n
+    _, _, ref = _run(model_cfg, _specs(), k_max=4)
+    sched, rm, got = _run(model_cfg, _specs(), k_max=4, evict_stage=n // 2, after="s0", count=5)
 
     assert len(sched.finished) == 4
     assert got == ref                       # uncorrupted across the interruption
@@ -97,30 +99,30 @@ def test_reassign_keeps_output_uncorrupted(gpt_oss_cfg):
     assert rm.warm_spares == 0              # the warm spare was consumed
 
 
-def test_rebuild_fallback_when_no_spare(gpt_oss_cfg):
-    n = _fit(gpt_oss_cfg).n
-    _, _, ref = _run(gpt_oss_cfg, _specs(), k_max=4)
-    sched, rm, got = _run(gpt_oss_cfg, _specs(), k_max=4, evict_stage=n // 2, count=5, warm_spares=0)
+def test_rebuild_fallback_when_no_spare(model_cfg):
+    n = _fit(model_cfg).n
+    _, _, ref = _run(model_cfg, _specs(), k_max=4)
+    sched, rm, got = _run(model_cfg, _specs(), k_max=4, evict_stage=n // 2, count=5, warm_spares=0)
     assert got == ref
     assert rm.timeline[0].policy == "rebuild"  # no warm spare → rebuild fallback (spec §5.1)
 
 
-def test_version_skew_forces_rebuild(gpt_oss_cfg):
-    n = _fit(gpt_oss_cfg).n
-    _, _, ref = _run(gpt_oss_cfg, _specs(), k_max=4)
+def test_version_skew_forces_rebuild(model_cfg):
+    n = _fit(model_cfg).n
+    _, _, ref = _run(model_cfg, _specs(), k_max=4)
     sched, rm, got = _run(
-        gpt_oss_cfg, _specs(), k_max=4, evict_stage=n // 2, count=5, warm_spares=1, version_skew=True
+        model_cfg, _specs(), k_max=4, evict_stage=n // 2, count=5, warm_spares=1, version_skew=True
     )
     assert got == ref
     assert rm.timeline[0].policy == "rebuild"  # cross-version activations are garbage → rebuild
     assert rm.warm_spares == 1                  # spare NOT consumed by a rebuild
 
 
-def test_recovery_timeline_logged(gpt_oss_cfg):
+def test_recovery_timeline_logged(model_cfg):
     from cairn_scheduler.domain import NodeState
 
-    n = _fit(gpt_oss_cfg).n
-    sched, rm, _ = _run(gpt_oss_cfg, _specs(), k_max=4, evict_stage=n // 2, count=5)
+    n = _fit(model_cfg).n
+    sched, rm, _ = _run(model_cfg, _specs(), k_max=4, evict_stage=n // 2, count=5)
     ev = rm.timeline[0]
     assert ev.stage == n // 2
     assert ev.replay_tokens > 0

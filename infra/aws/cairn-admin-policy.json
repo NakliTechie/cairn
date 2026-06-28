@@ -1,5 +1,5 @@
 {
-  "_comment": "DRAFT scoped admin for the occasional Cairn ACCOUNT-admin task (create/manage the project's scoped IAM users, VPC/IGW fixes, bucket + quota management) — an alternative to using ROOT CLI keys. ⚠ HONEST CAVEAT: anything that can manage IAM is privilege-escalation-capable (this key can PutUserPolicy an admin inline policy onto a cairn-* user, then use it), so it is a TRUSTED, powerful key — NOT least-priv like cairn-skypilot/cairn-s3-cache. Protect it with MFA, keep it off any box, and use it only for setup. If you'd rather not have a standing admin key at all, the most-secure option is to delete root access keys and use the ROOT CONSOLE (email+password+MFA, no CLI keys) for the ~monthly admin task. Apply: create IAM user 'cairn-admin' (root console, the last time you need root) → attach THIS inline (minus _comment) → enable MFA → create an access key → store as a named profile (NOT default). EC2 mutate is left region-wide because admin VPC/IGW work spans regions; tighten if desired.",
+  "_comment": "Scoped admin for the occasional Cairn ACCOUNT-admin task (create/manage the project's scoped IAM users, VPC/IGW fixes, bucket + quota management) — an alternative to using ROOT CLI keys. CAVEAT: anything that can manage IAM is privilege-escalation-capable (this key can PutUserPolicy an admin inline policy onto a cairn-* user, then use it), so it is a TRUSTED, powerful key — NOT least-priv like cairn-skypilot/cairn-s3-cache. Protect it with MFA, keep it off any box, and use it only for setup. The most-secure alternative is no standing admin key: delete root access keys and use the ROOT CONSOLE (email+password+MFA, no CLI keys) for the rare admin task. Apply: create IAM user 'cairn-admin' (root console) -> attach THIS inline (minus _comment) -> enable MFA -> create an access key -> store as a named profile (NOT default). Replace <ACCOUNT_ID> below with your AWS account id. EC2 mutate is left region-wide because admin VPC/IGW work spans regions; tighten if desired.",
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -11,8 +11,8 @@
         "iam:CreateAccessKey", "iam:DeleteAccessKey", "iam:UpdateAccessKey", "iam:ListAccessKeys"
       ],
       "Resource": [
-        "arn:aws:iam::AWS_ACCOUNT_ID:user/cairn-*",
-        "arn:aws:iam::AWS_ACCOUNT_ID:user/sky-*"
+        "arn:aws:iam::<ACCOUNT_ID>:user/cairn-*",
+        "arn:aws:iam::<ACCOUNT_ID>:user/sky-*"
       ]
     },
     {

@@ -16,12 +16,12 @@ name: cairn-dsv4-spare
 
 num_nodes: 1
 
-# SHARED FLEET SECURITY GROUP (self-replenish SG-isolation fix, 2026-06-28). MUST match the name pinned in
+# SHARED FLEET SECURITY GROUP (self-replenish SG-isolation fix). MUST match the name pinned in
 # cairn-dsv4.sky.yaml. A replenished spare is a SEPARATE SkyPilot cluster, so by default SkyPilot gives it
 # its OWN per-cluster SG — isolated from the live fleet's SG. That breaks the BIDIRECTIONAL recovery wire:
 # the spare's announce dial to the driver's :7780 hangs in SYN-SENT, AND the predecessor stage's later data
 # connection to the spare's :7777 is blocked, so the driver's read times out at recovery.py:309 and the
-# fleet stays degraded (both observed live 2026-06-28). Pinning the spare to the SAME named SG as the fleet
+# fleet stays degraded (both observed live). Pinning the spare to the SAME named SG as the fleet
 # makes all of 7777-7780 mutually reachable with no per-launch SG surgery. Pre-create per region with
 # `bash infra/aws/ensure-fleet-sg.sh`. (Fallback if you can't pin a shared SG: opt into the watcher's
 # CAIRN_AUTHORIZE_RECOVERY_PORTS path — see infra/skypilot/replenish-watcher.sh.)
@@ -77,7 +77,7 @@ setup: |
     _T=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
     R=$(curl -s -H "X-aws-ec2-metadata-token: $_T" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
     ECR_REGION="${R:-eu-south-2}"
-    ECR_REPO="AWS_ACCOUNT_ID.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
+    ECR_REPO="${CAIRN_ECR_ACCT:-<ACCOUNT_ID>}.dkr.ecr.${ECR_REGION}.amazonaws.com/cairn-sglang"
     if [ -n "${CAIRN_S3_WRITE_ACCESS_KEY_ID:-}" ] \
        && AWS_ACCESS_KEY_ID="$CAIRN_S3_WRITE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_WRITE_SECRET_ACCESS_KEY" \
             aws ecr get-login-password --region "$ECR_REGION" 2>/dev/null \
@@ -165,3 +165,4 @@ envs:
   CAIRN_S3_CACHE_SECRET_ACCESS_KEY: ""
   CAIRN_S3_WRITE_ACCESS_KEY_ID: ""
   CAIRN_S3_WRITE_SECRET_ACCESS_KEY: ""
+  CAIRN_ECR_ACCT: ""             # your AWS account id for the in-region ECR mirror; empty ⇒ Docker Hub

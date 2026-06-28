@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reliable Cairn teardown using cairn's OWN scoped key.
 #
-# WHY (~/Code/infra/aws/README.md gotcha #9): if the shared api server is running under a DIFFERENT
+# WHY: if the shared api server is running under a DIFFERENT
 # identity, `sky down` can't terminate a cairn-tagged box (the wrong key's tag-gate blocks it).
 # Terminating directly with cairn's key works via the `cairn=true` tag gate regardless of the server's
 # identity. Then we clear the local SkyPilot record with --purge.
@@ -15,7 +15,7 @@ set -euo pipefail
 
 PROFILE="${CAIRN_AWS_PROFILE:-cairn-skypilot}"
 CLUSTER="${CLUSTER:-${CAIRN_CLUSTER:-cairn-fleet}}"
-SKY="${SKY:-$(command -v sky || echo "$HOME/Code/mela/.venv/bin/sky")}"
+SKY="${SKY:-$(command -v sky)}"
 REGIONS="${CAIRN_REGIONS:-eu-south-2 ap-northeast-2 us-east-2 us-west-2}"
 
 for r in $REGIONS; do

@@ -1,12 +1,11 @@
 # Cairn — S3-backed artifact cache
 
-A durable plan for not paying for the same expensive setup twice. Born from the 2026-06-24
-DeepSeek-V4-Flash maiden run, where each fresh g7e box paid a ~30-min CUDA build + a 294 GB
-weight pull before serving a single token.
+A durable plan for not paying for the same expensive setup twice. Without it, each fresh g7e box
+pays a ~30-min CUDA build + a 294 GB weight pull before serving a single token.
 
 The strategy ties directly into **recovery and hotswaps**: a box that comes up fast is a box that
 can replace a spot-reclaimed stage fast, promote a spare fast, or load a different model fast. Cache
-= cheaper experiments *and* a better recovery story (Path 2 / durable-star).
+= cheaper experiments *and* a better recovery story.
 
 ## The core principle: download once, fan out from in-region S3
 
@@ -16,7 +15,7 @@ optimization to add later.
 
 Why it's not optional at scale — the weights make it obvious:
 
-| Boxes | Per-box-pulls-HF (today) | Download-once-to-S3 (the rule) |
+| Boxes | Per-box-pulls-HF (naive) | Download-once-to-S3 (the rule) |
 |---|---|---|
 | 4 | 600 GB HF egress, 4× rate-limit exposure | 294 GB HF once + 4× in-region S3 (backbone) |
 | 20 | **3 TB HF egress**, near-certain throttling, slow | 294 GB HF once + 20× in-region S3 (parallel, fast) |
@@ -36,7 +35,7 @@ than route everything through the controller.)
 
 ## The constraint that shapes everything
 
-**Boxes have no AWS credentials** (no instance role — verified 2026-06-24). So:
+**Boxes have no AWS credentials** (no instance role by default). So:
 - **Restore (S3 → box) is automatic** via SkyPilot `file_mounts: { /path: s3://... }` — SkyPilot
   uses the *controller's* creds to sync. Zero box-side credentials.
 - **Populate (box → S3) is a manual controller step** — the box can't write S3. Pattern:
@@ -59,11 +58,11 @@ so the least-priv key can read/write it; `s3:CreateBucket` on that pattern is al
 
 | Artifact | Size | Origin | Decision | Key |
 |---|---|---|---|---|
-| **0xSero kernel build** | 15 MB | ~30-min CUDA compile on g7e | ✅ **CACHE** (done) | base-image **digest** + arch (sm_120) |
-| **V4-Flash weights** | 294 GB | HF download (public) | ✅ **CACHE in-region** (planned) | model id + revision |
+| **0xSero kernel build** | 15 MB | ~30-min CUDA compile on g7e | ✅ **CACHE** | base-image **digest** + arch (sm_120) |
+| **V4-Flash weights** | 294 GB | HF download (public) | ✅ **CACHE in-region** | model id + revision |
 | **sglang base image** | 82 GB | `docker pull` (digest-pinned) | ✅ **in-region ECR mirror** (lazy, per region) | image digest |
 
-### 1. Kernel build — DONE (2026-06-24)
+### 1. Kernel build
 - Stored: `s3://skypilot-cairn-artifacts/dsv4-kernel/<image-digest>/build-docker.tar.gz`
   (current digest `408846afd1b0`).
 - Wired: `cairn-dsv4.sky.yaml` file_mounts it to `/cairn-kernel-cache`; setup restores it (cheapest-
@@ -73,7 +72,7 @@ so the least-priv key can read/write it; `s3:CreateBucket` on that pattern is al
   — update the digest in the file_mount and re-populate. A stale/missing prefix degrades gracefully
   to a full rebuild.
 
-### 2. Weights — WIRED (lazy, 2026-06-24); populate is the remaining manual step
+### 2. Weights — wired (lazy); populate is a manual step
 This is where "download once, fan out" pays off most. See the core principle above.
 - **Buckets EXIST in all 4 launchable regions** (`skypilot-cairn-weights-{eu-south-2,us-east-2,
   us-west-2,ap-northeast-2}`) so any region can be the cheapest at launch time. The `skypilot-`
@@ -103,24 +102,22 @@ This is where "download once, fan out" pays off most. See the core principle abo
   regions actually used. Drops to near-zero per *box* added (the win compounds with fleet size).
 - **Hotswap / recovery payoff (the reason this matters beyond cost):**
   - **Spare promotion / post-reclaim replacement:** a replacement box loads weights from in-region S3
-    in a fraction of the HF time → lower MTTR for the catastrophic-recovery path (Path 2 durable-star).
+    in a fraction of the HF time → lower MTTR for the catastrophic-recovery path.
   - **Model hotswap:** keep several models pre-staged in S3; bringing up a fleet for a different model
     becomes "sync from S3 + load", not "re-download from HF". Enables fast A/B and multi-model packing.
-  - This is the concrete infra under the "self-replenishing spare" + "resumable driver" items in
-    `plan/pending.md` (Parked / Path 2).
+  - This is the concrete infra under the self-replenishing spare + resumable driver.
 
 ### 3. Base image — in-region ECR mirror (lazy, per region)
 It's a *pull*, not a build, and it's digest-pinned (`lmsysorg/sglang:deepseek-v4-blackwell@sha256:
 408846…`). S3 wouldn't pull faster, so it stays on Docker Hub as the **fallback**; the **in-region ECR
 mirror** is the fast path (compressed registry content ~25.6 GB, AWS-backbone, layer-cached).
 
-**Region-derived, NOT hardcoded (fixed 2026-06-28).** The dsv4 setup (`acquire_image()` in both
-`cairn-dsv4.sky.yaml` and `cairn-dsv4-spare.sky.yaml`) now derives `ECR_REGION` from IMDS
-(`placement/region`) — exactly like `acquire_weights()` — so the mirror pull is always in-region.
-Previously `ECR_REGION` was hardcoded to `eu-south-2`, so a fleet (or a replenished spare) launched in
-e.g. us-east-2/Ohio pulled the image **cross-region** from eu-south-2 — slow, every box, every spare
-(observed live 2026-06-28). If the in-region pull misses (repo not yet populated there), it falls back
-to the ~82 GB Docker Hub pull.
+**Region-derived, NOT hardcoded.** The dsv4 setup (`acquire_image()` in both `cairn-dsv4.sky.yaml`
+and `cairn-dsv4-spare.sky.yaml`) derives `ECR_REGION` from IMDS (`placement/region`) — exactly like
+`acquire_weights()` — so the mirror pull is always in-region. A hardcoded region would make a fleet
+(or a replenished spare) launched elsewhere pull the image **cross-region** — slow, every box, every
+spare. If the in-region pull misses (repo not yet populated there), it falls back to the ~82 GB
+Docker Hub pull.
 
 **Lazy-per-region, like the weights cache.** ECR repos are region-scoped, so the `cairn-sglang` mirror
 must be populated **once per actively-used region**. Mirror from a live box that already pulled the
@@ -135,23 +132,23 @@ First launch in an un-mirrored region is a Docker Hub fallback (correct, just sl
 the next launch / spare there is an in-region hit.
 
 ## Next steps (priority order — weights fan-out is the headline)
-- [x] Kernel build → S3, wired into the dsv4 yaml (2026-06-24).
+- [x] Kernel build → S3, wired into the dsv4 yaml.
 - [ ] **Read instance profile** for the fleet — least-priv `s3:GetObject`/`ListBucket` on
-      `skypilot-cairn-weights-*` + `skypilot-cairn-artifacts`, attached at launch (confirm how SkyPilot 0.12
-      attaches an IAM instance profile). This is the prerequisite for direct parallel S3 fan-out.
+      `skypilot-cairn-weights-*` + `skypilot-cairn-artifacts`, attached at launch (confirm how the
+      pinned SkyPilot version attaches an IAM instance profile). Prerequisite for direct parallel S3 fan-out.
 - [ ] **Weights download-once → in-region S3, fan-out to boxes.** Create `skypilot-cairn-weights-<region>`
       **in the launch region**; populate DeepSeek-V4-Flash once (HF→S3); change the dsv4 setup so each
       box does `aws s3 sync s3://skypilot-cairn-weights-<region>/<model>/<rev>/ ~/model` (S3 hit → skip HF),
-      falling back to HF only on a cache miss. Gate: right after the maiden decode. This is THE
-      network-friendly pattern and the prerequisite for 10-20-box runs.
+      falling back to HF only on a cache miss. This is THE network-friendly pattern and the prerequisite
+      for 10-20-box runs.
 - [ ] Generalize: a small helper (`infra/skypilot/cache.py`?) — `populate <artifact>` /
       `key <artifact>` / `sync <artifact>` — so kernel + weights + future models share one
       keying/populate/restore convention (and the same instance-profile read path).
 - [ ] Tie weight-cache into the recovery path: spare/replacement boxes pull from in-region S3 →
-      measure the MTTR improvement vs HF (feeds the Path 2 / headline recovery numbers).
+      measure the MTTR improvement vs HF.
 - [x] ECR image mirror — region-derived (IMDS) in `acquire_image()`, lazy-per-region populate via
-      `cache-image.sh` (fixed the eu-south-2 cross-region hardcode, 2026-06-28). Follow-up: a standing
-      `ecr:CreateRepository` perm so new-region repos auto-create without the admin-cli profile.
+      `cache-image.sh`. Follow-up: a standing `ecr:CreateRepository` perm so new-region repos
+      auto-create without the admin-cli profile.
 
 > **Scale note (the reason this is the default, not an optimization):** at 10-20 boxes, per-box HF
 > pulls = multi-TB egress per launch + rate-limit throttling + slow bring-up. Download-once-to-S3 +

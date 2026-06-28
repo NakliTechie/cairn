@@ -1,7 +1,7 @@
-# Cairn GPU box image — VERIFIED LOCK (the exact env that ran the rung-2 SGLang block-forward green).
+# Cairn GPU box image — VERIFIED LOCK (the exact env that ran the SGLang block-forward green).
 #
-# Captured via `pip freeze` from the live g6.xlarge/L4 box on 2026-06-21, after test_sglang_split.py
-# passed (split==unsplit + replay-rebuild on real flashinfer kernels). This is the reproducible
+# Captured via `pip freeze` from a live g6.xlarge/L4 box, after test_sglang_split.py passed
+# (split==unsplit + replay-rebuild on real flashinfer kernels). This is the reproducible
 # source of truth — `pip install -r infra/requirements.lock` recreates the working env exactly.
 #
 # It encodes three corrections that requirements-gpu.txt's original pins got wrong (each found on the box):
@@ -9,11 +9,11 @@
 #   - torch==2.6.0 (sglang 0.4.6.post5 requires it; it overrode a pre-pinned 2.5.1).
 #   - compressed-tensors==0.9.4 (sglang pulls 0.15+, which imports transformers.masking_utils — absent in
 #     the transformers==4.51.1 sglang pins — breaking ALL model loading; 0.9.4 is the last pre-masking_utils).
-# The path-C oracle's transformers 5.x lives in a SEPARATE env (infra/requirements-ref.txt) — do not mix.
+# The reference oracle's transformers 5.x lives in a SEPARATE env (infra/requirements-ref.txt) — do not mix.
 #
 # Box prerequisites for flashinfer JIT (not pip): the CUDA toolkit (nvcc, /usr/local/cuda) + ninja on PATH.
 #
-# HASH-PINNED (M12 hardening — done 2026-06-23): every pin below carries the sha256 of all PyPI artifacts
+# HASH-PINNED: every pin below carries the sha256 of all PyPI artifacts
 # for that exact version. Regenerate with `python infra/hash_lock.py` (re-fetches hashes for the pinned
 # versions; to bump one, edit its `==` and re-run); verify with `python infra/hash_lock.py --check`.
 # Install hash-verified ON THE BOX (linux x86_64 / cpython-3.10 — the proven target):

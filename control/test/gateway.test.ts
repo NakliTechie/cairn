@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import { authenticate, GatewayError, parseRequest } from "../src/gateway";
 
 const KEYS = new Set(["sk-good"]);
-const MODELS = new Set(["gpt-oss-120b"]);
+const MODELS = new Set(["llama-3.1-8b"]);
 
 function body(over: Record<string, unknown> = {}) {
-  return { model: "gpt-oss-120b", messages: [{ role: "user", content: "hello" }], max_tokens: 8, ...over };
+  return { model: "llama-3.1-8b", messages: [{ role: "user", content: "hello" }], max_tokens: 8, ...over };
 }
 
 describe("authenticate", () => {
@@ -27,7 +27,7 @@ describe("authenticate", () => {
 describe("parseRequest", () => {
   it("parses a valid request", () => {
     const req = parseRequest(body(), MODELS);
-    expect(req.model).toBe("gpt-oss-120b");
+    expect(req.model).toBe("llama-3.1-8b");
     expect(req.max_tokens).toBe(8);
     expect(req.stream).toBe(false);
   });

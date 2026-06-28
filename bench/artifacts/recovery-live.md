@@ -37,6 +37,6 @@ cold-spare path).
 ### Honest scope (what this proves — and does NOT)
 - **Proves:** the recovery *mechanism* is correct and fast on real sglang paged-KV — single-box AND across
   separate boxes over the VPC LAN — with a pre-warmed spare bringing MTTR to ~23 ms.
-- **Does NOT prove (yet):** the same at headline scale (`gpt-oss-120b` / `GLM-5.2`, multi-GPU) — this is a
+- **Does NOT prove (yet):** the same at headline scale (`GLM-5.2`, multi-GPU) — this is a
   0.5B model, one L4 per box; nor is it a **cost claim** — that needs the real-fleet run + the actual AWS
   bill (§12 / Chunk C). No $ claim is made here (spec §6: "pitch it narrow").

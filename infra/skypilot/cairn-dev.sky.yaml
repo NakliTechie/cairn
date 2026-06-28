@@ -1,18 +1,18 @@
-# Cairn rung-2 single-GPU DEV box — a bare g6.xlarge (L4) spot for ITERATING on the SGLang
-# block-forward. NOT the fleet serve path (cairn-block.sky.yaml runs cairn_node.serve, which
-# doesn't exist yet): this box provisions + installs the GPU env, then stays UP for `sky exec`/SSH.
+# Cairn single-GPU DEV box — a bare g6.xlarge (L4) spot for ITERATING on the SGLang
+# block-forward. NOT the fleet serve path (cairn-block.sky.yaml runs cairn_node.serve):
+# this box provisions + installs the GPU env, then stays UP for `sky exec`/SSH.
 # Auto-downs on idle (cost guard); tear down explicitly with `sky down cairn-dev`.
 name: cairn-dev
 
 resources:
   cloud: aws
-  region: eu-south-2          # Spain — cheap g6 spot, <5% interruption (the proof region)
+  region: eu-south-2          # Spain — cheap g6 spot, <5% interruption
   instance_type: g6.xlarge    # 1x L4 (Ada, sm_89), 24 GB
   use_spot: true
   disk_size: 128
   labels:
-    cairn: "true"             # IAM destructive-action gate (H5/M13) + cost-allocation tag (docs/cost-methodology.md)
-    cairn-purpose: "rung2-dev"   # cost breakdown by purpose; the benchmark runs use spot-proof | ondemand-baseline
+    cairn: "true"             # IAM destructive-action gate + cost-allocation tag
+    cairn-purpose: "dev"      # cost breakdown by purpose; the benchmark runs use spot-proof | ondemand-baseline
 
 # Only the code the harness/forward/serving need (skips scheduler/.venv etc.).
 file_mounts:

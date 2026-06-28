@@ -19,5 +19,5 @@ def configs_dir():
 
 
 @pytest.fixture
-def gpt_oss_cfg():
-    return load_model_config(CONFIGS / "gpt-oss-120b.yaml")
+def model_cfg():
+    return load_model_config(CONFIGS / "llama-3.1-8b.yaml")

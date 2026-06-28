@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate a `--require-hashes` lock from the exact pins in infra/requirements.lock (M12 hardening).
+"""Regenerate a `--require-hashes` lock from the exact pins in infra/requirements.lock.
 
 Why not `uv pip compile`/`pip-compile`? Those RE-RESOLVE the dependency graph, which (a) can drift the
 proven versions and (b) trips over the deliberate `compressed-tensors==0.9.4` downgrade, which conflicts

@@ -27,7 +27,7 @@ The same `cairn_scheduler.Scheduler` drives sim or real:
 from cairn_scheduler import load_model_config, fit
 from cairn_scheduler.runtime import build_mock_pipeline      # rung 1 (no GPU)
 # from adapter import build_shard_pipeline                    # rung 2/3 (GPU)
-cfg = load_model_config("configs/gpt-oss-120b.yaml")
+cfg = load_model_config("configs/llama-3.1-8b.yaml")
 pipeline = build_mock_pipeline(fit(cfg))                      # ← swap to build_shard_pipeline on a GPU pool
 ```
 

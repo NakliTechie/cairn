@@ -1,5 +1,5 @@
-# Cairn GPU box image — the per-node serving env (sglang block-forward + the sealed wire). PROVEN on a
-# real L4 (2026-06-21). The install is TWO steps — the second CANNOT be a requirements pin (see below):
+# Cairn GPU box image — the per-node serving env (sglang block-forward + the sealed wire). Proven on a
+# real L4. The install is TWO steps — the second CANNOT be a requirements pin (see below):
 #
 #   pip install -r infra/requirements-gpu.txt
 #   pip install --no-deps compressed-tensors==0.9.4        # REQUIRED override — see the note at the bottom
@@ -34,4 +34,4 @@ pyyaml==6.0.2
 #     pip install --no-deps compressed-tensors==0.9.4
 #
 # transformers / huggingface-hub / numpy are sglang-resolved (4.51.1 / 0.36.2 / 1.26.4 on the box).
-# The path-C oracle's transformers 5.x lives in a SEPARATE env (infra/requirements-ref.txt) — never mix.
+# The reference oracle's transformers 5.x lives in a SEPARATE env (infra/requirements-ref.txt) — never mix.

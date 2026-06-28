@@ -63,7 +63,7 @@ declare -A DLAMI=(
 IMAGE_ID="${IMAGE_ID:-${DLAMI[$REGION]:-}}"
 
 PROFILE="${CAIRN_AWS_PROFILE:-cairn-skypilot}"
-SKY="${SKY:-$(command -v sky || echo "$HOME/Code/mela/.venv/bin/sky")}"
+SKY="${SKY:-$(command -v sky)}"
 
 echo "[bringup] model=$MODEL  nway=$NWAY  nodes=$NUM_NODES (=$NWAY active + $((NUM_NODES-NWAY)) spares)"
 echo "[bringup] region=$REGION  image=$IMAGE_ID  cluster=$CLUSTER  idle-autostop=${IDLE_MIN}m"

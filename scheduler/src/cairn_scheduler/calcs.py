@@ -43,8 +43,8 @@ def kv_bytes_per_stream(cfg: ModelConfig, num_layers: int, context_len: int) -> 
     """KV headroom one stream needs on a node holding `num_layers` layers.
 
     v1.0 `kv_model: full` treats every layer as full-attention (conservative upper
-    bound). TODO swa-aware: ~half of gpt-oss's layers are sliding-window(128), so their
-    per-stream KV is capped at min(context_len, sliding_window) (spec §12.2).
+    bound). TODO swa-aware: for models whose layers are sliding-window attention, those
+    layers' per-stream KV is capped at min(context_len, sliding_window) (spec §12.2).
     """
     return kv_bytes_per_token_per_layer(cfg) * num_layers * context_len
 

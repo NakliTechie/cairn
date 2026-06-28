@@ -25,12 +25,12 @@ from cairn_scheduler.runtime import MockBlockRuntime, build_mock_pipeline  # noq
 from cairn_scheduler.scheduler import Scheduler, Stream  # noqa: E402
 from cairn_scheduler.sim import Sim  # noqa: E402
 
-CFG = ROOT / "configs" / "gpt-oss-120b.yaml"
+CFG = ROOT / "configs" / "llama-3.1-8b.yaml"
 ART = ROOT / "bench" / "artifacts"
 
 # Illustrative prices ($/node-hour) — REAL numbers come from spec §12/§6 at build.
 G6_SPOT_HR = 0.30
-BASELINE_ONDEMAND_HR = 4.00  # one on-demand box large enough to hold gpt-oss-120b (~63 GB)
+BASELINE_ONDEMAND_HR = 4.00  # one on-demand box large enough to hold llama-3.1-8b (~15 GB bf16)
 
 
 def _run(r, specs, vocab, *, k_max, evict_stage=None, after="s0", count=0,
@@ -133,7 +133,9 @@ def cost_model(r, vocab):
 
 def run_all() -> dict:
     cfg = load_model_config(CFG)
-    r = fit(cfg, target_k=8, context_len=4096)
+    # Force a multi-stage split (llama-3.1-8b fits in 1 stage at the defaults; the gate
+    # artifacts demonstrate the N-stage pipeline, so reserve enough KV headroom to split).
+    r = fit(cfg, target_k=16, context_len=32768)
     vocab = cfg.vocab_size
     gates = [
         gate_reliability(r, vocab),

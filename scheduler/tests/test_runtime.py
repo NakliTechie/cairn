@@ -29,11 +29,11 @@ def test_forward_grows_kv():
     assert stage.kv_len("a") == 0 and not stage.has_stream("a")
 
 
-def test_cross_stream_kv_isolation(gpt_oss_cfg):
+def test_cross_stream_kv_isolation(model_cfg):
     """Spec §4.4: a token of stream A must never read stream B's KV. Interleaving B
     must not change A's output stream."""
-    r = fit(gpt_oss_cfg, target_k=4, context_len=2048)
-    vocab = gpt_oss_cfg.vocab_size
+    r = fit(model_cfg, target_k=4, context_len=2048)
+    vocab = model_cfg.vocab_size
 
     solo = build_mock_pipeline(r)
     a_solo = _decode(solo, "A", prompt_hidden=7, steps=6, vocab=vocab)
@@ -54,14 +54,14 @@ def test_cross_stream_kv_isolation(gpt_oss_cfg):
     assert a_inter == a_solo  # B's presence left no trace on A
 
 
-def test_split_equals_single_reference(gpt_oss_cfg):
+def test_split_equals_single_reference(model_cfg):
     """Spec §9 v1.0 correctness gate (in sim): the split pipeline is token-for-token
     identical to a single-node reference holding all layers."""
-    r = fit(gpt_oss_cfg, target_k=8, context_len=4096)
-    vocab = gpt_oss_cfg.vocab_size
+    r = fit(model_cfg, target_k=16, context_len=32768)  # force a real multi-stage split
+    vocab = model_cfg.vocab_size
 
     split = build_mock_pipeline(r)
-    reference = [MockBlockRuntime(0, 0, gpt_oss_cfg.num_layers - 1)]
+    reference = [MockBlockRuntime(0, 0, model_cfg.num_layers - 1)]
 
     ref_tokens = _decode(reference, "S", prompt_hidden=42, steps=12, vocab=vocab)
     split_tokens = _decode(split, "S", prompt_hidden=42, steps=12, vocab=vocab)
@@ -69,7 +69,7 @@ def test_split_equals_single_reference(gpt_oss_cfg):
     assert r.n >= 2  # the gate is only meaningful if it actually split into >1 stage
 
 
-def test_replay_rebuilds_kv(gpt_oss_cfg):
+def test_replay_rebuilds_kv(model_cfg):
     """Spec §5.3: KV is derived; on a drop the block's cache is rebuilt by re-prefilling
     over the durable token-history. Re-running the history must reproduce identical output."""
     stage = MockBlockRuntime(2, 8, 15)  # a middle block

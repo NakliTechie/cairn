@@ -4,9 +4,9 @@
     python infra/skypilot/down.py              # cancel all cairn-* managed jobs (scale to zero)
     python infra/skypilot/down.py --list       # just show what's running
 
-Cost discipline (vision §6): spot-only + clean teardown means no idle GPU spend. The
-only standing cost while up is the warm spare (spec §5.2); at rest, zero. There is no
-console step — this is the down half of a fully-API lifecycle.
+Cost discipline: spot-only + clean teardown means no idle GPU spend. The only standing
+cost while up is the warm spare; at rest, zero. There is no console step — this is the
+down half of a fully-API lifecycle.
 """
 
 from __future__ import annotations

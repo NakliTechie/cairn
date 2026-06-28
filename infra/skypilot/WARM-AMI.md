@@ -1,8 +1,7 @@
 # Cairn — Warm-AMI spares (single-digit-minute replenishment)
 
-_Design only — 2026-06-28. Nothing here is deployed. Sibling of [`CACHING.md`](./CACHING.md):
-caching makes the **first** box in a region cheap; the warm AMI makes a **replacement** box
-fast._
+_Design note. Sibling of [`CACHING.md`](./CACHING.md): caching makes the **first** box in a
+region cheap; the warm AMI makes a **replacement** box fast._
 
 ## The problem this solves (and the one it doesn't)
 
@@ -20,10 +19,9 @@ must, from cold:
 3. **`aws s3 sync` the ~294 GB DeepSeek-V4-Flash FP8 checkpoint S3 → NVMe**,
 4. start the container, load its slice into VRAM, flashinfer-warm, then `--announce`.
 
-**Observed live 2026-06-28: ~30+ min, dominated by step 3** (the S3→NVMe weight sync). That is
-[`report/productization.md`](../../report/productization.md)'s single biggest operational
-ceiling: if reclaims arrive faster than ~30 min apart for sustained stretches, replenishment
-can't keep up and the warm pool drains.
+**Measured cold: ~30+ min, dominated by step 3** (the S3→NVMe weight sync). That is the single
+biggest operational ceiling: if reclaims arrive faster than ~30 min apart for sustained
+stretches, replenishment can't keep up and the warm pool drains.
 
 > **Scope.** This optimizes **replenishment latency** (how fast a consumed spare is replaced),
 > *not* **swap latency** (already sub-second). It makes the pool refill in single-digit minutes
@@ -36,10 +34,10 @@ The obvious idea — "snapshot a warmed box, relaunch from it" — has one hard 
 > **The g7e NVMe at `/opt/dlami/nvme` is INSTANCE STORE (ephemeral local disk). It is NOT
 > captured in an AMI. AMIs only snapshot EBS volumes.**
 
-Today both the weights and the Docker image live on that NVMe (see step 0 of the spare yaml's
-`setup:` — we moved them there for the multi-GB/s reshape-reload bandwidth and to drop
-`disk_size` 600→150). An AMI of that box would capture the OS root and *nothing else* — the
-294 GB would be gone on the next boot, and we'd re-sync from S3 anyway. **No win.**
+Both the weights and the Docker image live on that NVMe (see step 0 of the spare yaml's
+`setup:` — staged there for the multi-GB/s reshape-reload bandwidth and to keep `disk_size`
+small). An AMI of that box would capture the OS root and *nothing else* — the 294 GB would be
+gone on the next boot, and the box would re-sync from S3 anyway. **No win.**
 
 To bake the weights into an image, they must sit on an **EBS** volume that the AMI's block
 device mapping (BDM) references — either the root volume or, better, a dedicated **EBS data
@@ -93,7 +91,7 @@ into VRAM** — a one-time bounded read, ~1–2 min at gp3's 1 GB/s ceiling (or 
 Express, up to ~4 GB/s on this Nitro instance). That's fast enough for the announce critical
 path.
 
-The one regression vs today: NVMe gave multi-GB/s for **load-on-promotion reshape** (a generic
+The one regression vs the NVMe staging: NVMe gives multi-GB/s for **load-on-promotion reshape** (a generic
 spare re-reads a *different* slice from disk when it's promoted to a non-tail rank — the
 `--stage-partition` path). EBS gp3 caps lower. Mitigation, **off the critical path**: after the
 spare announces, a background job copies `/opt/cairn-warm/model` → `/opt/dlami/nvme/model`
@@ -105,7 +103,7 @@ copy — simpler, slightly pricier per-GB-month.)
 
 g7e.2xlarge, in-region. "Slice" = one stage's ~58 GB resident shard of the 294 GB checkpoint.
 
-| Phase | Now (S3 sync) | Warm AMI, no FSR | **Warm AMI + FSR** |
+| Phase | Cold (S3 sync) | Warm AMI, no FSR | **Warm AMI + FSR** |
 |---|---|---|---|
 | `sky launch` → spot instance running + DLAMI boot | ~3–5 min | ~3–5 min | ~3–5 min |
 | Mount baked data volume | — | <1 min | <1 min |
@@ -115,7 +113,7 @@ g7e.2xlarge, in-region. "Slice" = one stage's ~58 GB resident shard of the 294 G
 | Container start + slice→VRAM (~58 GB) + flashinfer warm | ~3–5 min | ~3–5 min² | ~2–4 min |
 | **Total to `--announce`** | **~30–40 min** | **~12–20 min** | **~5–8 min** |
 
-¹ Concurrent with the weight sync today, so it hides under step 3's wall-clock.
+¹ Concurrent with the weight sync, so it hides under step 3's wall-clock.
 ² Inflated because the slice load *is* the lazy-load in the no-FSR case.
 
 With FSR, the floor is set by the irreducible costs — **spot acquisition + boot + flashinfer
@@ -126,8 +124,8 @@ time; it was baked once at build time.
 
 Rebuild is **occasional, not constant** — only when the **model** or the **sglang image**
 changes (model-as-config). Between rebuilds the AMI is reused for every replenish. The build is
-scripted in [`build-warm-ami.sh`](./build-warm-ami.sh) (written, **not run** — it provisions and
-snapshots real resources and uses admin-tier EC2 perms). Shape:
+scripted in [`build-warm-ami.sh`](./build-warm-ami.sh) (it provisions and snapshots real
+resources and uses admin-tier EC2 perms). Shape:
 
 1. **Launch a builder box** from the region's DLAMI with an extra blank ~400 GB gp3 data volume
    attached (a g7e isn't required for staging, but using the DLAMI base keeps the resulting
@@ -157,7 +155,7 @@ down on its own.
 
 ## Integrating with the replenish path
 
-Today the watcher launches the spare yaml with `--region <R> --image-id <DLAMI>`. With a warm
+The watcher launches the spare yaml with `--region <R> --image-id <DLAMI>`. With a warm
 AMI, the **only structural change** is the image and a couple of setup skips:
 
 1. **`image_id` → the region's warm AMI** (per region, like the DLAMI ids already tracked in
@@ -190,8 +188,8 @@ AMI, the **only structural change** is the image and a couple of setup skips:
    (image pull + weight movement), not the *warming* step.
 
 This is deliberately additive: a fleet launched on the DLAMI keeps working; a fleet launched on
-the warm AMI replenishes ~5× faster. The actual yaml edits are left as a follow-up (kept out of
-the live, working spare yaml until the AMI exists) — the snippet above is the exact diff.
+the warm AMI replenishes ~5× faster. The snippet above is the exact diff to the spare yaml,
+applied once the AMI exists.
 
 ## Per-region / per-AZ + cost tradeoffs
 
@@ -248,9 +246,9 @@ opt-in per run.
 - **Rebuild discipline.** The AMI is now a build artifact keyed by (model revision, image
   digest, kernel ABI) — exactly the CACHING.md keys. A stale AMI silently serves an old
   model/image. Tie the rebuild trigger to the same digest bump that invalidates the kernel cache.
-- **EBS vs NVMe reshape throughput** (the open question already in `pending.md`): the background
-  EBS→NVMe copy resolves it off the critical path, but measure whether direct io2-BX reads are
-  fast enough to skip the copy entirely.
+- **EBS vs NVMe reshape throughput** (open question): the background EBS→NVMe copy resolves it
+  off the critical path, but measure whether direct io2-BX reads are fast enough to skip the copy
+  entirely.
 
 ## Bottom line
 
@@ -261,5 +259,3 @@ at replenish time because it was baked once at build time. The spare still does 
 + flashinfer warm before announcing, so the swap stays sub-second and invisible. Cost is ~$15–20/mo
 storage per region plus FSR ($/hr per AZ, opt-in per run) — small against turning the system's
 single biggest operational ceiling into a non-issue.
-</content>
-</invoke>
