@@ -237,6 +237,124 @@ def decode_with_recovery_nstage(head, tail, spare, *, stage_addrs, spare_addr,
     return out[:n_new], mttr, st["head"], st["read"], st["k"], st["spare_addr"]
 
 
+def decode_multi_with_recovery(head, tail, spare, *, stage_addrs, spare_addr, streams, n_new,
+                               on_event=None, reshape_spare=None, partition=None):
+    """K CONCURRENT streams + any-position warm-spare recovery — the multi-stream counterpart of
+    decode_with_recovery_nstage merged with pipeline._drive_multi. Keeps one forward per stream in flight
+    (so a full pipeline stays busy); on a node drop (drain{stage:k} or read-edge error) it re-stitches the
+    dead stage onto the spare ONCE and replays EVERY live stream's committed history onto the healed
+    pipeline (each replay's last logit = that stream's pending token), then resumes all streams.
+
+    `streams` = [(seq, prompt), …]. Returns ({seq: [tokens]}, mttr_s | None). Each stream's output is
+    bit-identical to a no-drop run (the recovery is transparent per stream). Survives ONE drop (single spare)."""
+    import torch
+    from shard.transport import LanEdge, EDGE_ERRORS
+    N = len(stage_addrs)
+
+    def _emit(kind, *p):
+        if on_event is not None:
+            try:
+                on_event(kind, *p)
+            except Exception:
+                pass
+
+    prompt_of = {seq: list(p) for seq, p in streams}
+    st = {seq: {"out": [], "pos": 0, "cur": torch.tensor([list(p)])} for seq, p in streams}
+    gen = {seq: 0 for seq in st}                      # fresh-seq generation per stream (bumped on recovery)
+    wire = {seq: seq for seq in st}                   # current on-wire seq per stream
+    rev = {seq: seq for seq in st}                    # wire-seq -> base-seq (routing; stale seqs absent)
+    sstate = {"head": head, "read": tail, "spare": spare, "spare_addr": spare_addr}
+    live = set(st)
+
+    def _restitch(k):
+        """Re-stitch the dead stage k onto the spare (reshape if off-shape). No replay (done per-stream)."""
+        if reshape_spare is not None:
+            ls = le = None
+            if partition is not None:
+                ls = sum(partition[:k]); le = ls + int(partition[k])
+            shaped = reshape_spare(k, ls, le)
+            if shaped is not None:
+                sstate["spare"], sstate["spare_addr"] = shaped
+        if sstate["spare_addr"] is None or sstate["spare"] is None:
+            raise RuntimeError(f"no usable spare for rank {k} recovery")
+        sp_host, sp_port = sstate["spare_addr"]
+        if k == 0:                                                  # ENTRY
+            try:
+                sstate["head"].close()
+            except Exception:
+                pass
+            nh = LanEdge(sp_host, sp_port); _connect_retry(nh)
+            nh.send({"op": "set_my_next", "host": stage_addrs[1][0], "port": stage_addrs[1][1]})
+            sstate["head"] = nh
+        elif k == N - 1:                                            # TAIL
+            sstate["head"].send({"op": "set_next", "target_stage": k - 1, "host": sp_host, "port": sp_port})
+            sstate["read"] = sstate["spare"]
+        else:                                                       # MIDDLE
+            sstate["head"].send({"op": "set_next", "target_stage": k - 1, "host": sp_host, "port": sp_port,
+                                 "spare_next_host": stage_addrs[k + 1][0], "spare_next_port": stage_addrs[k + 1][1]})
+
+    def _recover(k):
+        t0 = time.time()
+        _restitch(k)
+        for base in list(live):                                    # fresh wire-seq per live stream
+            rev.pop(wire[base], None)
+            gen[base] += 1; wire[base] = f"{base}#r{gen[base]}"; rev[wire[base]] = base
+        for base in list(live):                                    # replay each live stream's history
+            hist = prompt_of[base] + st[base]["out"]
+            sstate["head"].send({"h": torch.tensor([hist]), "seq": wire[base], "pos": 0})
+        need = set(live)
+        while need:                                                # collect replay results (skip stale/ops)
+            m = sstate["read"].recv()
+            if isinstance(m, dict) and m.get("op"):
+                continue
+            base = rev.get(m.get("seq"))
+            if base is None or base not in need:
+                continue
+            hist_len = len(prompt_of[base]) + len(st[base]["out"])
+            tok = int(m["h"][:, -1].argmax(-1))
+            st[base]["out"].append(tok); st[base]["pos"] = hist_len; st[base]["cur"] = torch.tensor([[tok]])
+            need.discard(base)
+            if len(st[base]["out"]) >= n_new:
+                live.discard(base)
+        for base in live:                                          # re-inject the still-live streams
+            sstate["head"].send({"h": st[base]["cur"], "seq": wire[base], "pos": st[base]["pos"]})
+        return time.time() - t0
+
+    for base in st:                                                # prime: one prefill per stream
+        sstate["head"].send({"h": st[base]["cur"], "seq": wire[base], "pos": 0})
+    mttr = None
+    recovered = False
+    while live:
+        try:
+            msg = sstate["read"].recv()
+        except EDGE_ERRORS:
+            if recovered:
+                raise RuntimeError("second node loss — out of warm spares (Path-1 single-spare)")
+            committed = sum(len(s["out"]) for s in st.values())
+            _emit("death", N - 1, committed)
+            mttr = _recover(N - 1); recovered = True
+            _emit("recovered", mttr, -1, committed); continue
+        if isinstance(msg, dict) and msg.get("op") == "draining":
+            if recovered:
+                continue
+            k = int(msg.get("stage", N - 1))
+            committed = sum(len(s["out"]) for s in st.values())
+            _emit("draining", k, committed)
+            mttr = _recover(k); recovered = True
+            _emit("recovered", mttr, -1, committed); continue
+        base = rev.get(msg.get("seq"))
+        if base is None or base not in live:                       # stale (pre-recovery) result — ignore
+            continue
+        hist_len = len(prompt_of[base]) + len(st[base]["out"])
+        st[base]["out"].append(int(msg["h"][:, -1].argmax(-1)))
+        st[base]["pos"] = hist_len
+        if len(st[base]["out"]) >= n_new:
+            live.discard(base); continue
+        st[base]["cur"] = torch.tensor([[st[base]["out"][-1]]])
+        sstate["head"].send({"h": st[base]["cur"], "seq": wire[base], "pos": st[base]["pos"]})
+    return {seq: st[seq]["out"][:n_new] for seq in st}, mttr
+
+
 def _spawn_stage(runtime, model, ls, le, lp, nh, np_, rank, device="cpu",
                  drain_after=None, die_after=None, mem_fraction=None):
     """Spawn one cairn_node.serve with an explicit --stage-rank (N-stage), optionally inducing a
