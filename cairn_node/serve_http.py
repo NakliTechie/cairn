@@ -71,7 +71,21 @@ class _Tok:
         if self.mock:
             text = " ".join(str(m.get("content", "")) for m in messages)
             return [ord(c) % self.vocab for c in text] or [1]
-        ids = self.t.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        try:
+            ids = self.t.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        except Exception:
+            # The sgl-project FP8 repack ships a tokenizer_config WITHOUT a chat_template (GPU-confirmed
+            # 2026-06-28: apply_chat_template → ValueError), so fall back to the canonical DeepSeek-V3/V4
+            # chat format (<｜User｜>/<｜Assistant｜> markers; BOS is added by the tokenizer, add_bos_token=True).
+            buf = "".join(m.get("content", "") for m in messages if m.get("role") == "system")
+            for m in messages:
+                role, content = m.get("role"), m.get("content", "")
+                if role == "user":
+                    buf += "<｜User｜>" + content
+                elif role == "assistant":
+                    buf += "<｜Assistant｜>" + content
+            buf += "<｜Assistant｜>"
+            ids = self.t.encode(buf)
         return list(ids)
 
     def decode(self, ids) -> str:
@@ -235,7 +249,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(eng.complete(req))
         except GatewayError as e:
             self._send(e.to_error(), e.status)
-        except Exception as e:  # never leak internals to the client
+        except Exception as e:  # never leak internals to the client — but DO surface them server-side
+            import traceback
+            print(f"[serve_http] request failed: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
             self._send({"error": {"message": f"internal error: {type(e).__name__}", "type": "internal_error",
                                    "code": "internal_error"}}, 500)
 
