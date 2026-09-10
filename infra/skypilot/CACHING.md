@@ -127,7 +127,7 @@ set -a; source infra/secrets.env; set +a
 CLUSTER=cairn-dsv4 ECR_REGION=us-east-2 bash infra/skypilot/cache-image.sh   # Ohio; repeat per region used
 ```
 Creating a *new* region's repo needs `ecr:CreateRepository` (the `cairn-s3-populate` key has R/W on the
-existing repo only); the script tries the `admin-cli` profile, else prints the one-line create command.
+existing repo only); the script tries the `default` profile (keyless root session; `admin-cli` was deleted 2026-08-01), else prints the one-line create command.
 First launch in an un-mirrored region is a Docker Hub fallback (correct, just slower) — populate after so
 the next launch / spare there is an in-region hit.
 
@@ -148,7 +148,7 @@ the next launch / spare there is an in-region hit.
       measure the MTTR improvement vs HF.
 - [x] ECR image mirror — region-derived (IMDS) in `acquire_image()`, lazy-per-region populate via
       `cache-image.sh`. Follow-up: a standing `ecr:CreateRepository` perm so new-region repos
-      auto-create without the admin-cli profile.
+      auto-create without the `default` profile.
 
 > **Scale note (the reason this is the default, not an optimization):** at 10-20 boxes, per-box HF
 > pulls = multi-TB egress per launch + rate-limit throttling + slow bring-up. Download-once-to-S3 +

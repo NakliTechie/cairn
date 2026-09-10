@@ -148,7 +148,7 @@ resources and uses admin-tier EC2 perms). Shape:
 7. **Output: the per-region AMI id** → drop into the spare yaml's `image_id` (and the main yaml).
 
 The script keeps build-time EC2 mutations (`run-instances`, `create-image`, `copy-image`, FSR
-enable/disable) behind `AWS_PROFILE=${AWS_PROFILE:-admin-cli}` — the least-priv `cairn-skypilot`
+enable/disable) behind `AWS_PROFILE=${AWS_PROFILE:-default}` — the least-priv `cairn-skypilot`
 key intentionally **cannot** do these (consistent with the
 credential posture (scoped least-privilege key; see `infra/aws/`)). It prints the resulting AMI id and never tears anything
 down on its own.

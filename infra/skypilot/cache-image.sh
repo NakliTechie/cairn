@@ -18,7 +18,7 @@
 # once per actively-used region by overriding ECR_REGION to match the live cluster's region, e.g. Ohio:
 #   CLUSTER=cairn-dsv4 ECR_REGION=us-east-2 bash infra/skypilot/cache-image.sh
 # Creating a NEW region's repo needs ecr:CreateRepository (the cairn-s3-populate key has R/W on the existing
-# cairn-sglang repo only) — this script ensure-creates it via the admin-cli profile, falling back to the
+# cairn-sglang repo only) — this script ensure-creates it via the `default` profile, falling back to the
 # write key; if both lack the perm it prints a clear message and you create the repo once from the console.
 set -euo pipefail
 CLUSTER="${CLUSTER:-cairn-dsv4}"
@@ -32,14 +32,14 @@ ECR_URI="${ACCT}.dkr.ecr.${REGION}.amazonaws.com/${REPO}"
 echo "[cache-image] $CLUSTER: mirror $IMG -> $ECR_URI:$TAG (region $REGION)"
 
 # Ensure the per-region ECR repo exists (idempotent) — a `docker push` to a missing repo fails. Prefer the
-# admin-cli profile (can create); fall back to the populate key (can describe an existing repo, may not create).
+# `default` admin profile (can create); fall back to the populate key (can describe an existing repo, may not create).
 echo "[cache-image] ensuring ECR repo $REPO exists in $REGION ..."
-if aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" --profile admin-cli >/dev/null 2>&1 \
+if aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" --profile default >/dev/null 2>&1 \
    || AWS_ACCESS_KEY_ID="$CAIRN_S3_WRITE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_WRITE_SECRET_ACCESS_KEY" \
         aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" >/dev/null 2>&1; then
   echo "[cache-image] repo already present in $REGION"
-elif aws ecr create-repository --repository-name "$REPO" --region "$REGION" --profile admin-cli >/dev/null 2>&1; then
-  echo "[cache-image] created repo $REPO in $REGION (admin-cli)"
+elif aws ecr create-repository --repository-name "$REPO" --region "$REGION" --profile default >/dev/null 2>&1; then
+  echo "[cache-image] created repo $REPO in $REGION (default, keyless root)"
 else
   echo "[cache-image] WARNING: repo $REPO missing in $REGION and could not auto-create (needs ecr:CreateRepository)."
   echo "[cache-image]          Create it once, then re-run:  aws ecr create-repository --repository-name $REPO --region $REGION"
@@ -56,7 +56,7 @@ sudo docker push $ECR_URI:$TAG
 echo '[box] push complete'
 REMOTE
 echo "[cache-image] verifying ECR image ..."
-aws ecr describe-images --repository-name "$REPO" --region "$REGION" --profile admin-cli \
+aws ecr describe-images --repository-name "$REPO" --region "$REGION" --profile default \
   --query 'imageDetails[0].[imageTags[0],imageSizeInBytes]' --output text 2>/dev/null || \
   AWS_ACCESS_KEY_ID="$CAIRN_S3_WRITE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$CAIRN_S3_WRITE_SECRET_ACCESS_KEY" \
   aws ecr describe-images --repository-name "$REPO" --region "$REGION" \

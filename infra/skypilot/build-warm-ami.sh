@@ -9,7 +9,7 @@
 # It provisions a real builder instance + a 400 GB EBS volume, stages ~376 GB onto it, snapshots
 # it, and registers an AMI. It uses ADMIN-TIER EC2 perms (run-instances, create-image,
 # copy-image, FSR) that the least-priv cairn-skypilot key does NOT have by design (see
-# infra/aws/README.md credential posture) — hence AWS_PROFILE defaults to admin-cli. Read it,
+# infra/aws/README.md credential posture) — hence AWS_PROFILE defaults to `default` (keyless root; admin-cli was deleted 2026-08-01). Read it,
 # understand the cost, then run a phase at a time. Nothing here tears down on its own.
 #
 # WHY EBS not NVMe: the g7e NVMe at /opt/dlami/nvme is INSTANCE STORE (ephemeral) and is NOT
@@ -31,7 +31,7 @@ set -uo pipefail
 # ---- config (override via env) ---------------------------------------------------------------
 REGION="${REGION:?set REGION, e.g. us-east-2}"
 AZ="${AZ:-${REGION}a}"                                   # FSR + EBS are AZ-local; pin the build AZ
-PROFILE="${AWS_PROFILE:-admin-cli}"                      # admin-tier perms (cairn-skypilot can't do these)
+PROFILE="${AWS_PROFILE:-default}"                      # admin-tier perms (cairn-skypilot can't do these)
 AWS="aws --region $REGION --profile $PROFILE"
 
 # The DLAMI base per region (same build as cairn-dsv4.sky.yaml's image_id). Keep these in sync.
@@ -224,7 +224,7 @@ Cairn warm-AMI builder — phases (run in order; see top-of-file usage + WARM-AM
   fsr-enable   (RUN time) enable Fast Snapshot Restore on the snapshot in \$AZ   (\$0.75/hr/AZ)
   fsr-disable  (teardown) disable FSR to stop the hourly charge
   cleanup      terminate the builder instance (AMI + snapshot persist)
-Env: REGION (req), AZ, AWS_PROFILE=admin-cli, SG_ID, SUBNET_ID, DATA_GB, DATA_VOL_TYPE, SNAP.
+Env: REGION (req), AZ, AWS_PROFILE=default, SG_ID, SUBNET_ID, DATA_GB, DATA_VOL_TYPE, SNAP.
 EOF
   ;;
 esac
